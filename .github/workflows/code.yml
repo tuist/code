@@ -51,6 +51,19 @@ jobs:
           packages: platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018
       - name: Install the Android Rust standard library
         run: mise exec -- rustup target add aarch64-linux-android
+      - name: Create an Android debug keystore
+        run: |
+          mise exec -- keytool -genkeypair \
+            -alias androiddebugkey \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -keystore "$RUNNER_TEMP/tuist-code-debug.keystore" \
+            -keypass android \
+            -storepass android \
+            -validity 10000 \
+            -noprompt
+          echo "ANDROID_DEBUG_KEYSTORE=$RUNNER_TEMP/tuist-code-debug.keystore" >> "$GITHUB_ENV"
       - name: Build through Once
         run: |
           android_root=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
