@@ -46,9 +46,6 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             pkg-config
-      - name: Install the Metal Toolchain
-        if: runner.os == 'macOS'
-        run: xcodebuild -downloadComponent MetalToolchain
       - uses: jdx/mise-action@v4
         with:
           cache: true
@@ -88,9 +85,6 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             pkg-config
-      - name: Install the Metal Toolchain
-        if: runner.os == 'macOS'
-        run: xcodebuild -downloadComponent MetalToolchain
       - uses: jdx/mise-action@v4
         with:
           cache: true

@@ -7,7 +7,7 @@ Its first screen uses [GPUI, a GPU-accelerated user interface framework](https:/
 ## Requirements
 
 - [Mise](https://mise.jdx.dev/), which installs the pinned Rust and Once toolchains.
-- macOS: Xcode command line tools and the Metal Toolchain component. GPUI renders with Metal. Install the component with `xcodebuild -downloadComponent MetalToolchain` when Xcode does not already provide it.
+- macOS: Xcode command line tools. GPUI renders with Metal, which is included with current Xcode installations.
 - Linux: development packages for Fontconfig, Wayland or the [X Window System (X11)](https://www.x.org/wiki/), the X Keyboard Extension, and Vulkan. The GitHub Actions workflow shows the Debian and Ubuntu package names.
 
 ## Start the app

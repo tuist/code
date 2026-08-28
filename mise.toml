@@ -26,6 +26,7 @@ run = "once test cargo_code_bin_code_unit_tests"
 
 [tasks.validate]
 description = "Validate the Once workspace definition."
+depends = ["dependencies"]
 run = "once query validate-workspace"
 
 [tasks.run]
