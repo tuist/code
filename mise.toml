@@ -1,0 +1,30 @@
+[tools]
+rust = "1.94.1"
+"github:tuist/once" = { version = "0.46.3", exe = "once" }
+
+[tasks.format]
+description = "Format the Rust source code."
+run = "cargo fmt --all"
+
+[tasks."format:check"]
+description = "Check Rust formatting."
+run = "cargo fmt --all -- --check"
+
+[tasks.dependencies]
+description = "Fetch the locked Rust packages required by Once."
+run = "cargo fetch --locked"
+
+[tasks.build]
+description = "Build the desktop application through Once."
+depends = ["dependencies"]
+run = "once build cargo_code_bin_code"
+
+[tasks.test]
+description = "Run the application tests through Once."
+depends = ["dependencies"]
+run = "once test cargo_code_bin_code_unit_tests"
+
+[tasks.run]
+description = "Open the native desktop window through Once."
+depends = ["dependencies"]
+run = "once run cargo_code_bin_code"
