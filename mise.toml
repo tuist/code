@@ -24,6 +24,10 @@ description = "Run the application tests through Once."
 depends = ["dependencies"]
 run = "once test cargo_code_bin_code_unit_tests"
 
+[tasks.validate]
+description = "Validate the Once workspace definition."
+run = "once query validate-workspace"
+
 [tasks.run]
 description = "Open the native desktop window through Once."
 depends = ["dependencies"]

@@ -25,6 +25,7 @@ The first run fetches the locked Rust packages, builds GPUI, and opens a centere
 mise run format
 mise run build
 mise run test
+mise run validate
 ```
 
 `once.toml` adapts the Cargo workspace into Once targets. The current targets are `cargo_code_bin_code` for the application and `cargo_code_bin_code_unit_tests` for its tests.
