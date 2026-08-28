@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  desktop:
-    name: Build and test macOS application
+  build_desktop:
+    name: Build desktop application
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
@@ -23,6 +23,49 @@ jobs:
           cache: true
       - name: Build through Once
         run: mise run build
+
+  build_ios:
+    name: Build iOS application
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+      - name: Install the iOS Rust standard library
+        run: mise exec -- rustup target add aarch64-apple-ios-sim
+      - name: Build through Once
+        run: mise run build:ios
+
+  build_android:
+    name: Build Android application
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
+      - name: Set up Android tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018
+      - name: Install the Android Rust standard library
+        run: mise exec -- rustup target add aarch64-linux-android
+      - name: Build through Once
+        run: |
+          android_root=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
+          ANDROID_SDK_ROOT="$android_root" \
+          ANDROID_NDK_HOME="$android_root/ndk/27.2.12479018" \
+          mise run build:android
+
+  test:
+    name: Test shared Rust code
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+        with:
+          cache: true
       - name: Test through Once
         run: mise run test
 
