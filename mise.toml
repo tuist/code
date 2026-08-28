@@ -1,35 +1,36 @@
 [tools]
 rust = "1.94.1"
+java = "21.0.2"
 "github:tuist/once" = { version = "0.46.3", exe = "once" }
 
 [tasks.format]
-description = "Format the Rust source code."
-run = "cargo fmt --all"
+description = "Format shared Rust sources."
+run = "rustfmt --edition 2024 shared/rust/src/lib.rs shared/rust/tests/identity_tests.rs"
 
 [tasks."format:check"]
-description = "Check Rust formatting."
-run = "cargo fmt --all -- --check"
-
-[tasks.dependencies]
-description = "Fetch the locked Rust packages required by Once."
-run = "cargo fetch --locked"
+description = "Check shared Rust formatting."
+run = "rustfmt --check --edition 2024 shared/rust/src/lib.rs shared/rust/tests/identity_tests.rs"
 
 [tasks.build]
-description = "Build the desktop application through Once."
-depends = ["dependencies"]
-run = "once build cargo_code_bin_code"
+description = "Build the macOS application bundle through Once."
+run = "once build TuistCodeDesktop"
+
+[tasks."build:ios"]
+description = "Build the iOS simulator application bundle through Once."
+run = "once build TuistCodeiOS"
+
+[tasks."build:android"]
+description = "Build the Android application package through Once."
+run = "once build TuistCodeAndroid"
 
 [tasks.test]
-description = "Run the application tests through Once."
-depends = ["dependencies"]
-run = "once test cargo_code_bin_code_unit_tests"
+description = "Run shared Rust tests through Once."
+run = "once test TuistCodeSharedTests"
 
 [tasks.validate]
 description = "Validate the Once workspace definition."
-depends = ["dependencies"]
 run = "once query validate-workspace"
 
 [tasks.run]
-description = "Open the native desktop window through Once."
-depends = ["dependencies"]
-run = "once run cargo_code_bin_code"
+description = "Open the macOS Tuist Code application bundle through Once."
+run = "once run TuistCodeDesktop"

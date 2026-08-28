@@ -1,4 +1,4 @@
-name: Code
+name: Tuist Code
 
 on:
   push:
@@ -9,91 +9,26 @@ permissions:
   contents: read
 
 concurrency:
-  group: code-${{ github.workflow }}-${{ github.ref }}
+  group: tuist-code-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: Linux
-            runner: ubuntu-24.04
-          - platform: macOS
-            runner: macos-15
+  desktop:
+    name: Build and test macOS application
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
-      - name: Install Linux rendering dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            build-essential \
-            clang \
-            cmake \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            libvulkan-dev \
-            libwayland-dev \
-            libx11-dev \
-            libx11-xcb-dev \
-            libxcb-render0-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            pkg-config
       - uses: jdx/mise-action@v4
         with:
           cache: true
       - name: Build through Once
         run: mise run build
-
-  test:
-    name: Test (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: Linux
-            runner: ubuntu-24.04
-          - platform: macOS
-            runner: macos-15
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install Linux rendering dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            build-essential \
-            clang \
-            cmake \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            libvulkan-dev \
-            libwayland-dev \
-            libx11-dev \
-            libx11-xcb-dev \
-            libxcb-render0-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            pkg-config
-      - uses: jdx/mise-action@v4
-        with:
-          cache: true
       - name: Test through Once
         run: mise run test
 
   validate:
-    name: Validate
-    runs-on: ubuntu-24.04
+    name: Validate Once workspace
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4

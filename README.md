@@ -1,14 +1,18 @@
-# Code
+# Tuist Code
 
-Code is an experimental native coding environment.
+Tuist Code is an experimental native coding environment with three first-class applications:
 
-Its first screen uses [GPUI, a GPU-accelerated user interface framework](https://gpui.rs/) from the creators of [Zed](https://zed.dev/). [Once](https://buildonce.dev/) owns the build and test graph, so local development and GitHub Actions exercise the same targets.
+- macOS desktop
+- iOS simulator
+- Android
+
+The applications use the same Rust implementation of the product identity and brand colour. [Once](https://buildonce.dev/) builds the native macOS and iOS application bundles, packages the Android application, and runs the shared Rust tests.
 
 ## Requirements
 
-- [Mise](https://mise.jdx.dev/), which installs the pinned Rust and Once toolchains.
-- macOS: Xcode command line tools. GPUI renders with Metal, which is included with current Xcode installations.
-- Linux: development packages for Fontconfig, Wayland or the [X Window System (X11)](https://www.x.org/wiki/), the X Keyboard Extension, and Vulkan. The GitHub Actions workflow shows the Debian and Ubuntu package names.
+- [Mise](https://mise.jdx.dev/), which installs the pinned Rust, Java Development Kit, and Once toolchains.
+- macOS: Xcode command line tools, including an iOS simulator runtime for the iOS application.
+- Android: Android Software Development Kit Platform 35, Build Tools 35.0.0, and the Android Native Development Kit for `arm64-v8a`.
 
 ## Start the app
 
@@ -17,15 +21,31 @@ mise install
 mise run run
 ```
 
-The first run fetches the locked Rust packages, builds GPUI, and opens a centered native window.
+The first run builds and opens the Tuist Code macOS application bundle. Its dock icon is generated from the current Tuist brand logo.
 
 ## Development commands
 
 ```sh
 mise run format
 mise run build
+mise run build:ios
+mise run build:android
 mise run test
 mise run validate
 ```
 
-`once.toml` adapts the Cargo workspace into Once targets. The current targets are `cargo_code_bin_code` for the application and `cargo_code_bin_code_unit_tests` for its tests.
+The `once.toml` file declares all native targets directly: `TuistCodeDesktop`, `TuistCodeiOS`, `TuistCodeAndroid`, and their shared Rust libraries.
+
+## Android setup
+
+Before building the Android application, configure the location of the [Android Software Development Kit](https://developer.android.com/tools) and the [Android Native Development Kit](https://developer.android.com/ndk):
+
+```sh
+export ANDROID_SDK_ROOT=/path/to/android-sdk
+export ANDROID_NDK_HOME=/path/to/android-ndk
+mise run build:android
+```
+
+## Updating the logo
+
+`assets/tuist-logo.svg` is the Tuist brand logo. Run `scripts/generate_app_icons.sh` after updating it to regenerate the macOS and iOS application icons and the in-app image assets.
