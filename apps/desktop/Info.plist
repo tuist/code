@@ -22,5 +22,14 @@
     <string>15.0</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>tuist</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

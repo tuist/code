@@ -10,8 +10,7 @@ render_logo_mark() {
     local source=$1
     local output=$2
 
-    sips -s format png "$source" --out "$temporary_directory/logo-mark.png" >/dev/null
-    sips -z 1024 1024 "$temporary_directory/logo-mark.png" --out "$output" >/dev/null
+    sips -s format png -z 1024 1024 "$source" --out "$output" >/dev/null
 }
 
 render_app_icon() {

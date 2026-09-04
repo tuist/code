@@ -1,15 +1,16 @@
 [tools]
 rust = "1.94.1"
 java = "21.0.2"
+android-sdk = "23.0"
 "github:tuist/once" = { version = "0.46.3", exe = "once" }
 
 [tasks.format]
 description = "Format shared Rust sources."
-run = "rustfmt --edition 2024 shared/rust/src/lib.rs shared/rust/tests/identity_tests.rs"
+run = "rustfmt --edition 2024 shared/rust/src/lib.rs shared/rust/src/bin/tuist_code_agent.rs shared/rust/tests/identity_tests.rs"
 
 [tasks."format:check"]
 description = "Check shared Rust formatting."
-run = "rustfmt --check --edition 2024 shared/rust/src/lib.rs shared/rust/tests/identity_tests.rs"
+run = "rustfmt --check --edition 2024 shared/rust/src/lib.rs shared/rust/src/bin/tuist_code_agent.rs shared/rust/tests/identity_tests.rs"
 
 [tasks.build]
 description = "Build the macOS application bundle through Once."
@@ -21,11 +22,48 @@ run = "once build TuistCodeiOS"
 
 [tasks."build:android"]
 description = "Build the Android application package through Once."
-run = "once build TuistCodeAndroid"
+depends = ["android:setup"]
+run = "ANDROID_NDK_HOME=\"$(mise where android-sdk)/ndk/27.2.12479018\" once build TuistCodeAndroid"
+
+[tasks."android:setup"]
+description = "Install the Android platform, build tools, and Native Development Kit required by Tuist Code."
+run = """
+sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "platform-tools"
+"""
+
+[tasks."android:emulator:setup"]
+description = "Install and create the Android emulator used by Tuist Code."
+depends = ["android:setup"]
+run = """
+sdkmanager --install "emulator" "system-images;android-35;google_apis;arm64-v8a"
+if ! avdmanager list avd | rg --quiet "Name: TuistCode"; then
+  echo no | avdmanager create avd --force --name TuistCode --package "system-images;android-35;google_apis;arm64-v8a"
+fi
+"""
+
+[tasks."android:emulator:start"]
+description = "Boot the Tuist Code Android emulator when it is not already running."
+depends = ["android:emulator:setup"]
+run = """
+tuist_code_adb="$ANDROID_SDK_ROOT/platform-tools/adb"
+if ! "$tuist_code_adb" devices | rg --quiet "^emulator-.*\\tdevice$"; then
+  nohup "$ANDROID_SDK_ROOT/emulator/emulator" -avd TuistCode -no-snapshot -no-audio -no-boot-anim > /tmp/tuist-code-android-emulator.log 2>&1 &
+  "$tuist_code_adb" wait-for-device
+  until "$tuist_code_adb" shell getprop sys.boot_completed | rg --quiet "^1$"; do sleep 2; done
+fi
+"""
 
 [tasks.test]
 description = "Run shared Rust tests through Once."
 run = "once test TuistCodeSharedTests"
+
+[tasks."agent:build"]
+description = "Build the headless Rust coding-agent runner."
+run = "once build TuistCodeAgent"
+
+[tasks."agent:run"]
+description = "Run the headless Rust coding-agent runner."
+run = "once run TuistCodeAgent --"
 
 [tasks.validate]
 description = "Validate the Once workspace definition."
@@ -33,4 +71,13 @@ run = "once query validate-workspace"
 
 [tasks.run]
 description = "Open the macOS Tuist Code application bundle through Once."
-run = "once run TuistCodeDesktop"
+run = "once run TuistCodeDesktop --visible"
+
+[tasks."run:ios"]
+description = "Open the Tuist Code application in the booted iOS simulator through Once."
+run = "once run TuistCodeiOS --visible"
+
+[tasks."run:android"]
+description = "Open the Tuist Code application on the Android emulator through Once."
+depends = ["android:emulator:start"]
+run = "ANDROID_NDK_HOME=\"$(mise where android-sdk)/ndk/27.2.12479018\" once run TuistCodeAndroid --visible"
