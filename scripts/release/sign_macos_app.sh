@@ -5,8 +5,10 @@ app=${1:?Pass the macOS application path}
 identity=${2:?Pass the Developer ID signing identity}
 framework="$app/Contents/Frameworks/Sparkle.framework"
 sparkle="$framework/Versions/B"
+agent="$app/Contents/Resources/tuist_code_agent"
 
 required_paths=(
+  "$agent"
   "$sparkle/XPCServices/Installer.xpc"
   "$sparkle/XPCServices/Downloader.xpc"
   "$sparkle/Autoupdate"
@@ -21,6 +23,7 @@ for path in "${required_paths[@]}"; do
   fi
 done
 
+codesign --force --sign "$identity" --options runtime --timestamp "$agent"
 codesign --force --sign "$identity" --options runtime --timestamp "$sparkle/XPCServices/Installer.xpc"
 codesign --force --sign "$identity" --options runtime --timestamp --preserve-metadata=entitlements "$sparkle/XPCServices/Downloader.xpc"
 codesign --force --sign "$identity" --options runtime --timestamp "$sparkle/Autoupdate"
