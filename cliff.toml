@@ -1,0 +1,50 @@
+# git-cliff configuration: https://git-cliff.org/docs/configuration
+
+[bump]
+initial_tag = "0.1.0"
+no_increment_regex = "^docs?(\\([^)]*\\))?:"
+
+[changelog]
+header = ""
+body = """
+## What's Changed
+<!-- RELEASE NOTES START -->
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+  * {{ commit.message | split(pat="\n") | first | trim }}
+{%- endfor %}
+{% endfor %}
+
+{% if version and previous.version %}
+**Full Changelog**: https://github.com/tuist/code/compare/{{ previous.version }}...{{ version }}
+{% endif %}
+"""
+trim = true
+footer = ""
+postprocessors = [
+  { pattern = '\* (feat|fix|docs?|perf|refactor|style|test|chore|ci)(\([^)]*\))?:\s*', replace = "* " },
+]
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+commit_preprocessors = [
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/tuist/code/pull/${1}))" },
+]
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactoring" },
+  { message = "^docs?", group = "Documentation" },
+  { message = "^(test|style|chore|ci)", skip = true },
+]
+protect_breaking_commits = true
+filter_commits = true
+tag_pattern = "[0-9]+\\.[0-9]+\\.[0-9]+"
+skip_tags = "beta|alpha"
+ignore_tags = "rc"
+topo_order = false
+sort_commits = "newest"

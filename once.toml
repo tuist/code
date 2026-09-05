@@ -63,6 +63,16 @@ product_name = "Tuist Code"
 asset_catalogs = ["apps/desktop/Assets.xcassets"]
 app_icon = "AppIcon"
 info_plist = "apps/desktop/Info.plist"
+swift_flags = ["-F", ".build/sparkle/Sparkle.xcframework/macos-arm64_x86_64"]
+linkopts = [
+  "-F.build/sparkle/Sparkle.xcframework/macos-arm64_x86_64",
+  "-framework",
+  "Sparkle",
+  "-Xlinker",
+  "-rpath",
+  "-Xlinker",
+  "@executable_path/../Frameworks",
+]
 
 [[target]]
 name = "TuistCodeiOS"
@@ -80,6 +90,35 @@ product_name = "Tuist Code"
 asset_catalogs = ["apps/ios/Assets.xcassets"]
 app_icon = "AppIcon"
 info_plist = "apps/ios/Info.plist"
+
+[[target]]
+name = "TuistCodeiOSRelease"
+kind = "apple_application"
+srcs = ["apps/ios/Sources/**/*.swift"]
+deps = ["./TuistCodeiOSSharedRelease"]
+
+[target.attrs]
+platform = "ios"
+bundle_id = "dev.tuist.code.ios"
+minimum_os = "17.0"
+sdk_variant = "device"
+families = ["iphone"]
+product_name = "Tuist Code"
+asset_catalogs = ["apps/ios/Assets.xcassets"]
+app_icon = "AppIcon"
+info_plist = "apps/ios/Info.plist"
+
+[[target]]
+name = "TuistCodeiOSSharedRelease"
+kind = "rust_library"
+srcs = ["shared/rust/src/**/*.rs"]
+
+[target.attrs]
+crate_name = "tuist_code_shared"
+crate_root = "shared/rust/src/lib.rs"
+edition = "2024"
+target = "aarch64-apple-ios"
+crate_type = "staticlib"
 
 [[target]]
 name = "TuistCodeAndroid"
@@ -100,3 +139,24 @@ build_tools_version = "35.0.0"
 version_code = 1
 version_name = "0.1.0"
 launch_activity = ".MainActivity"
+
+[[target]]
+name = "TuistCodeAndroidRelease"
+kind = "android_binary"
+srcs = ["apps/android/src/**/*.java"]
+deps = ["./TuistCodeMobileShared"]
+
+[target.attrs]
+application_id = "dev.tuist.code"
+namespace = "dev.tuist.code"
+manifest = "apps/android/AndroidManifest.xml"
+resource_files = ["apps/android/res/**"]
+resource_dirs = ["apps/android/res"]
+compile_sdk = 35
+min_sdk_version = 26
+target_sdk_version = 35
+build_tools_version = "35.0.0"
+version_code = 1
+version_name = "0.1.0"
+launch_activity = ".MainActivity"
+signing = "none"

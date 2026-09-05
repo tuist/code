@@ -1,0 +1,301 @@
+name: Release applications
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: application-release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check for a new version
+    runs-on: ubuntu-24.04
+    outputs:
+      should-release: ${{ steps.release.outputs.should-release }}
+      next-version: ${{ steps.release.outputs.next-version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          cache: true
+          install_args: git-cliff jq
+      - id: release
+        run: mise run release:check
+
+  preflight:
+    name: Validate release credentials
+    needs: check
+    if: github.event_name != 'pull_request' && needs.check.outputs.should-release == 'true'
+    runs-on: macos-15
+    env:
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          cache: true
+      - name: Check signing and update credentials
+        run: scripts/release/preflight.sh
+
+  macos:
+    name: Build, sign, and notarize macOS
+    needs: [check, preflight]
+    if: github.event_name != 'pull_request' && needs.check.outputs.should-release == 'true' && needs.preflight.result == 'success'
+    runs-on: macos-15
+    env:
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          cache: true
+      - name: Set the application version
+        env:
+          VERSION: ${{ needs.check.outputs.next-version }}
+        run: |
+          BUILD_NUMBER=$(scripts/release/version_code.sh "$VERSION")
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" apps/desktop/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" apps/desktop/Info.plist
+      - name: Build the macOS application
+        run: mise run build
+      - name: Import the Developer ID certificate
+        env:
+          KEYCHAIN_PASSWORD: ${{ runner.temp }}-${{ github.run_id }}
+        run: |
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          op document get "Developer ID Application Certificate" --vault "Tuist Code" --out-file "$certificate"
+          certificate_password=$(op read "op://Tuist Code/Developer ID Certificate Password/password")
+          echo "::add-mask::$certificate_password"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$certificate_password" -T /usr/bin/codesign
+          default_keychain=$(security default-keychain -d user | tr -d '"')
+          security list-keychains -d user -s "$keychain" "$default_keychain"
+          security default-keychain -d user -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+          identity=$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n1)
+          test -n "$identity"
+          echo "DEVELOPER_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Sign, notarize, and package
+        env:
+          TEAM_ID: U6LC622NKF
+          VERSION: ${{ needs.check.outputs.next-version }}
+        run: |
+          mkdir -p release
+          app="release/Tuist Code.app"
+          scripts/release/assemble_macos_app.sh "$app"
+          scripts/release/sign_macos_app.sh "$app" "$DEVELOPER_IDENTITY"
+
+          notarization_archive="$RUNNER_TEMP/Tuist-Code-notarization.zip"
+          ditto -c -k --keepParent "$app" "$notarization_archive"
+          apple_id=$(op item get "App Specific Password" --vault "Tuist Code" --reveal --format json | jq -r '.fields[] | select(.id == "username").value')
+          app_password=$(op item get "App Specific Password" --vault "Tuist Code" --reveal --format json | jq -r '.fields[] | select(.id == "password").value')
+          echo "::add-mask::$apple_id"
+          echo "::add-mask::$app_password"
+          xcrun notarytool store-credentials tuist-code-release --apple-id "$apple_id" --password "$app_password" --team-id "$TEAM_ID"
+          xcrun notarytool submit "$notarization_archive" --keychain-profile tuist-code-release --wait
+          xcrun stapler staple "$app"
+
+          ditto -c -k --keepParent "$app" "release/Tuist-Code-macOS-$VERSION.zip"
+      - name: Generate the Sparkle feed
+        env:
+          VERSION: ${{ needs.check.outputs.next-version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/appcast-input"
+          cp "release/Tuist-Code-macOS-$VERSION.zip" "$RUNNER_TEMP/appcast-input/"
+          if gh release download appcast --pattern appcast.xml --dir "$RUNNER_TEMP/appcast-input"; then
+            gh api 'repos/{owner}/{repo}/releases?per_page=5' --jq '.[] | .assets[] | select(.name | startswith("Tuist-Code-macOS-") and endswith(".zip")) | [.name, .browser_download_url] | @tsv' | while IFS=$'\t' read -r name url; do
+              curl --fail --location --silent --show-error "$url" --output "$RUNNER_TEMP/appcast-input/$name"
+            done
+          fi
+          op read "op://Tuist Code/Tuist App Private Sparkle Key/credential" | \
+            .build/sparkle/bin/generate_appcast \
+              --link "https://github.com/tuist/code/releases" \
+              --download-url-prefix "https://github.com/tuist/code/releases/download/$VERSION/" \
+              --ed-key-file - \
+              -o release/appcast.xml \
+              "$RUNNER_TEMP/appcast-input"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-release
+          path: |
+            release/Tuist-Code-macOS-*.zip
+            release/appcast.xml
+          retention-days: 1
+
+  ios:
+    name: Build and sign iOS
+    needs: [check, preflight]
+    if: github.event_name != 'pull_request' && needs.check.outputs.should-release == 'true' && needs.preflight.result == 'success'
+    runs-on: macos-15
+    env:
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          cache: true
+      - name: Install the iOS Rust standard library
+        run: mise exec -- rustup target add aarch64-apple-ios
+      - name: Set the application version
+        env:
+          VERSION: ${{ needs.check.outputs.next-version }}
+        run: |
+          BUILD_NUMBER=$(scripts/release/version_code.sh "$VERSION")
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" apps/ios/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" apps/ios/Info.plist
+      - name: Install signing materials
+        env:
+          KEYCHAIN_PASSWORD: ${{ runner.temp }}-${{ github.run_id }}
+        run: |
+          mkdir -p .signing
+          op document get "Tuist Code Ad Hoc" --vault "Tuist Code" --out-file .signing/Tuist_Code_Ad_Hoc.mobileprovision
+          op document get "Distribution Certificate" --vault "Tuist Code" --out-file "$RUNNER_TEMP/distribution.p12"
+          certificate_password=$(op read "op://Tuist Code/Distribution Certificate Password/password")
+          echo "::add-mask::$certificate_password"
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain"
+          security import "$RUNNER_TEMP/distribution.p12" -k "$keychain" -P "$certificate_password" -T /usr/bin/codesign
+          default_keychain=$(security default-keychain -d user | tr -d '"')
+          security list-keychains -d user -s "$keychain" "$default_keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain"
+          identity=$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Apple Distribution:[^"]*\)".*/\1/p' | head -n1)
+          test -n "$identity"
+          echo "IOS_DISTRIBUTION_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Build and package the iOS application
+        env:
+          VERSION: ${{ needs.check.outputs.next-version }}
+        run: |
+          once build TuistCodeiOSRelease
+          app=".once/out/TuistCodeiOSRelease/Tuist Code.app"
+          cp .signing/Tuist_Code_Ad_Hoc.mobileprovision "$app/embedded.mobileprovision"
+          security cms -D -i .signing/Tuist_Code_Ad_Hoc.mobileprovision > "$RUNNER_TEMP/profile.plist"
+          plutil -extract Entitlements xml1 -o "$RUNNER_TEMP/entitlements.plist" "$RUNNER_TEMP/profile.plist"
+          codesign --force --timestamp --sign "$IOS_DISTRIBUTION_IDENTITY" --entitlements "$RUNNER_TEMP/entitlements.plist" "$app"
+          mkdir -p release/Payload
+          ditto "$app" "release/Payload/Tuist Code.app"
+          (cd release && zip -qry "Tuist-Code-iOS-$VERSION.ipa" Payload)
+          codesign --verify --deep --strict --verbose=2 "release/Payload/Tuist Code.app"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-release
+          path: release/*.ipa
+          retention-days: 1
+
+  android:
+    name: Build and sign Android
+    needs: [check, preflight]
+    if: github.event_name != 'pull_request' && needs.check.outputs.should-release == 'true' && needs.preflight.result == 'success'
+    runs-on: ubuntu-24.04
+    env:
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          cache: true
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018
+      - name: Install the Android Rust standard library
+        run: mise exec -- rustup target add aarch64-linux-android
+      - name: Set the application version
+        env:
+          VERSION: ${{ needs.check.outputs.next-version }}
+        run: |
+          BUILD_NUMBER=$(scripts/release/version_code.sh "$VERSION")
+          export BUILD_NUMBER
+          scripts/release/set_android_version.sh
+      - name: Build and sign the Android application package
+        env:
+          VERSION: ${{ needs.check.outputs.next-version }}
+        run: |
+          android_root=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
+          ANDROID_SDK_ROOT="$android_root" ANDROID_NDK_HOME="$android_root/ndk/27.2.12479018" once build TuistCodeAndroidRelease
+          unsigned_apk=$(find .once/out/TuistCodeAndroidRelease -name '*.apk' -type f -print -quit)
+          test -n "$unsigned_apk"
+          op document get "Google Play release.keystore binary" --vault "Tuist Code" --out-file "$RUNNER_TEMP/release.keystore"
+          ANDROID_KEYSTORE_PASSWORD=$(op item get "Google Play release.keystore" --vault "Tuist Code" --reveal --format json | jq -r '.fields[] | select(.id == "password").value')
+          export ANDROID_KEYSTORE_PASSWORD
+          echo "::add-mask::$ANDROID_KEYSTORE_PASSWORD"
+          mkdir -p release
+          "$android_root/build-tools/35.0.0/zipalign" -f 4 "$unsigned_apk" "$RUNNER_TEMP/aligned.apk"
+          "$android_root/build-tools/35.0.0/apksigner" sign \
+            --ks "$RUNNER_TEMP/release.keystore" \
+            --ks-key-alias tuist \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --out "release/Tuist-Code-Android-$VERSION.apk" \
+            "$RUNNER_TEMP/aligned.apk"
+          "$android_root/build-tools/35.0.0/apksigner" verify --verbose "release/Tuist-Code-Android-$VERSION.apk"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-release
+          path: release/*.apk
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub release
+    needs: [check, macos, ios, android]
+    if: needs.check.outputs.should-release == 'true' && needs.macos.result == 'success' && needs.ios.result == 'success' && needs.android.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          cache: true
+          install_args: git-cliff
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: '*-release'
+          path: release
+          merge-multiple: true
+      - name: Generate release notes and checksums
+        env:
+          VERSION: ${{ needs.check.outputs.next-version }}
+        run: |
+          latest_version=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          if [[ -n "$latest_version" ]]; then
+            git cliff --config cliff.toml --tag "$VERSION" -- "$latest_version..HEAD" > release-notes.md
+          else
+            git cliff --config cliff.toml --tag "$VERSION" > release-notes.md
+          fi
+          (cd release && shasum -a 256 Tuist-Code-* > SHA256SUMS.txt)
+          (cd release && shasum -a 512 Tuist-Code-* > SHA512SUMS.txt)
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.check.outputs.next-version }}
+          target_commitish: ${{ github.sha }}
+          name: Tuist Code ${{ needs.check.outputs.next-version }}
+          body_path: release-notes.md
+          files: |
+            release/Tuist-Code-Android-*.apk
+            release/Tuist-Code-iOS-*.ipa
+            release/Tuist-Code-macOS-*.zip
+            release/SHA256SUMS.txt
+            release/SHA512SUMS.txt
+      - name: Publish the Sparkle application cast
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: appcast
+          name: Sparkle application cast
+          body: The stable update feed consumed by the Tuist Code macOS application.
+          files: release/appcast.xml
+          make_latest: 'false'

@@ -2,6 +2,9 @@
 rust = "1.94.1"
 java = "21.0.2"
 "github:tuist/once" = { version = "0.46.3", exe = "once" }
+git-cliff = "2.10.1"
+jq = "1.8.1"
+"1password-cli" = "2.32.0"
 
 [tasks.format]
 description = "Format shared Rust sources."
@@ -13,7 +16,15 @@ run = "rustfmt --check --edition 2024 shared/rust/src/lib.rs shared/rust/tests/i
 
 [tasks.build]
 description = "Build the macOS application bundle through Once."
-run = "once build TuistCodeDesktop"
+depends = ["prepare:sparkle"]
+run = """
+once build TuistCodeDesktop
+scripts/embed_sparkle.sh
+"""
+
+[tasks."prepare:sparkle"]
+description = "Download the checksum-pinned Sparkle framework."
+run = "scripts/prepare_sparkle.sh"
 
 [tasks."build:ios"]
 description = "Build the iOS simulator application bundle through Once."
@@ -22,6 +33,10 @@ run = "once build TuistCodeiOS"
 [tasks."build:android"]
 description = "Build the Android application package through Once."
 run = "once build TuistCodeAndroid"
+
+[tasks."release:check"]
+description = "Detect whether conventional commits require a new release."
+run = "scripts/release/check.sh"
 
 [tasks.test]
 description = "Run shared Rust tests through Once."
