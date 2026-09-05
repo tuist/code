@@ -5949,8 +5949,9 @@ private final class AppKitSettingsTabViewController: NSTabViewController {
 
 @MainActor
 private final class AppKitSettingsWindowController: NSWindowController {
-    private static let generalSize = NSSize(width: 540, height: 220)
-    private static let accountsSize = NSSize(width: 760, height: 520)
+    private static let generalSize = NSSize(width: 680, height: 220)
+    private static let accountsSize = NSSize(width: 680, height: 420)
+    private static let selectedPaneKey = "settings.selectedPane"
 
     init(accountStore: InferenceAccountStore, appearanceChanged: @escaping (AppKitAppearance) -> Void) {
         let tabController = AppKitSettingsTabViewController()
@@ -5971,18 +5972,23 @@ private final class AppKitSettingsWindowController: NSWindowController {
             systemSymbolName: "person.2",
             accessibilityDescription: "Inference Accounts"
         )
-        tabController.preferredContentSize = Self.generalSize
+        let storedPane = UserDefaults.standard.integer(forKey: Self.selectedPaneKey)
+        let selectedPane = tabController.tabViewItems.indices.contains(storedPane) ? storedPane : 0
+        tabController.selectedTabViewItemIndex = selectedPane
+        let initialSize = selectedPane == 0 ? Self.generalSize : Self.accountsSize
+        tabController.preferredContentSize = initialSize
 
         let window = NSWindow(contentViewController: tabController)
-        window.title = "Tuist Code Settings"
+        window.title = selectedPane == 0 ? "General" : "Inference Accounts"
         window.styleMask = [.titled, .closable]
-        window.setContentSize(Self.generalSize)
+        window.setContentSize(initialSize)
         window.center()
         super.init(window: window)
 
         tabController.selectionDidChange = { [weak window, weak tabController] selectedIndex in
             guard let window, let tabController else { return }
             let contentSize = selectedIndex == 0 ? Self.generalSize : Self.accountsSize
+            UserDefaults.standard.set(selectedIndex, forKey: Self.selectedPaneKey)
             tabController.preferredContentSize = contentSize
 
             let currentFrame = window.frame
@@ -6087,16 +6093,14 @@ private final class AppKitAccountsSettingsViewController: NSViewController,
     NSTableViewDelegate
 {
     private let accountStore: InferenceAccountStore
-    private let tableView = NSTableView()
+    private let accountPopup = NSPopUpButton()
     private let removeButton = NSButton()
     private let refreshButton = NSButton()
-    private let emptyStateView = NSStackView()
-    private let accountDetailView = NSStackView()
-    private let accountIcon = NSImageView()
-    private let accountNameLabel = NSTextField(labelWithString: "")
-    private let accountMetadataLabel = NSTextField(labelWithString: "")
-    private let modelsHeadingLabel = NSTextField(labelWithString: "Models")
-    private let modelsLabel = NSTextField(wrappingLabelWithString: "")
+    private let providerLabel = NSTextField(labelWithString: "Not configured")
+    private let statusLabel = NSTextField(labelWithString: "Not connected")
+    private let statusIndicator = NSView()
+    private let modelsHeadingLabel = NSTextField(labelWithString: "Available Models")
+    private let modelsTable = NSTableView()
     private var cancellables = Set<AnyCancellable>()
     private var lastPresentedAuthorizationURL: URL?
 
@@ -6110,159 +6114,131 @@ private final class AppKitAccountsSettingsViewController: NSViewController,
 
     override func loadView() {
         let root = NSView()
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.drawsBackground = false
-        tableView.headerView = nil
-        tableView.delegate = self
-        tableView.dataSource = self
-        tableView.rowHeight = 32
-        tableView.intercellSpacing = .zero
-        tableView.style = .sourceList
-        tableView.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("account")))
-        scroll.documentView = tableView
+
+        let heading = NSTextField(labelWithString: "Accounts")
+        heading.font = .systemFont(ofSize: 16, weight: .semibold)
+        let description = NSTextField(
+            wrappingLabelWithString: "Manage the accounts Tuist Code uses to run agent sessions."
+        )
+        description.textColor = .secondaryLabelColor
+
+        accountPopup.target = self
+        accountPopup.action = #selector(accountChanged(_:))
+        accountPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
 
         let addButton = NSButton(
-            image: NSImage(systemSymbolName: "plus", accessibilityDescription: "Add inference account") ?? NSImage(),
+            title: "Add Account…",
             target: self,
             action: #selector(showAddMenu(_:))
         )
-        addButton.bezelStyle = .smallSquare
-        addButton.toolTip = "Add inference account"
-        removeButton.image = NSImage(systemSymbolName: "minus", accessibilityDescription: "Remove inference account")
-        removeButton.bezelStyle = .smallSquare
+        removeButton.title = "Remove"
         removeButton.target = self
         removeButton.action = #selector(removeSelectedAccount(_:))
-        removeButton.toolTip = "Remove selected inference account"
+
+        let accountControls = NSStackView(views: [accountPopup, addButton, removeButton])
+        accountControls.orientation = .horizontal
+        accountControls.alignment = .centerY
+        accountControls.spacing = 8
+
+        statusIndicator.wantsLayer = true
+        statusIndicator.layer?.cornerRadius = 4
+        statusIndicator.widthAnchor.constraint(equalToConstant: 8).isActive = true
+        statusIndicator.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        let status = NSStackView(views: [statusIndicator, statusLabel, NSView()])
+        status.orientation = .horizontal
+        status.alignment = .centerY
+        status.spacing = 7
+
+        let form = NSGridView(views: [
+            [formLabel("Account:"), accountControls],
+            [formLabel("Provider:"), providerLabel],
+            [formLabel("Status:"), status],
+        ])
+        form.columnSpacing = 12
+        form.rowSpacing = 10
+        form.column(at: 0).xPlacement = .trailing
+        form.column(at: 1).xPlacement = .fill
+
+        let modelsColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("model"))
+        modelsColumn.title = "Model"
+        modelsColumn.minWidth = 260
+        modelsColumn.width = 330
+        let reasoningColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("reasoning"))
+        reasoningColumn.title = "Reasoning"
+        reasoningColumn.minWidth = 150
+        reasoningColumn.width = 220
+        modelsTable.addTableColumn(modelsColumn)
+        modelsTable.addTableColumn(reasoningColumn)
+        modelsTable.delegate = self
+        modelsTable.dataSource = self
+        modelsTable.rowHeight = 26
+        modelsTable.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        modelsTable.allowsEmptySelection = true
+
+        let modelsScroll = NSScrollView()
+        modelsScroll.borderType = .bezelBorder
+        modelsScroll.hasVerticalScroller = true
+        modelsScroll.autohidesScrollers = true
+        modelsScroll.documentView = modelsTable
+        modelsScroll.heightAnchor.constraint(equalToConstant: 170).isActive = true
+
         refreshButton.target = self
         refreshButton.action = #selector(performAccountAction(_:))
-        refreshButton.title = "Refresh Models"
-        let controls = NSStackView(views: [addButton, removeButton, NSView()])
-        controls.orientation = .horizontal
-        controls.spacing = 6
+        refreshButton.title = "Refresh"
 
-        let sidebarHeading = NSTextField(labelWithString: "Accounts")
-        sidebarHeading.font = .systemFont(ofSize: 13, weight: .semibold)
+        let modelsHeader = NSStackView(views: [modelsHeadingLabel, NSView(), refreshButton])
+        modelsHeader.orientation = .horizontal
+        modelsHeader.alignment = .centerY
+        modelsHeadingLabel.font = .systemFont(ofSize: 13, weight: .semibold)
 
-        let detailContainer = NSView()
-        configureDetailContainer(detailContainer)
-
-        let left = NSStackView(views: [sidebarHeading, scroll, controls])
-        left.orientation = .vertical
-        left.alignment = .leading
-        left.spacing = 8
-        scroll.widthAnchor.constraint(equalTo: left.widthAnchor).isActive = true
-        controls.widthAnchor.constraint(equalTo: left.widthAnchor).isActive = true
-        let split = NSSplitView()
-        split.isVertical = true
-        split.dividerStyle = .thin
-        split.addArrangedSubview(left)
-        split.addArrangedSubview(detailContainer)
-        root.addSubview(split)
-        split.translatesAutoresizingMaskIntoConstraints = false
-        let splitEdges = [
-            split.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
-            split.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
-            split.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
-            split.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -20),
-        ]
-        splitEdges.forEach { $0.priority = .defaultHigh }
-        let minimumScrollHeight = scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 280)
-        minimumScrollHeight.priority = .defaultHigh
-        let minimumDetailWidth = detailContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 420)
-        minimumDetailWidth.priority = .defaultHigh
-        NSLayoutConstraint.activate(splitEdges + [
-            left.widthAnchor.constraint(equalToConstant: 250),
-            minimumScrollHeight,
-            minimumDetailWidth,
+        let firstSeparator = NSBox()
+        firstSeparator.boxType = .separator
+        let secondSeparator = NSBox()
+        secondSeparator.boxType = .separator
+        let stack = NSStackView(views: [
+            heading,
+            description,
+            firstSeparator,
+            form,
+            secondSeparator,
+            modelsHeader,
+            modelsScroll,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.setCustomSpacing(4, after: heading)
+        stack.setCustomSpacing(16, after: description)
+        stack.setCustomSpacing(16, after: firstSeparator)
+        stack.setCustomSpacing(16, after: form)
+        root.addSubview(stack)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 30),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -30),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 24),
+            firstSeparator.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            form.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            secondSeparator.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            modelsHeader.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            modelsScroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         view = root
         observeStore()
-        updateSelection()
-    }
-
-    private func configureDetailContainer(_ detailContainer: NSView) {
-        let emptyIcon = NSImageView(image: NSImage(
-            systemSymbolName: "person.crop.circle.badge.questionmark",
-            accessibilityDescription: "No account selected"
-        ) ?? NSImage())
-        emptyIcon.contentTintColor = .tertiaryLabelColor
-        emptyIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 38, weight: .regular)
-        let emptyTitle = NSTextField(labelWithString: "Select an account")
-        emptyTitle.font = .systemFont(ofSize: 16, weight: .semibold)
-        let emptyDescription = NSTextField(
-            wrappingLabelWithString: "Choose an account to view its provider, sign-in status, and available models."
-        )
-        emptyDescription.textColor = .secondaryLabelColor
-        emptyDescription.alignment = .center
-        emptyStateView.setViews([emptyIcon, emptyTitle, emptyDescription], in: .top)
-        emptyStateView.orientation = .vertical
-        emptyStateView.alignment = .centerX
-        emptyStateView.spacing = 8
-        emptyStateView.setCustomSpacing(14, after: emptyIcon)
-
-        accountIcon.contentTintColor = AppKitPalette.accent
-        accountIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 28, weight: .regular)
-        accountNameLabel.font = .systemFont(ofSize: 17, weight: .semibold)
-        accountMetadataLabel.font = .systemFont(ofSize: 12)
-        accountMetadataLabel.textColor = .secondaryLabelColor
-        let accountLabels = NSStackView(views: [accountNameLabel, accountMetadataLabel])
-        accountLabels.orientation = .vertical
-        accountLabels.alignment = .leading
-        accountLabels.spacing = 3
-        let header = NSStackView(views: [accountIcon, accountLabels, NSView(), refreshButton])
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 12
-        accountIcon.widthAnchor.constraint(equalToConstant: 32).isActive = true
-        accountIcon.heightAnchor.constraint(equalToConstant: 32).isActive = true
-
-        let separator = NSBox()
-        separator.boxType = .separator
-        modelsHeadingLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        modelsLabel.font = .systemFont(ofSize: 13)
-        modelsLabel.maximumNumberOfLines = 0
-        modelsLabel.lineBreakMode = .byTruncatingTail
-        accountDetailView.setViews([header, separator, modelsHeadingLabel, modelsLabel], in: .top)
-        accountDetailView.orientation = .vertical
-        accountDetailView.alignment = .leading
-        accountDetailView.spacing = 14
-        accountDetailView.setCustomSpacing(18, after: separator)
-
-        detailContainer.addSubview(emptyStateView)
-        detailContainer.addSubview(accountDetailView)
-        emptyStateView.translatesAutoresizingMaskIntoConstraints = false
-        accountDetailView.translatesAutoresizingMaskIntoConstraints = false
-        let detailBottom = accountDetailView.bottomAnchor.constraint(
-            lessThanOrEqualTo: detailContainer.bottomAnchor,
-            constant: -24
-        )
-        detailBottom.priority = .defaultHigh
-        let detailTrailing = accountDetailView.trailingAnchor.constraint(
-            equalTo: detailContainer.trailingAnchor,
-            constant: -28
-        )
-        detailTrailing.priority = .defaultHigh
-        NSLayoutConstraint.activate([
-            emptyStateView.centerXAnchor.constraint(equalTo: detailContainer.centerXAnchor),
-            emptyStateView.centerYAnchor.constraint(equalTo: detailContainer.centerYAnchor, constant: -8),
-            emptyStateView.widthAnchor.constraint(lessThanOrEqualToConstant: 300),
-            accountDetailView.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor, constant: 28),
-            detailTrailing,
-            accountDetailView.topAnchor.constraint(equalTo: detailContainer.topAnchor, constant: 26),
-            detailBottom,
-            header.widthAnchor.constraint(equalTo: accountDetailView.widthAnchor),
-            separator.widthAnchor.constraint(equalTo: accountDetailView.widthAnchor),
-            modelsLabel.widthAnchor.constraint(equalTo: accountDetailView.widthAnchor),
-        ])
+        reloadAccounts()
     }
 
     private func observeStore() {
         accountStore.$accounts
             .sink { [weak self] _ in
-                self?.tableView.reloadData()
-                self?.updateSelection()
+                self?.reloadAccounts()
             }
+            .store(in: &cancellables)
+        accountStore.$modelsByAccountID
+            .sink { [weak self] _ in self?.updateSelection() }
+            .store(in: &cancellables)
+        accountStore.$refreshingModelAccountIDs
+            .sink { [weak self] _ in self?.updateSelection() }
             .store(in: &cancellables)
         Publishers.CombineLatest3(
             accountStore.$authorizationURL,
@@ -6279,77 +6255,113 @@ private final class AppKitAccountsSettingsViewController: NSViewController,
             .store(in: &cancellables)
     }
 
-    func numberOfRows(in _: NSTableView) -> Int { accountStore.accounts.count }
+    private func formLabel(_ title: String) -> NSTextField {
+        let label = NSTextField(labelWithString: title)
+        label.alignment = .right
+        return label
+    }
 
-    func tableView(_: NSTableView, viewFor _: NSTableColumn?, row: Int) -> NSView? {
-        let account = accountStore.accounts[row]
+    private var models: [InferenceModel] {
+        selectedAccount.map(accountStore.models(for:)) ?? []
+    }
+
+    func numberOfRows(in _: NSTableView) -> Int { models.count }
+
+    func tableView(_: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard models.indices.contains(row) else { return nil }
+        let model = models[row]
+        let value: String
+        if tableColumn?.identifier.rawValue == "reasoning" {
+            let efforts = model.reasoningEfforts.map(\.title)
+            if let first = efforts.first, let last = efforts.last, first != last {
+                value = "\(first) to \(last)"
+            } else {
+                value = efforts.first ?? "Not specified"
+            }
+        } else {
+            value = model.name
+        }
+        let label = NSTextField(labelWithString: value)
+        label.lineBreakMode = .byTruncatingTail
+        if tableColumn?.identifier.rawValue == "reasoning" {
+            label.textColor = .secondaryLabelColor
+            label.toolTip = model.reasoningEfforts.map(\.title).joined(separator: ", ")
+        }
         let cell = NSTableCellView()
-        let label = NSTextField(labelWithString: account.name)
-        let provider = accountStore.provider(for: account)
-        let image = NSImageView(image: NSImage(
-            systemSymbolName: provider?.symbolName ?? "cpu",
-            accessibilityDescription: provider?.name ?? "Provider"
-        ) ?? NSImage())
-        image.contentTintColor = AppKitPalette.accent
-        cell.addSubview(image)
+        cell.textField = label
         cell.addSubview(label)
-        image.translatesAutoresizingMaskIntoConstraints = false
         label.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            image.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
-            image.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            image.widthAnchor.constraint(equalToConstant: 16),
-            image.heightAnchor.constraint(equalToConstant: 16),
-            label.leadingAnchor.constraint(equalTo: image.trailingAnchor, constant: 8),
-            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
             label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
         ])
         return cell
     }
 
-    func tableViewSelectionDidChange(_: Notification) { updateSelection() }
-
     private var selectedAccount: InferenceAccount? {
-        guard tableView.selectedRow >= 0, accountStore.accounts.indices.contains(tableView.selectedRow) else { return nil }
-        return accountStore.accounts[tableView.selectedRow]
+        guard let accountID = accountPopup.selectedItem?.representedObject as? String else { return nil }
+        return accountStore.accounts.first(where: { $0.id == accountID })
+    }
+
+    private func reloadAccounts() {
+        let selectedAccountID = selectedAccount?.id
+        accountPopup.removeAllItems()
+        accountStore.accounts.forEach { account in
+            accountPopup.addItem(withTitle: account.name)
+            accountPopup.lastItem?.representedObject = account.id
+            if let provider = accountStore.provider(for: account) {
+                accountPopup.lastItem?.image = NSImage(
+                    systemSymbolName: provider.symbolName,
+                    accessibilityDescription: provider.name
+                )
+            }
+        }
+        if let selectedAccountID,
+           let item = accountPopup.itemArray.first(where: { ($0.representedObject as? String) == selectedAccountID })
+        {
+            accountPopup.select(item)
+        } else if !accountStore.accounts.isEmpty {
+            accountPopup.selectItem(at: 0)
+        }
+        accountPopup.isEnabled = !accountStore.accounts.isEmpty
+        updateSelection()
     }
 
     private func updateSelection() {
         guard let account = selectedAccount else {
-            emptyStateView.isHidden = false
-            accountDetailView.isHidden = true
+            providerLabel.stringValue = "Not configured"
+            statusLabel.stringValue = "Not connected"
+            statusIndicator.layer?.backgroundColor = NSColor.tertiaryLabelColor.cgColor
+            modelsHeadingLabel.stringValue = "Available Models"
+            modelsTable.reloadData()
             removeButton.isEnabled = false
             refreshButton.isEnabled = false
             return
         }
         let provider = accountStore.provider(for: account)
-        let models = accountStore.models(for: account)
-        let visibleModels = models.prefix(14).map { "• \($0.name)" }
-        let remainingCount = models.count - visibleModels.count
-        let modelLines = visibleModels + (remainingCount > 0 ? ["+ \(remainingCount) more"] : [])
-
-        emptyStateView.isHidden = true
-        accountDetailView.isHidden = false
-        accountIcon.image = NSImage(
-            systemSymbolName: provider?.symbolName ?? "cpu",
-            accessibilityDescription: provider?.name ?? "Provider"
-        )
-        accountNameLabel.stringValue = account.name
-        accountMetadataLabel.stringValue = "\(provider?.name ?? account.providerID)  ·  \(account.state.title)"
-        modelsHeadingLabel.stringValue = models.isEmpty ? "Models" : "Models (\(models.count))"
-        modelsLabel.stringValue = modelLines.isEmpty ? "No models loaded." : modelLines.joined(separator: "\n")
-        modelsLabel.textColor = modelLines.isEmpty ? .secondaryLabelColor : .labelColor
+        providerLabel.stringValue = provider?.name ?? account.providerID
+        statusLabel.stringValue = account.state.title
+        statusIndicator.layer?.backgroundColor = (
+            account.state == .configured ? NSColor.systemGreen : NSColor.systemOrange
+        ).cgColor
+        modelsHeadingLabel.stringValue = models.isEmpty ? "Available Models" : "Available Models (\(models.count))"
+        modelsTable.reloadData()
         removeButton.isEnabled = true
         refreshButton.isEnabled = true
         switch account.state {
         case .configured:
-            refreshButton.title = "Refresh Models"
+            let refreshing = accountStore.isRefreshingModels(for: account)
+            refreshButton.title = refreshing ? "Refreshing…" : "Refresh"
+            refreshButton.isEnabled = !refreshing
         case .requiresAuthorization:
             refreshButton.title = "Sign In"
         case .authorizing:
             refreshButton.title = "Cancel Sign In"
         }
     }
+
+    @objc private func accountChanged(_: Any?) { updateSelection() }
 
     @objc private func showAddMenu(_ sender: NSButton) {
         let menu = NSMenu()
