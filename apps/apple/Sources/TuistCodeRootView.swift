@@ -4592,11 +4592,13 @@ final class AppKitMainWindowController: NSWindowController, NSToolbarDelegate {
     init() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1120, height: 720),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = String(cString: tuistCodeAppName())
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
         window.minSize = NSSize(width: 800, height: 500)
         window.center()
         super.init(window: window)
@@ -4744,6 +4746,7 @@ final class AppKitMainWindowController: NSWindowController, NSToolbarDelegate {
     }
 
     private func configureSplitView() {
+        sidebarController.preferredContentSize = NSSize(width: 280, height: 600)
         sidebarController.onSelection = { [weak self] selection in
             self?.select(selection)
         }
@@ -4751,7 +4754,7 @@ final class AppKitMainWindowController: NSWindowController, NSToolbarDelegate {
             self?.deleteSession(target)
         }
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarController)
-        sidebarItem.minimumThickness = 220
+        sidebarItem.minimumThickness = 240
         sidebarItem.maximumThickness = 360
         sidebarItem.canCollapse = true
         splitViewController.addSplitViewItem(sidebarItem)
@@ -4770,6 +4773,7 @@ final class AppKitMainWindowController: NSWindowController, NSToolbarDelegate {
         let toolbar = NSToolbar(identifier: "dev.tuist.code.main-toolbar")
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
+        toolbar.showsBaselineSeparator = false
         toolbar.allowsUserCustomization = true
         window?.toolbar = toolbar
         window?.toolbarStyle = .unified
@@ -5088,11 +5092,23 @@ final class AppKitMainWindowController: NSWindowController, NSToolbarDelegate {
     }
 
     func toolbarAllowedItemIdentifiers(_: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.toggleSidebar, .flexibleSpace, Self.addToolbarIdentifier, Self.accountToolbarIdentifier]
+        [
+            .toggleSidebar,
+            .sidebarTrackingSeparator,
+            Self.addToolbarIdentifier,
+            Self.accountToolbarIdentifier,
+            .flexibleSpace,
+        ]
     }
 
     func toolbarDefaultItemIdentifiers(_: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.toggleSidebar, .flexibleSpace, Self.addToolbarIdentifier, Self.accountToolbarIdentifier]
+        [
+            .toggleSidebar,
+            .sidebarTrackingSeparator,
+            Self.addToolbarIdentifier,
+            Self.accountToolbarIdentifier,
+            .flexibleSpace,
+        ]
     }
 
     func toolbar(
@@ -5130,6 +5146,7 @@ final class AppKitMainWindowController: NSWindowController, NSToolbarDelegate {
                 action: #selector(showAccountMenu(_:))
             )
             button.bezelStyle = .toolbar
+            button.contentTintColor = AppKitPalette.accent
             item.view = button
             return item
         default:
@@ -5204,12 +5221,14 @@ private final class AppKitWorkspaceSidebarViewController: NSViewController,
     private var pendingSelection: AppKitNavigationSelection?
 
     override func loadView() {
+        let container = NSView()
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = false
         outlineView.headerView = nil
         outlineView.style = .sourceList
         outlineView.rowSizeStyle = .default
+        outlineView.rowHeight = 28
         outlineView.allowsEmptySelection = true
         outlineView.dataSource = self
         outlineView.delegate = self
@@ -5219,7 +5238,24 @@ private final class AppKitWorkspaceSidebarViewController: NSViewController,
         outlineView.addTableColumn(column)
         outlineView.outlineTableColumn = column
         scrollView.documentView = outlineView
-        view = scrollView
+
+        let heading = NSTextField(labelWithString: "Workspaces")
+        heading.font = .preferredFont(forTextStyle: .headline)
+        heading.textColor = .secondaryLabelColor
+        container.addSubview(heading)
+        container.addSubview(scrollView)
+        heading.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            heading.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 16),
+            heading.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -12),
+            heading.topAnchor.constraint(equalTo: container.safeAreaLayoutGuide.topAnchor, constant: 12),
+            scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 6),
+            scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+        view = container
     }
 
     func render(workspaces: [Workspace], selecting selection: AppKitNavigationSelection?) {
@@ -5317,7 +5353,12 @@ private final class AppKitWorkspaceSidebarViewController: NSViewController,
         }
         cell.textField?.stringValue = node.title
         cell.imageView?.image = NSImage(systemSymbolName: node.symbolName, accessibilityDescription: node.title)
+        cell.imageView?.contentTintColor = AppKitPalette.accent
         return cell
+    }
+
+    func outlineView(_: NSOutlineView, rowViewForItem _: Any) -> NSTableRowView? {
+        AppKitSidebarRowView()
     }
 
     func outlineViewSelectionDidChange(_: Notification) {
@@ -5384,6 +5425,20 @@ private final class AppKitDeleteOutlineView: NSOutlineView {
     }
 }
 
+private final class AppKitSidebarRowView: NSTableRowView {
+    override var isEmphasized: Bool {
+        get { false }
+        set {}
+    }
+
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard selectionHighlightStyle != .none else { return }
+        let selectionRect = bounds.insetBy(dx: 6, dy: 1)
+        AppKitPalette.selection.setFill()
+        NSBezierPath(roundedRect: selectionRect, xRadius: 6, yRadius: 6).fill()
+    }
+}
+
 @MainActor
 private final class AppKitEmptyStateViewController: NSViewController {
     private let stateTitle: String
@@ -5413,13 +5468,14 @@ private final class AppKitEmptyStateViewController: NSViewController {
     override func loadView() {
         let container = NSView()
         let image = NSImageView(image: NSImage(systemSymbolName: symbolName, accessibilityDescription: stateTitle) ?? NSImage())
-        image.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 32, weight: .regular)
+        image.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 36, weight: .regular)
         image.contentTintColor = .secondaryLabelColor
         let titleLabel = NSTextField(labelWithString: stateTitle)
-        titleLabel.font = .preferredFont(forTextStyle: .title2)
+        titleLabel.font = .systemFont(ofSize: 22, weight: .bold)
         titleLabel.alignment = .center
         let messageLabel = NSTextField(wrappingLabelWithString: message)
         messageLabel.textColor = .secondaryLabelColor
+        messageLabel.font = .systemFont(ofSize: 14)
         messageLabel.alignment = .center
         messageLabel.maximumNumberOfLines = 3
         let views: [NSView]
@@ -5441,7 +5497,7 @@ private final class AppKitEmptyStateViewController: NSViewController {
             stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
             stack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
             stack.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
-            messageLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 500),
+            messageLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 360),
         ])
         view = container
     }
@@ -5453,6 +5509,20 @@ private final class AppKitEmptyStateViewController: NSViewController {
 #endif
 
 #if os(macOS)
+private enum AppKitPalette {
+    static let accent = NSColor(
+        calibratedRed: 111 / 255,
+        green: 44 / 255,
+        blue: 1,
+        alpha: 1
+    )
+    static let selection = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(calibratedRed: 67 / 255, green: 49 / 255, blue: 111 / 255, alpha: 1)
+            : NSColor(calibratedRed: 232 / 255, green: 225 / 255, blue: 1, alpha: 1)
+    }
+}
+
 private enum AppKitAppearance: String, CaseIterable {
     case system
     case light
@@ -5490,6 +5560,7 @@ private final class AppKitAgentSessionViewController: NSViewController {
 
     private let statusImage = NSImageView()
     private let statusLabel = NSTextField(labelWithString: "Start the agent")
+    private let transcriptScroll = NSScrollView()
     private let transcriptTextView = NSTextView()
     private let approvalBox = NSBox()
     private let approvalLabel = NSTextField(wrappingLabelWithString: "")
@@ -5590,9 +5661,9 @@ private final class AppKitAgentSessionViewController: NSViewController {
             width: 700,
             height: CGFloat.greatestFiniteMagnitude
         )
-        let transcriptScroll = NSScrollView()
         transcriptScroll.hasVerticalScroller = true
         transcriptScroll.borderType = .noBorder
+        transcriptScroll.drawsBackground = false
         transcriptScroll.documentView = transcriptTextView
 
         configureApprovalBox()
@@ -5624,7 +5695,7 @@ private final class AppKitAgentSessionViewController: NSViewController {
         NSLayoutConstraint.activate([
             contentStack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
             contentStack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
-            contentStack.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
+            contentStack.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: 12),
             contentStack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16),
             header.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
             locationLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
@@ -5638,6 +5709,14 @@ private final class AppKitAgentSessionViewController: NSViewController {
         restoreConfiguration()
         updateContent()
         observeStores()
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        let width = transcriptScroll.contentSize.width
+        guard width > 0 else { return }
+        transcriptTextView.frame.size.width = width
+        transcriptTextView.textContainer?.containerSize.width = width
     }
 
     private func configureApprovalBox() {
@@ -5865,8 +5944,10 @@ private final class AppKitSettingsWindowController: NSWindowController {
         tabController.tabStyle = .toolbar
         let general = AppKitGeneralSettingsViewController(appearanceChanged: appearanceChanged)
         general.title = "General"
+        general.preferredContentSize = NSSize(width: 720, height: 400)
         let accounts = AppKitAccountsSettingsViewController(accountStore: accountStore)
         accounts.title = "Inference Accounts"
+        accounts.preferredContentSize = NSSize(width: 720, height: 400)
         tabController.addChild(general)
         tabController.addChild(accounts)
         tabController.tabViewItems[0].image = NSImage(
@@ -5877,11 +5958,14 @@ private final class AppKitSettingsWindowController: NSWindowController {
             systemSymbolName: "person.2",
             accessibilityDescription: "Inference Accounts"
         )
+        tabController.preferredContentSize = NSSize(width: 720, height: 400)
 
         let window = NSWindow(contentViewController: tabController)
         window.title = "Tuist Code Settings"
         window.styleMask = [.titled, .closable]
         window.setContentSize(NSSize(width: 720, height: 470))
+        window.contentMinSize = NSSize(width: 720, height: 400)
+        window.minSize = NSSize(width: 720, height: 470)
         window.center()
         super.init(window: window)
     }
@@ -5984,12 +6068,21 @@ private final class AppKitAccountsSettingsViewController: NSViewController,
         removeButton.action = #selector(removeSelectedAccount(_:))
         refreshButton.target = self
         refreshButton.action = #selector(performAccountAction(_:))
+        refreshButton.title = "Refresh Models"
         let controls = NSStackView(views: [addButton, removeButton, NSView(), refreshButton])
         controls.orientation = .horizontal
         controls.spacing = 6
 
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.maximumNumberOfLines = 0
+        let detailContainer = NSView()
+        detailContainer.addSubview(detailLabel)
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            detailLabel.leadingAnchor.constraint(equalTo: detailContainer.leadingAnchor, constant: 24),
+            detailLabel.trailingAnchor.constraint(equalTo: detailContainer.trailingAnchor, constant: -24),
+            detailLabel.topAnchor.constraint(equalTo: detailContainer.topAnchor, constant: 24),
+        ])
         let left = NSStackView(views: [scroll, controls])
         left.orientation = .vertical
         left.alignment = .leading
@@ -6000,7 +6093,7 @@ private final class AppKitAccountsSettingsViewController: NSViewController,
         split.isVertical = true
         split.dividerStyle = .thin
         split.addArrangedSubview(left)
-        split.addArrangedSubview(detailLabel)
+        split.addArrangedSubview(detailContainer)
         root.addSubview(split)
         split.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -6008,8 +6101,9 @@ private final class AppKitAccountsSettingsViewController: NSViewController,
             split.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
             split.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
             split.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -20),
-            left.widthAnchor.constraint(greaterThanOrEqualToConstant: 250),
-            detailLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
+            left.widthAnchor.constraint(equalToConstant: 280),
+            scroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 280),
+            detailContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
         ])
         view = root
         observeStore()
@@ -6049,6 +6143,7 @@ private final class AppKitAccountsSettingsViewController: NSViewController,
             systemSymbolName: provider?.symbolName ?? "cpu",
             accessibilityDescription: provider?.name ?? "Provider"
         ) ?? NSImage())
+        image.contentTintColor = AppKitPalette.accent
         cell.addSubview(image)
         cell.addSubview(label)
         image.translatesAutoresizingMaskIntoConstraints = false
