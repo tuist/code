@@ -18,6 +18,8 @@
     <string>1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
     <key>NSPrincipalClass</key>
@@ -31,5 +33,9 @@
             </array>
         </dict>
     </array>
+    <key>SUFeedURL</key>
+    <string>https://github.com/tuist/code/releases/download/appcast/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>XUfguyGrLktmv6E4C/iqfw8p57HWKqx4mJ/hG4/lbMk=</string>
 </dict>
 </plist>
