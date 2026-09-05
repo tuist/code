@@ -1,8 +1,12 @@
 import AuthenticationServices
+import Combine
 import CryptoKit
 import Foundation
 import Security
+
+#if os(iOS)
 import SwiftUI
+#endif
 
 #if os(macOS)
 import AppKit
@@ -109,6 +113,7 @@ private func tuistCodeExecuteAgentTool(
     _ outputCapacity: Int
 ) -> Int32
 
+#if os(iOS)
 struct TuistCodeRootView: View {
     @StateObject private var authentication = AuthenticationService()
     @Environment(\.tuistCodeTheme) private var theme
@@ -1020,12 +1025,13 @@ private struct AgentSessionView: View {
             : availableReasoningEfforts.first ?? .none
     }
 }
+#endif
 
 /// The capability supplied to an agent as soon as a local session begins.
 ///
 /// The agent runner can use `prompt(for:)` as its system context and bind this
 /// definition to `WorkspaceStore.renameSessionAndWorktree`. Keeping the
-/// capability separate from the SwiftUI view makes the same contract portable
+/// capability separate from the user-interface view makes the same contract portable
 /// to another desktop client.
 private enum AgentSessionTools {
     static func prompt(
@@ -1110,6 +1116,7 @@ fileprivate struct AgentSessionRuntimeSnapshot: Identifiable, Hashable {
     }
 }
 
+#if os(iOS)
 private struct AgentSessionRunView: View {
     @EnvironmentObject private var agentRuntime: AgentSessionRuntimeStore
 
@@ -1225,6 +1232,7 @@ private struct AgentSessionRunView: View {
         }
     }
 }
+#endif
 
 /// Owns provider conversations independently from navigation, allowing several
 /// worktree sessions to progress while the user moves between them.
@@ -1478,7 +1486,7 @@ final class AgentSessionRuntimeStore: ObservableObject {
     }
 }
 
-/// Bridges the headless Rust agent process to SwiftUI. It forwards JSON Lines
+/// Bridges the headless Rust agent process to the native user interface. It forwards JSON Lines
 /// events and never implements provider or tool-loop behaviour itself.
 #if os(macOS)
 private final class RustAgentRunner {
@@ -1888,6 +1896,7 @@ private enum SharedAgentToolRuntime {
     }
 }
 
+#if os(iOS)
 struct TuistCodeSettingsView: View {
     @EnvironmentObject private var themeStore: TuistCodeThemeStore
 
@@ -2602,6 +2611,7 @@ private struct CloneRepositorySheet: View {
         #endif
     }
 }
+#endif
 
 private enum SharedProjectService {
     private static let outputPathCapacity = 4_096
@@ -4559,6 +4569,1646 @@ private extension String {
     }
 }
 
+#if os(macOS)
+@MainActor
+final class AppKitMainWindowController: NSWindowController, NSToolbarDelegate {
+    private let workspaceStore = WorkspaceStore()
+    private let accountStore = InferenceAccountStore()
+    private let runtimeStore = AgentSessionRuntimeStore()
+    private let authentication = AuthenticationService()
+    private let splitViewController = NSSplitViewController()
+    private let sidebarController = AppKitWorkspaceSidebarViewController()
+    private var detailController: NSViewController?
+    private var settingsWindowController: AppKitSettingsWindowController?
+    private var selectedWorkspaceID: Workspace.ID?
+    private var selectedProjectIDs = [Workspace.ID: LocalProject.ID]()
+    private var activeSessionTarget: AgentSessionTarget?
+    private weak var cloneDestinationField: NSTextField?
+    private var cancellables = Set<AnyCancellable>()
+
+    private static let addToolbarIdentifier = NSToolbarItem.Identifier("dev.tuist.code.toolbar.add")
+    private static let accountToolbarIdentifier = NSToolbarItem.Identifier("dev.tuist.code.toolbar.account")
+
+    init() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 720),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = String(cString: tuistCodeAppName())
+        window.minSize = NSSize(width: 800, height: 500)
+        window.center()
+        super.init(window: window)
+
+        configureSplitView()
+        configureToolbar()
+        observeStores()
+        applyStoredAppearance()
+
+        selectedWorkspaceID = workspaceStore.workspaces.first?.id
+        sidebarController.render(workspaces: workspaceStore.workspaces, selecting: .workspace(selectedWorkspaceID))
+        showProjectOverview()
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        nil
+    }
+
+    @objc func newWorkspace(_: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "New Workspace"
+        alert.informativeText = "Create a workspace to organize related repositories."
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        let nameField = NSTextField(string: "")
+        nameField.placeholderString = "Workspace name"
+        nameField.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+        alert.accessoryView = nameField
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        let workspace = workspaceStore.addWorkspace(named: name)
+        selectedWorkspaceID = workspace.id
+        activeSessionTarget = nil
+        sidebarController.render(workspaces: workspaceStore.workspaces, selecting: .workspace(workspace.id))
+        showProjectOverview()
+    }
+
+    @objc func addLocalRepository(_: Any?) {
+        guard let workspaceID = selectedWorkspaceID else {
+            showMessage("Select a workspace before adding a repository.")
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.title = "Add Local Repository"
+        panel.message = "Choose a folder that contains a Git repository."
+        panel.prompt = "Add Repository"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let directoryURL = panel.url else { return }
+        guard let project = workspaceStore.addLocalProject(at: directoryURL, to: workspaceID) else {
+            presentWorkspaceError()
+            return
+        }
+        selectedProjectIDs[workspaceID] = project.id
+        activeSessionTarget = nil
+        sidebarController.render(
+            workspaces: workspaceStore.workspaces,
+            selecting: .project(workspaceID: workspaceID, projectID: project.id)
+        )
+        showProjectOverview()
+    }
+
+    @objc func cloneRepository(_: Any?) {
+        guard let workspaceID = selectedWorkspaceID else {
+            showMessage("Select a workspace before cloning a repository.")
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Clone Repository"
+        alert.informativeText = "Enter a remote repository address and choose its parent folder."
+        alert.addButton(withTitle: "Clone")
+        alert.addButton(withTitle: "Cancel")
+
+        let remoteField = NSTextField(string: "")
+        remoteField.placeholderString = "https://github.com/organization/repository.git"
+        let destinationField = NSTextField(string: FileManager.default.homeDirectoryForCurrentUser.path)
+        destinationField.placeholderString = "Destination parent folder"
+        let chooseButton = NSButton(title: "Choose…", target: nil, action: nil)
+        let destinationRow = NSStackView(views: [destinationField, chooseButton])
+        destinationRow.orientation = .horizontal
+        destinationRow.spacing = 8
+        destinationField.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        let stack = NSStackView(views: [remoteField, destinationRow])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.frame = NSRect(x: 0, y: 0, width: 430, height: 60)
+        remoteField.widthAnchor.constraint(equalToConstant: 430).isActive = true
+        alert.accessoryView = stack
+        chooseButton.target = self
+        chooseButton.action = #selector(chooseCloneDestination(_:))
+        cloneDestinationField = destinationField
+
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            cloneDestinationField = nil
+            return
+        }
+        cloneDestinationField = nil
+        let remote = remoteField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let destination = destinationField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !remote.isEmpty, !destination.isEmpty else { return }
+        guard let project = workspaceStore.cloneRepository(
+            remote,
+            into: URL(fileURLWithPath: destination),
+            workspaceID: workspaceID
+        ) else {
+            presentWorkspaceError()
+            return
+        }
+        selectedProjectIDs[workspaceID] = project.id
+        activeSessionTarget = nil
+        sidebarController.render(
+            workspaces: workspaceStore.workspaces,
+            selecting: .project(workspaceID: workspaceID, projectID: project.id)
+        )
+        showProjectOverview()
+    }
+
+    @objc func showSettings(_: Any?) {
+        if settingsWindowController == nil {
+            settingsWindowController = AppKitSettingsWindowController(accountStore: accountStore) { [weak self] appearance in
+                self?.apply(appearance: appearance)
+            }
+        }
+        settingsWindowController?.showWindow(nil)
+        settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func chooseCloneDestination(_ sender: NSButton) {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Clone Destination"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK,
+              let url = panel.url,
+              let field = cloneDestinationField
+        else {
+            return
+        }
+        field.stringValue = url.path
+    }
+
+    private func configureSplitView() {
+        sidebarController.onSelection = { [weak self] selection in
+            self?.select(selection)
+        }
+        sidebarController.onDeleteSession = { [weak self] target in
+            self?.deleteSession(target)
+        }
+        let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarController)
+        sidebarItem.minimumThickness = 220
+        sidebarItem.maximumThickness = 360
+        sidebarItem.canCollapse = true
+        splitViewController.addSplitViewItem(sidebarItem)
+
+        let initialDetail = AppKitEmptyStateViewController(
+            title: "Select a project",
+            message: "Choose a repository in the sidebar to view its agent sessions.",
+            symbolName: "folder"
+        )
+        detailController = initialDetail
+        splitViewController.addSplitViewItem(NSSplitViewItem(viewController: initialDetail))
+        window?.contentViewController = splitViewController
+    }
+
+    private func configureToolbar() {
+        let toolbar = NSToolbar(identifier: "dev.tuist.code.main-toolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = true
+        window?.toolbar = toolbar
+        window?.toolbarStyle = .unified
+    }
+
+    private func observeStores() {
+        workspaceStore.$workspaces
+            .dropFirst()
+            .sink { [weak self] workspaces in
+                guard let self else { return }
+                self.sidebarController.render(workspaces: workspaces, selecting: self.currentSelection)
+                self.refreshVisibleDetail()
+            }
+            .store(in: &cancellables)
+
+        workspaceStore.$errorMessage
+            .compactMap { $0 }
+            .sink { [weak self] message in
+                self?.showMessage(message)
+                self?.workspaceStore.errorMessage = nil
+            }
+            .store(in: &cancellables)
+
+        authentication.$state
+            .sink { [weak self] _ in
+                self?.window?.toolbar?.validateVisibleItems()
+            }
+            .store(in: &cancellables)
+
+        authentication.$errorMessage
+            .compactMap { $0 }
+            .sink { [weak self] message in self?.showMessage(message) }
+            .store(in: &cancellables)
+    }
+
+    private var currentSelection: AppKitNavigationSelection? {
+        if let activeSessionTarget {
+            return .session(activeSessionTarget)
+        }
+        guard let selectedWorkspaceID else { return nil }
+        if let projectID = selectedProjectIDs[selectedWorkspaceID] {
+            return .project(workspaceID: selectedWorkspaceID, projectID: projectID)
+        }
+        return .workspace(selectedWorkspaceID)
+    }
+
+    private var selectedProject: LocalProject? {
+        guard let selectedWorkspaceID,
+              let projectID = selectedProjectIDs[selectedWorkspaceID]
+        else {
+            return nil
+        }
+        return workspaceStore.workspaces.first(where: { $0.id == selectedWorkspaceID })?
+            .projects.first(where: { $0.id == projectID })
+    }
+
+    private func select(_ selection: AppKitNavigationSelection) {
+        switch selection {
+        case let .workspace(workspaceID):
+            selectedWorkspaceID = workspaceID
+            activeSessionTarget = nil
+        case let .project(workspaceID, projectID):
+            selectedWorkspaceID = workspaceID
+            selectedProjectIDs[workspaceID] = projectID
+            activeSessionTarget = nil
+        case let .session(target):
+            selectedWorkspaceID = target.workspaceID
+            selectedProjectIDs[target.workspaceID] = target.projectID
+            activeSessionTarget = target
+        case let .newSession(workspaceID, projectID, worktreeID):
+            selectedWorkspaceID = workspaceID
+            selectedProjectIDs[workspaceID] = projectID
+            activeSessionTarget = nil
+            guard let project = workspaceStore.workspaces.first(where: { $0.id == workspaceID })?
+                .projects.first(where: { $0.id == projectID }),
+                let worktree = project.worktrees.first(where: { $0.id == worktreeID })
+            else {
+                return
+            }
+            createSession(in: worktree, project: project)
+            return
+        }
+        refreshVisibleDetail()
+    }
+
+    private func refreshVisibleDetail() {
+        if let target = activeSessionTarget,
+           let project = project(for: target),
+           let worktree = project.worktrees.first(where: { $0.id == target.worktreeID }),
+           let session = worktree.sessions.first(where: { $0.id == target.sessionID })
+        {
+            showSession(project: project, worktree: worktree, session: session, target: target)
+        } else {
+            showProjectOverview()
+        }
+    }
+
+    private func showProjectOverview() {
+        guard let project = selectedProject else {
+            replaceDetail(with: AppKitEmptyStateViewController(
+                title: "Select a project",
+                message: "Choose a repository in the sidebar to view its agent sessions.",
+                symbolName: "folder"
+            ))
+            return
+        }
+        let hasRemoteSessions = SharedCapabilityService.remoteSessionsAreAvailable(for: authentication.state)
+        let message: String
+        if project.worktrees.isEmpty {
+            message = hasRemoteSessions
+                ? "Create a worktree for \(project.name), then start an agent session. Remote sessions are available through Tuist."
+                : "Create a worktree for \(project.name), then start an agent session. Connect to Tuist to unlock remote sessions."
+        } else {
+            message = "Choose a session in the sidebar, or create another worktree for \(project.name)."
+        }
+        let controller = AppKitEmptyStateViewController(
+            title: project.worktrees.isEmpty ? "No agent sessions" : "Select an agent session",
+            message: message,
+            symbolName: project.worktrees.isEmpty ? "sparkles" : "sidebar.left",
+            actionTitle: "New Worktree"
+        ) { [weak self] in
+            self?.createWorktree(for: project)
+        }
+        controller.title = project.name
+        replaceDetail(with: controller)
+    }
+
+    private func showSession(
+        project: LocalProject,
+        worktree: ProjectWorktree,
+        session: AgentSession,
+        target: AgentSessionTarget
+    ) {
+        let controller = AppKitAgentSessionViewController(
+            project: project,
+            worktree: worktree,
+            session: session,
+            accountStore: accountStore,
+            runtimeStore: runtimeStore,
+            onClose: { [weak self] in
+                guard let self else { return }
+                self.activeSessionTarget = nil
+                self.sidebarController.render(
+                    workspaces: self.workspaceStore.workspaces,
+                    selecting: .project(workspaceID: target.workspaceID, projectID: target.projectID)
+                )
+                self.showProjectOverview()
+            },
+            onNewSession: { [weak self] in self?.createSession(in: worktree, project: project) },
+            onStart: { [weak self] prompt, configuration in
+                self?.startAgentSession(prompt: prompt, configuration: configuration, target: target)
+            }
+        )
+        controller.title = session.title
+        replaceDetail(with: controller)
+    }
+
+    private func replaceDetail(with controller: NSViewController) {
+        guard splitViewController.splitViewItems.count > 1 else { return }
+        splitViewController.removeSplitViewItem(splitViewController.splitViewItems[1])
+        splitViewController.addSplitViewItem(NSSplitViewItem(viewController: controller))
+        detailController = controller
+        window?.title = controller.title.map { "\($0) — Tuist Code" } ?? "Tuist Code"
+    }
+
+    private func createWorktree(for project: LocalProject) {
+        guard let workspaceID = selectedWorkspaceID,
+              let worktree = workspaceStore.createWorktree(in: workspaceID, projectID: project.id),
+              let session = worktree.sessions.first
+        else {
+            presentWorkspaceError()
+            return
+        }
+        let target = AgentSessionTarget(
+            workspaceID: workspaceID,
+            projectID: project.id,
+            worktreeID: worktree.id,
+            sessionID: session.id
+        )
+        activeSessionTarget = target
+        sidebarController.render(workspaces: workspaceStore.workspaces, selecting: .session(target))
+        refreshVisibleDetail()
+    }
+
+    private func createSession(in worktree: ProjectWorktree, project: LocalProject) {
+        guard let workspaceID = selectedWorkspaceID,
+              let session = workspaceStore.createSession(
+                  in: workspaceID,
+                  projectID: project.id,
+                  worktreeID: worktree.id
+              )
+        else {
+            return
+        }
+        let target = AgentSessionTarget(
+            workspaceID: workspaceID,
+            projectID: project.id,
+            worktreeID: worktree.id,
+            sessionID: session.id
+        )
+        activeSessionTarget = target
+        sidebarController.render(workspaces: workspaceStore.workspaces, selecting: .session(target))
+        refreshVisibleDetail()
+    }
+
+    private func deleteSession(_ target: AgentSessionTarget) {
+        guard let session = workspaceStore.session(
+            in: target.workspaceID,
+            projectID: target.projectID,
+            worktreeID: target.worktreeID,
+            sessionID: target.sessionID
+        ) else {
+            return
+        }
+        if session.initialPrompt != nil || runtimeStore.snapshot(for: session.id) != nil {
+            let alert = NSAlert()
+            alert.messageText = "Delete Session?"
+            alert.informativeText = workspaceStore.isOnlySession(
+                in: target.workspaceID,
+                projectID: target.projectID,
+                worktreeID: target.worktreeID
+            )
+                ? "This removes the session from Tuist Code. Its Git worktree and files remain on disk."
+                : "This permanently removes this session from Tuist Code. Other sessions in the Git worktree are unaffected."
+            alert.addButton(withTitle: "Delete")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        runtimeStore.discard(sessionID: target.sessionID)
+        guard workspaceStore.deleteSession(
+            in: target.workspaceID,
+            projectID: target.projectID,
+            worktreeID: target.worktreeID,
+            sessionID: target.sessionID
+        ) else {
+            return
+        }
+        activeSessionTarget = nil
+        selectedWorkspaceID = target.workspaceID
+        selectedProjectIDs[target.workspaceID] = target.projectID
+        sidebarController.render(
+            workspaces: workspaceStore.workspaces,
+            selecting: .project(workspaceID: target.workspaceID, projectID: target.projectID)
+        )
+        showProjectOverview()
+    }
+
+    private func startAgentSession(
+        prompt: String,
+        configuration: AgentSessionInferenceConfiguration,
+        target: AgentSessionTarget
+    ) {
+        guard let project = project(for: target),
+              let worktree = project.worktrees.first(where: { $0.id == target.worktreeID }),
+              let account = accountStore.configuredAccounts.first(where: { $0.id == configuration.accountID })
+        else {
+            showMessage("The selected inference account is unavailable.")
+            return
+        }
+        workspaceStore.startAgentSession(
+            prompt: prompt,
+            in: target.workspaceID,
+            projectID: target.projectID,
+            worktreeID: target.worktreeID,
+            sessionID: target.sessionID,
+            configuration: configuration
+        )
+        let credential = account.providerID == "codex" ? "" : accountStore.credential(for: account)
+        guard let credential else {
+            showMessage("The selected inference account is unavailable.")
+            return
+        }
+        let agentPrompt = AgentSessionTools.prompt(
+            for: prompt,
+            configuration: configuration,
+            canRenameWorktree: worktree.sessions.count == 1
+        )
+        runtimeStore.start(
+            sessionID: target.sessionID,
+            in: URL(fileURLWithPath: worktree.directoryPath),
+            prompt: agentPrompt,
+            configuration: configuration,
+            credential: credential
+        )
+        refreshVisibleDetail()
+    }
+
+    private func project(for target: AgentSessionTarget) -> LocalProject? {
+        workspaceStore.workspaces.first(where: { $0.id == target.workspaceID })?
+            .projects.first(where: { $0.id == target.projectID })
+    }
+
+    private func presentWorkspaceError() {
+        if let message = workspaceStore.errorMessage {
+            showMessage(message)
+            workspaceStore.errorMessage = nil
+        }
+    }
+
+    private func showMessage(_ message: String) {
+        guard !(message.isEmpty) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Unable to complete request"
+        alert.informativeText = message
+        alert.runModal()
+    }
+
+    private func applyStoredAppearance() {
+        apply(appearance: AppKitAppearance(rawValue: UserDefaults.standard.string(forKey: AppKitAppearance.storageKey) ?? "") ?? .system)
+    }
+
+    private func apply(appearance: AppKitAppearance) {
+        UserDefaults.standard.set(appearance.rawValue, forKey: AppKitAppearance.storageKey)
+        NSApp.appearance = appearance.nsAppearance
+    }
+
+    func toolbarAllowedItemIdentifiers(_: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.toggleSidebar, .flexibleSpace, Self.addToolbarIdentifier, Self.accountToolbarIdentifier]
+    }
+
+    func toolbarDefaultItemIdentifiers(_: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.toggleSidebar, .flexibleSpace, Self.addToolbarIdentifier, Self.accountToolbarIdentifier]
+    }
+
+    func toolbar(
+        _: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar _: Bool
+    ) -> NSToolbarItem? {
+        switch itemIdentifier {
+        case Self.addToolbarIdentifier:
+            let item = NSMenuToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "Add"
+            item.paletteLabel = "Add Workspace or Project"
+            item.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add Workspace or Project")
+            let menu = NSMenu()
+            let workspace = menu.addItem(withTitle: "New Workspace…", action: #selector(newWorkspace(_:)), keyEquivalent: "")
+            workspace.target = self
+            menu.addItem(.separator())
+            let local = menu.addItem(withTitle: "Add Local Repository…", action: #selector(addLocalRepository(_:)), keyEquivalent: "")
+            local.target = self
+            let clone = menu.addItem(withTitle: "Clone Repository…", action: #selector(cloneRepository(_:)), keyEquivalent: "")
+            clone.target = self
+            item.menu = menu
+            return item
+        case Self.accountToolbarIdentifier:
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = "Account"
+            let button = NSButton(
+                image: NSImage(
+                    systemSymbolName: authentication.state == .authenticated
+                        ? "person.crop.circle.fill"
+                        : "person.crop.circle.badge.plus",
+                    accessibilityDescription: "Tuist Account"
+                ) ?? NSImage(),
+                target: self,
+                action: #selector(showAccountMenu(_:))
+            )
+            button.bezelStyle = .toolbar
+            item.view = button
+            return item
+        default:
+            return nil
+        }
+    }
+
+    @objc private func showAccountMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        if authentication.state == .authenticated {
+            let status = menu.addItem(withTitle: "Connected to Tuist", action: nil, keyEquivalent: "")
+            status.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil)
+            menu.addItem(withTitle: authentication.configuration.origin.host() ?? authentication.configuration.origin.absoluteString, action: nil, keyEquivalent: "")
+            menu.addItem(.separator())
+            let signOut = menu.addItem(withTitle: "Sign Out", action: #selector(signOut(_:)), keyEquivalent: "")
+            signOut.target = self
+        } else {
+            menu.addItem(withTitle: "Work locally without an account.", action: nil, keyEquivalent: "")
+            let connect = menu.addItem(withTitle: "Connect to Tuist", action: #selector(connectToTuist(_:)), keyEquivalent: "")
+            connect.target = self
+            connect.isEnabled = authentication.state != .authenticating
+            menu.addItem(withTitle: "Connect to unlock remote sessions and remote builds.", action: nil, keyEquivalent: "")
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func connectToTuist(_: Any?) {
+        authentication.signIn()
+    }
+
+    @objc private func signOut(_: Any?) {
+        authentication.signOut()
+    }
+}
+
+private enum AppKitNavigationSelection: Hashable {
+    case workspace(Workspace.ID?)
+    case project(workspaceID: Workspace.ID, projectID: LocalProject.ID)
+    case session(AgentSessionTarget)
+    case newSession(workspaceID: Workspace.ID, projectID: LocalProject.ID, worktreeID: ProjectWorktree.ID)
+}
+
+private final class AppKitNavigationNode: NSObject {
+    let title: String
+    let symbolName: String
+    let selection: AppKitNavigationSelection
+    let children: [AppKitNavigationNode]
+
+    init(
+        title: String,
+        symbolName: String,
+        selection: AppKitNavigationSelection,
+        children: [AppKitNavigationNode] = []
+    ) {
+        self.title = title
+        self.symbolName = symbolName
+        self.selection = selection
+        self.children = children
+    }
+}
+
+@MainActor
+private final class AppKitWorkspaceSidebarViewController: NSViewController,
+    NSOutlineViewDataSource,
+    NSOutlineViewDelegate
+{
+    var onSelection: ((AppKitNavigationSelection) -> Void)?
+    var onDeleteSession: ((AgentSessionTarget) -> Void)?
+
+    private let outlineView = AppKitDeleteOutlineView()
+    private var roots = [AppKitNavigationNode]()
+    private var pendingSelection: AppKitNavigationSelection?
+
+    override func loadView() {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = false
+        outlineView.headerView = nil
+        outlineView.style = .sourceList
+        outlineView.rowSizeStyle = .default
+        outlineView.allowsEmptySelection = true
+        outlineView.dataSource = self
+        outlineView.delegate = self
+        outlineView.onDelete = { [weak self] in self?.deleteSelectedSession() }
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("workspace"))
+        column.title = "Workspaces"
+        outlineView.addTableColumn(column)
+        outlineView.outlineTableColumn = column
+        scrollView.documentView = outlineView
+        view = scrollView
+    }
+
+    func render(workspaces: [Workspace], selecting selection: AppKitNavigationSelection?) {
+        roots = workspaces.map { workspace in
+            AppKitNavigationNode(
+                title: workspace.name,
+                symbolName: "square.stack.3d.up",
+                selection: .workspace(workspace.id),
+                children: workspace.projects.map { project in
+                    AppKitNavigationNode(
+                        title: project.name,
+                        symbolName: "folder",
+                        selection: .project(workspaceID: workspace.id, projectID: project.id),
+                        children: project.worktrees.flatMap { worktree in
+                            if worktree.sessions.isEmpty {
+                                return [AppKitNavigationNode(
+                                    title: "New Session",
+                                    symbolName: "plus",
+                                    selection: .newSession(
+                                        workspaceID: workspace.id,
+                                        projectID: project.id,
+                                        worktreeID: worktree.id
+                                    )
+                                )]
+                            }
+                            return worktree.sessions.map { session in
+                                AppKitNavigationNode(
+                                    title: session.title,
+                                    symbolName: "sparkles",
+                                    selection: .session(AgentSessionTarget(
+                                        workspaceID: workspace.id,
+                                        projectID: project.id,
+                                        worktreeID: worktree.id,
+                                        sessionID: session.id
+                                    ))
+                                )
+                            }
+                        }
+                    )
+                }
+            )
+        }
+        pendingSelection = selection
+        guard isViewLoaded else { return }
+        outlineView.reloadData()
+        roots.forEach { workspace in
+            outlineView.expandItem(workspace)
+            workspace.children.forEach { outlineView.expandItem($0) }
+        }
+        selectPendingNode()
+    }
+
+    func outlineView(_: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        (item as? AppKitNavigationNode)?.children.count ?? roots.count
+    }
+
+    func outlineView(_: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        (item as? AppKitNavigationNode)?.children[index] ?? roots[index]
+    }
+
+    func outlineView(_: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        guard let node = item as? AppKitNavigationNode else { return false }
+        return !node.children.isEmpty
+    }
+
+    func outlineView(
+        _: NSOutlineView,
+        viewFor _: NSTableColumn?,
+        item: Any
+    ) -> NSView? {
+        guard let node = item as? AppKitNavigationNode else { return nil }
+        let identifier = NSUserInterfaceItemIdentifier("navigation-cell")
+        let cell = outlineView.makeView(withIdentifier: identifier, owner: self) as? NSTableCellView
+            ?? NSTableCellView()
+        cell.identifier = identifier
+        if cell.textField == nil {
+            let imageView = NSImageView()
+            let textField = NSTextField(labelWithString: "")
+            textField.lineBreakMode = .byTruncatingTail
+            cell.imageView = imageView
+            cell.textField = textField
+            cell.addSubview(imageView)
+            cell.addSubview(textField)
+            imageView.translatesAutoresizingMaskIntoConstraints = false
+            textField.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                imageView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                imageView.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                imageView.widthAnchor.constraint(equalToConstant: 16),
+                imageView.heightAnchor.constraint(equalToConstant: 16),
+                textField.leadingAnchor.constraint(equalTo: imageView.trailingAnchor, constant: 6),
+                textField.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+                textField.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            ])
+        }
+        cell.textField?.stringValue = node.title
+        cell.imageView?.image = NSImage(systemSymbolName: node.symbolName, accessibilityDescription: node.title)
+        return cell
+    }
+
+    func outlineViewSelectionDidChange(_: Notification) {
+        let row = outlineView.selectedRow
+        guard row >= 0,
+              let node = outlineView.item(atRow: row) as? AppKitNavigationNode
+        else {
+            return
+        }
+        onSelection?(node.selection)
+    }
+
+    private func selectPendingNode() {
+        guard let pendingSelection else { return }
+        for row in 0 ..< outlineView.numberOfRows {
+            guard let node = outlineView.item(atRow: row) as? AppKitNavigationNode else { continue }
+            if node.selection == pendingSelection {
+                outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                outlineView.scrollRowToVisible(row)
+                break
+            }
+        }
+    }
+
+    private func deleteSelectedSession() {
+        let row = outlineView.selectedRow
+        guard row >= 0,
+              let node = outlineView.item(atRow: row) as? AppKitNavigationNode,
+              case let .session(target) = node.selection
+        else {
+            return
+        }
+        onDeleteSession?(target)
+    }
+}
+
+private final class AppKitDeleteOutlineView: NSOutlineView {
+    var onDelete: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 51 || event.keyCode == 117 {
+            onDelete?()
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        let clickedRow = row(at: point)
+        guard clickedRow >= 0,
+              let node = item(atRow: clickedRow) as? AppKitNavigationNode,
+              case .session = node.selection
+        else { return nil }
+        selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
+        let menu = NSMenu()
+        let delete = menu.addItem(withTitle: "Delete Session", action: #selector(deleteFromMenu(_:)), keyEquivalent: "")
+        delete.target = self
+        return menu
+    }
+
+    @objc private func deleteFromMenu(_: Any?) {
+        onDelete?()
+    }
+}
+
+@MainActor
+private final class AppKitEmptyStateViewController: NSViewController {
+    private let stateTitle: String
+    private let message: String
+    private let symbolName: String
+    private let actionTitle: String?
+    private let action: (() -> Void)?
+
+    init(
+        title: String,
+        message: String,
+        symbolName: String,
+        actionTitle: String? = nil,
+        action: (() -> Void)? = nil
+    ) {
+        stateTitle = title
+        self.message = message
+        self.symbolName = symbolName
+        self.actionTitle = actionTitle
+        self.action = action
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) { nil }
+
+    override func loadView() {
+        let container = NSView()
+        let image = NSImageView(image: NSImage(systemSymbolName: symbolName, accessibilityDescription: stateTitle) ?? NSImage())
+        image.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 32, weight: .regular)
+        image.contentTintColor = .secondaryLabelColor
+        let titleLabel = NSTextField(labelWithString: stateTitle)
+        titleLabel.font = .preferredFont(forTextStyle: .title2)
+        titleLabel.alignment = .center
+        let messageLabel = NSTextField(wrappingLabelWithString: message)
+        messageLabel.textColor = .secondaryLabelColor
+        messageLabel.alignment = .center
+        messageLabel.maximumNumberOfLines = 3
+        let views: [NSView]
+        if let actionTitle {
+            let button = NSButton(title: actionTitle, target: self, action: #selector(performAction(_:)))
+            button.bezelStyle = .rounded
+            button.keyEquivalent = "\r"
+            views = [image, titleLabel, messageLabel, button]
+        } else {
+            views = [image, titleLabel, messageLabel]
+        }
+        let stack = NSStackView(views: views)
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 12
+        container.addSubview(stack)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            stack.widthAnchor.constraint(lessThanOrEqualToConstant: 520),
+            messageLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 500),
+        ])
+        view = container
+    }
+
+    @objc private func performAction(_: Any?) {
+        action?()
+    }
+}
+#endif
+
+#if os(macOS)
+private enum AppKitAppearance: String, CaseIterable {
+    case system
+    case light
+    case dark
+
+    static let storageKey = "tuist-code-theme"
+
+    var title: String {
+        switch self {
+        case .system: "System"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+
+    var nsAppearance: NSAppearance? {
+        switch self {
+        case .system: nil
+        case .light: NSAppearance(named: .aqua)
+        case .dark: NSAppearance(named: .darkAqua)
+        }
+    }
+}
+
+@MainActor
+private final class AppKitAgentSessionViewController: NSViewController {
+    private let project: LocalProject
+    private let worktree: ProjectWorktree
+    private let session: AgentSession
+    private let accountStore: InferenceAccountStore
+    private let runtimeStore: AgentSessionRuntimeStore
+    private let onClose: () -> Void
+    private let onNewSession: () -> Void
+    private let onStart: (String, AgentSessionInferenceConfiguration) -> Void
+
+    private let statusImage = NSImageView()
+    private let statusLabel = NSTextField(labelWithString: "Start the agent")
+    private let transcriptTextView = NSTextView()
+    private let approvalBox = NSBox()
+    private let approvalLabel = NSTextField(wrappingLabelWithString: "")
+    private let questionBox = NSBox()
+    private let questionLabel = NSTextField(wrappingLabelWithString: "")
+    private let answerField = NSTextField(string: "")
+    private let accountPopup = NSPopUpButton()
+    private let modelPopup = NSPopUpButton()
+    private let reasoningPopup = NSPopUpButton()
+    private let promptField = NSTextField(string: "")
+    private let startButton = NSButton()
+    private let stopButton = NSButton()
+    private var cancellables = Set<AnyCancellable>()
+
+    private var agentAccounts: [InferenceAccount] {
+        accountStore.configuredAccounts.filter { ["together", "fireworks", "codex"].contains($0.providerID) }
+    }
+
+    init(
+        project: LocalProject,
+        worktree: ProjectWorktree,
+        session: AgentSession,
+        accountStore: InferenceAccountStore,
+        runtimeStore: AgentSessionRuntimeStore,
+        onClose: @escaping () -> Void,
+        onNewSession: @escaping () -> Void,
+        onStart: @escaping (String, AgentSessionInferenceConfiguration) -> Void
+    ) {
+        self.project = project
+        self.worktree = worktree
+        self.session = session
+        self.accountStore = accountStore
+        self.runtimeStore = runtimeStore
+        self.onClose = onClose
+        self.onNewSession = onNewSession
+        self.onStart = onStart
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) { nil }
+
+    override func loadView() {
+        let root = NSView()
+
+        let backButton = NSButton(
+            image: NSImage(systemSymbolName: "chevron.backward", accessibilityDescription: "Sessions") ?? NSImage(),
+            target: self,
+            action: #selector(closeSession(_:))
+        )
+        backButton.bezelStyle = .toolbar
+        backButton.toolTip = "Return to sessions"
+        let titleLabel = NSTextField(labelWithString: session.title)
+        titleLabel.font = .preferredFont(forTextStyle: .headline)
+        titleLabel.lineBreakMode = .byTruncatingTail
+        stopButton.title = "Stop"
+        stopButton.target = self
+        stopButton.action = #selector(stopSession(_:))
+        stopButton.bezelStyle = .rounded
+        stopButton.contentTintColor = .systemRed
+        let newSessionButton = NSButton(title: "New Session", target: self, action: #selector(createSession(_:)))
+        newSessionButton.bezelStyle = .rounded
+        let header = NSStackView(views: [backButton, titleLabel, NSView(), stopButton, newSessionButton])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 10
+        titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let locationLabel = NSTextField(labelWithString: "\(project.name)  ·  \(worktree.directoryPath)")
+        locationLabel.font = .preferredFont(forTextStyle: .caption1)
+        locationLabel.textColor = .secondaryLabelColor
+        locationLabel.lineBreakMode = .byTruncatingMiddle
+
+        statusImage.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Agent status")
+        statusImage.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .medium)
+        statusLabel.font = .preferredFont(forTextStyle: .headline)
+        let statusRow = NSStackView(views: [statusImage, statusLabel, NSView()])
+        statusRow.orientation = .horizontal
+        statusRow.alignment = .centerY
+        statusRow.spacing = 8
+
+        transcriptTextView.isEditable = false
+        transcriptTextView.isSelectable = true
+        transcriptTextView.drawsBackground = false
+        transcriptTextView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        transcriptTextView.textContainerInset = NSSize(width: 8, height: 8)
+        transcriptTextView.frame = NSRect(x: 0, y: 0, width: 700, height: 240)
+        transcriptTextView.minSize = NSSize(width: 0, height: 240)
+        transcriptTextView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        transcriptTextView.isVerticallyResizable = true
+        transcriptTextView.isHorizontallyResizable = false
+        transcriptTextView.autoresizingMask = [.width]
+        transcriptTextView.textContainer?.widthTracksTextView = true
+        transcriptTextView.textContainer?.containerSize = NSSize(
+            width: 700,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        let transcriptScroll = NSScrollView()
+        transcriptScroll.hasVerticalScroller = true
+        transcriptScroll.borderType = .noBorder
+        transcriptScroll.documentView = transcriptTextView
+
+        configureApprovalBox()
+        configureQuestionBox()
+        configureComposer()
+
+        let contentStack = NSStackView(views: [
+            header,
+            locationLabel,
+            separator(),
+            statusRow,
+            transcriptScroll,
+            approvalBox,
+            questionBox,
+            separator(),
+            composerView(),
+        ])
+        contentStack.orientation = .vertical
+        contentStack.alignment = .leading
+        contentStack.spacing = 12
+        root.addSubview(contentStack)
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        header.translatesAutoresizingMaskIntoConstraints = false
+        locationLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusRow.translatesAutoresizingMaskIntoConstraints = false
+        transcriptScroll.translatesAutoresizingMaskIntoConstraints = false
+        approvalBox.translatesAutoresizingMaskIntoConstraints = false
+        questionBox.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            contentStack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18),
+            contentStack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18),
+            contentStack.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
+            contentStack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16),
+            header.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            locationLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            statusRow.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            transcriptScroll.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            transcriptScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 180),
+            approvalBox.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+            questionBox.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+        ])
+        view = root
+        restoreConfiguration()
+        updateContent()
+        observeStores()
+    }
+
+    private func configureApprovalBox() {
+        approvalBox.title = "Approval required"
+        approvalBox.boxType = .primary
+        let deny = NSButton(title: "Deny", target: self, action: #selector(denyTool(_:)))
+        let allow = NSButton(title: "Allow", target: self, action: #selector(allowTool(_:)))
+        allow.keyEquivalent = "\r"
+        let buttons = NSStackView(views: [deny, allow])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
+        let stack = NSStackView(views: [approvalLabel, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        approvalBox.contentView = stack
+    }
+
+    private func configureQuestionBox() {
+        questionBox.title = "The agent needs your input"
+        questionBox.boxType = .primary
+        answerField.placeholderString = "Your response"
+        let reply = NSButton(title: "Reply", target: self, action: #selector(replyToQuestion(_:)))
+        let row = NSStackView(views: [answerField, reply])
+        row.orientation = .horizontal
+        row.spacing = 8
+        answerField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let stack = NSStackView(views: [questionLabel, row])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        row.widthAnchor.constraint(greaterThanOrEqualToConstant: 420).isActive = true
+        questionBox.contentView = stack
+    }
+
+    private func configureComposer() {
+        accountPopup.target = self
+        accountPopup.action = #selector(accountChanged(_:))
+        modelPopup.target = self
+        modelPopup.action = #selector(modelChanged(_:))
+        reasoningPopup.target = self
+        reasoningPopup.action = #selector(configurationChanged(_:))
+        promptField.placeholderString = "Ask the agent to work on this project"
+        promptField.target = self
+        promptField.action = #selector(startSession(_:))
+        startButton.title = session.initialPrompt == nil ? "Start" : "Send"
+        startButton.image = NSImage(systemSymbolName: "arrow.up.circle.fill", accessibilityDescription: startButton.title)
+        startButton.imagePosition = .imageLeading
+        startButton.bezelStyle = .rounded
+        startButton.keyEquivalent = "\r"
+        startButton.target = self
+        startButton.action = #selector(startSession(_:))
+    }
+
+    private func composerView() -> NSView {
+        let selectors = NSStackView(views: [accountPopup, modelPopup, reasoningPopup, NSView()])
+        selectors.orientation = .horizontal
+        selectors.spacing = 10
+        let promptRow = NSStackView(views: [promptField, startButton])
+        promptRow.orientation = .horizontal
+        promptRow.spacing = 10
+        promptField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let stack = NSStackView(views: [selectors, promptRow])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        selectors.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        promptRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        return stack
+    }
+
+    private func observeStores() {
+        runtimeStore.$snapshots
+            .sink { [weak self] _ in self?.updateContent() }
+            .store(in: &cancellables)
+        Publishers.CombineLatest(accountStore.$accounts, accountStore.$modelsByAccountID)
+            .sink { [weak self] _, _ in self?.restoreConfiguration() }
+            .store(in: &cancellables)
+    }
+
+    private func updateContent() {
+        let snapshot = runtimeStore.snapshot(for: session.id)
+        statusLabel.stringValue = snapshot?.phase.title ?? (session.initialPrompt == nil ? "Start the agent" : "Agent is starting")
+        statusImage.image = NSImage(
+            systemSymbolName: snapshot?.phase.symbolName ?? "sparkles",
+            accessibilityDescription: statusLabel.stringValue
+        )
+        stopButton.isHidden = snapshot?.phase != .running
+        approvalBox.isHidden = snapshot?.pendingApproval == nil
+        questionBox.isHidden = snapshot?.pendingQuestion == nil
+        approvalLabel.stringValue = snapshot?.pendingApproval.map {
+            "The agent wants to use \($0.tool).\n\($0.summary)"
+        } ?? ""
+        questionLabel.stringValue = snapshot?.pendingQuestion ?? ""
+        transcriptTextView.string = transcript(for: snapshot)
+        startButton.isEnabled = snapshot?.phase != .running && configuration != nil
+    }
+
+    private func transcript(for snapshot: AgentSessionRuntimeSnapshot?) -> String {
+        guard let snapshot else {
+            if let initialPrompt = session.initialPrompt {
+                return "Task\n\n\(initialPrompt)\n\nThe agent can inspect, search, edit, patch, and run commands in this worktree. Changes and commands require your approval."
+            }
+            return "Describe the task below. Before work begins, the agent is instructed to name this session and its worktree."
+        }
+        var lines = snapshot.activities.map { activity in
+            let marker = activity.isInProgress ? "●" : "✓"
+            return ["\(marker) \(activity.title)", activity.detail].compactMap { $0 }.joined(separator: "\n")
+        }
+        if let error = snapshot.errorMessage { lines.append("Error\n\(error)") }
+        if !snapshot.transcript.isEmpty { lines.append("Provider events\n\(snapshot.transcript)") }
+        return lines.joined(separator: "\n\n")
+    }
+
+    private func restoreConfiguration() {
+        let previousAccountID = accountPopup.selectedItem?.representedObject as? String
+        accountPopup.removeAllItems()
+        agentAccounts.forEach { account in
+            accountPopup.addItem(withTitle: account.name)
+            accountPopup.lastItem?.representedObject = account.id
+        }
+        let desiredAccountID = session.inferenceConfiguration?.accountID ?? previousAccountID ?? agentAccounts.first?.id
+        select(itemRepresenting: desiredAccountID, in: accountPopup)
+        reloadModels()
+    }
+
+    private func reloadModels() {
+        let account = selectedAccount
+        let desiredModelID = session.inferenceConfiguration?.accountID == account?.id
+            ? session.inferenceConfiguration?.modelID
+            : modelPopup.selectedItem?.representedObject as? String
+        modelPopup.removeAllItems()
+        if let account {
+            accountStore.models(for: account).forEach { model in
+                modelPopup.addItem(withTitle: model.name)
+                modelPopup.lastItem?.representedObject = model.id
+            }
+        }
+        select(itemRepresenting: desiredModelID, in: modelPopup)
+        if modelPopup.selectedItem == nil, modelPopup.numberOfItems > 0 { modelPopup.selectItem(at: 0) }
+        reloadReasoningEfforts()
+    }
+
+    private func reloadReasoningEfforts() {
+        let desired = session.inferenceConfiguration?.modelID == selectedModel?.id
+            ? session.inferenceConfiguration?.reasoningEffort
+            : .medium
+        reasoningPopup.removeAllItems()
+        (selectedModel?.reasoningEfforts ?? []).forEach { effort in
+            reasoningPopup.addItem(withTitle: effort.title)
+            reasoningPopup.lastItem?.representedObject = effort.rawValue
+        }
+        select(itemRepresenting: desired?.rawValue, in: reasoningPopup)
+        if reasoningPopup.selectedItem == nil, reasoningPopup.numberOfItems > 0 { reasoningPopup.selectItem(at: 0) }
+        updateContent()
+    }
+
+    private var selectedAccount: InferenceAccount? {
+        guard let id = accountPopup.selectedItem?.representedObject as? String else { return nil }
+        return agentAccounts.first(where: { $0.id == id })
+    }
+
+    private var selectedModel: InferenceModel? {
+        guard let account = selectedAccount,
+              let id = modelPopup.selectedItem?.representedObject as? String
+        else { return nil }
+        return accountStore.models(for: account).first(where: { $0.id == id })
+    }
+
+    private var configuration: AgentSessionInferenceConfiguration? {
+        guard let account = selectedAccount,
+              let provider = accountStore.provider(for: account),
+              let model = selectedModel,
+              let rawEffort = reasoningPopup.selectedItem?.representedObject as? String,
+              let effort = InferenceReasoningEffort(rawValue: rawEffort),
+              model.reasoningEfforts.contains(effort)
+        else { return nil }
+        return AgentSessionInferenceConfiguration(
+            accountID: account.id,
+            providerID: provider.id,
+            modelID: model.id,
+            reasoningEffort: effort
+        )
+    }
+
+    private func select(itemRepresenting value: String?, in popup: NSPopUpButton) {
+        guard let value,
+              let item = popup.itemArray.first(where: { ($0.representedObject as? String) == value })
+        else { return }
+        popup.select(item)
+    }
+
+    private func separator() -> NSBox {
+        let box = NSBox()
+        box.boxType = .separator
+        return box
+    }
+
+    @objc private func closeSession(_: Any?) { onClose() }
+    @objc private func createSession(_: Any?) { onNewSession() }
+    @objc private func stopSession(_: Any?) { runtimeStore.stop(sessionID: session.id) }
+    @objc private func accountChanged(_: Any?) { reloadModels() }
+    @objc private func modelChanged(_: Any?) { reloadReasoningEfforts() }
+    @objc private func configurationChanged(_: Any?) { updateContent() }
+    @objc private func allowTool(_: Any?) { runtimeStore.approvePendingToolCall(for: session.id, approved: true) }
+    @objc private func denyTool(_: Any?) { runtimeStore.approvePendingToolCall(for: session.id, approved: false) }
+
+    @objc private func replyToQuestion(_: Any?) {
+        runtimeStore.answerPendingQuestion(for: session.id, answer: answerField.stringValue)
+        answerField.stringValue = ""
+    }
+
+    @objc private func startSession(_: Any?) {
+        let prompt = promptField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty, let configuration else { return }
+        onStart(prompt, configuration)
+        promptField.stringValue = ""
+    }
+}
+
+@MainActor
+private final class AppKitSettingsWindowController: NSWindowController {
+    init(accountStore: InferenceAccountStore, appearanceChanged: @escaping (AppKitAppearance) -> Void) {
+        let tabController = NSTabViewController()
+        tabController.tabStyle = .toolbar
+        let general = AppKitGeneralSettingsViewController(appearanceChanged: appearanceChanged)
+        general.title = "General"
+        let accounts = AppKitAccountsSettingsViewController(accountStore: accountStore)
+        accounts.title = "Inference Accounts"
+        tabController.addChild(general)
+        tabController.addChild(accounts)
+        tabController.tabViewItems[0].image = NSImage(
+            systemSymbolName: "gearshape",
+            accessibilityDescription: "General"
+        )
+        tabController.tabViewItems[1].image = NSImage(
+            systemSymbolName: "person.2",
+            accessibilityDescription: "Inference Accounts"
+        )
+
+        let window = NSWindow(contentViewController: tabController)
+        window.title = "Tuist Code Settings"
+        window.styleMask = [.titled, .closable]
+        window.setContentSize(NSSize(width: 720, height: 470))
+        window.center()
+        super.init(window: window)
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) { nil }
+}
+
+@MainActor
+private final class AppKitGeneralSettingsViewController: NSViewController {
+    private let appearanceChanged: (AppKitAppearance) -> Void
+    private let popup = NSPopUpButton()
+
+    init(appearanceChanged: @escaping (AppKitAppearance) -> Void) {
+        self.appearanceChanged = appearanceChanged
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) { nil }
+
+    override func loadView() {
+        let root = NSView()
+        let heading = NSTextField(labelWithString: "Appearance")
+        heading.font = .preferredFont(forTextStyle: .headline)
+        let label = NSTextField(labelWithString: "Theme")
+        AppKitAppearance.allCases.forEach { appearance in
+            popup.addItem(withTitle: appearance.title)
+            popup.lastItem?.representedObject = appearance.rawValue
+        }
+        let selected = UserDefaults.standard.string(forKey: AppKitAppearance.storageKey) ?? AppKitAppearance.system.rawValue
+        popup.selectItem(withTitle: AppKitAppearance(rawValue: selected)?.title ?? AppKitAppearance.system.title)
+        popup.target = self
+        popup.action = #selector(changeAppearance(_:))
+        let row = NSStackView(views: [label, popup, NSView()])
+        row.orientation = .horizontal
+        row.spacing = 12
+        let stack = NSStackView(views: [heading, row])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        root.addSubview(stack)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 28),
+            stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -28),
+            stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 28),
+        ])
+        view = root
+    }
+
+    @objc private func changeAppearance(_: Any?) {
+        guard let rawValue = popup.selectedItem?.representedObject as? String,
+              let appearance = AppKitAppearance(rawValue: rawValue)
+        else { return }
+        appearanceChanged(appearance)
+    }
+}
+
+@MainActor
+private final class AppKitAccountsSettingsViewController: NSViewController,
+    NSTableViewDataSource,
+    NSTableViewDelegate
+{
+    private let accountStore: InferenceAccountStore
+    private let tableView = NSTableView()
+    private let detailLabel = NSTextField(wrappingLabelWithString: "Select an account to inspect its configuration.")
+    private let removeButton = NSButton()
+    private let refreshButton = NSButton()
+    private var cancellables = Set<AnyCancellable>()
+    private var lastPresentedAuthorizationURL: URL?
+
+    init(accountStore: InferenceAccountStore) {
+        self.accountStore = accountStore
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) { nil }
+
+    override func loadView() {
+        let root = NSView()
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        tableView.headerView = nil
+        tableView.delegate = self
+        tableView.dataSource = self
+        tableView.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("account")))
+        scroll.documentView = tableView
+
+        let addButton = NSButton(
+            image: NSImage(systemSymbolName: "plus", accessibilityDescription: "Add inference account") ?? NSImage(),
+            target: self,
+            action: #selector(showAddMenu(_:))
+        )
+        addButton.bezelStyle = .smallSquare
+        removeButton.image = NSImage(systemSymbolName: "minus", accessibilityDescription: "Remove inference account")
+        removeButton.bezelStyle = .smallSquare
+        removeButton.target = self
+        removeButton.action = #selector(removeSelectedAccount(_:))
+        refreshButton.target = self
+        refreshButton.action = #selector(performAccountAction(_:))
+        let controls = NSStackView(views: [addButton, removeButton, NSView(), refreshButton])
+        controls.orientation = .horizontal
+        controls.spacing = 6
+
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.maximumNumberOfLines = 0
+        let left = NSStackView(views: [scroll, controls])
+        left.orientation = .vertical
+        left.alignment = .leading
+        left.spacing = 8
+        scroll.widthAnchor.constraint(equalTo: left.widthAnchor).isActive = true
+        controls.widthAnchor.constraint(equalTo: left.widthAnchor).isActive = true
+        let split = NSSplitView()
+        split.isVertical = true
+        split.dividerStyle = .thin
+        split.addArrangedSubview(left)
+        split.addArrangedSubview(detailLabel)
+        root.addSubview(split)
+        split.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            split.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
+            split.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
+            split.topAnchor.constraint(equalTo: root.topAnchor, constant: 20),
+            split.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -20),
+            left.widthAnchor.constraint(greaterThanOrEqualToConstant: 250),
+            detailLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 300),
+        ])
+        view = root
+        observeStore()
+        updateSelection()
+    }
+
+    private func observeStore() {
+        accountStore.$accounts
+            .sink { [weak self] _ in
+                self?.tableView.reloadData()
+                self?.updateSelection()
+            }
+            .store(in: &cancellables)
+        Publishers.CombineLatest3(
+            accountStore.$authorizationURL,
+            accountStore.$authorizationDeviceCode,
+            accountStore.$authorizationDeviceCodeExpiration
+        )
+        .sink { [weak self] url, code, expiration in
+            self?.presentAuthorization(url: url, code: code, expiration: expiration)
+        }
+        .store(in: &cancellables)
+        accountStore.$errorMessage
+            .compactMap { $0 }
+            .sink { [weak self] message in self?.showError(message) }
+            .store(in: &cancellables)
+    }
+
+    func numberOfRows(in _: NSTableView) -> Int { accountStore.accounts.count }
+
+    func tableView(_: NSTableView, viewFor _: NSTableColumn?, row: Int) -> NSView? {
+        let account = accountStore.accounts[row]
+        let cell = NSTableCellView()
+        let label = NSTextField(labelWithString: account.name)
+        let provider = accountStore.provider(for: account)
+        let image = NSImageView(image: NSImage(
+            systemSymbolName: provider?.symbolName ?? "cpu",
+            accessibilityDescription: provider?.name ?? "Provider"
+        ) ?? NSImage())
+        cell.addSubview(image)
+        cell.addSubview(label)
+        image.translatesAutoresizingMaskIntoConstraints = false
+        label.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            image.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            image.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            image.widthAnchor.constraint(equalToConstant: 16),
+            image.heightAnchor.constraint(equalToConstant: 16),
+            label.leadingAnchor.constraint(equalTo: image.trailingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_: Notification) { updateSelection() }
+
+    private var selectedAccount: InferenceAccount? {
+        guard tableView.selectedRow >= 0, accountStore.accounts.indices.contains(tableView.selectedRow) else { return nil }
+        return accountStore.accounts[tableView.selectedRow]
+    }
+
+    private func updateSelection() {
+        guard let account = selectedAccount else {
+            detailLabel.stringValue = accountStore.accounts.isEmpty
+                ? "No inference accounts\n\nAdd an account to select the provider and model used by coding sessions."
+                : "Select an account to inspect its configuration."
+            removeButton.isEnabled = false
+            refreshButton.isEnabled = false
+            return
+        }
+        let provider = accountStore.provider(for: account)
+        let models = accountStore.models(for: account)
+        let modelList = models.isEmpty
+            ? "No models loaded"
+            : models.prefix(12).map(\.name).joined(separator: "\n")
+        detailLabel.stringValue = "\(account.name)\n\nProvider: \(provider?.name ?? account.providerID)\nStatus: \(account.state.title)\nModels: \(models.count)\n\n\(modelList)"
+        removeButton.isEnabled = true
+        refreshButton.isEnabled = true
+        switch account.state {
+        case .configured:
+            refreshButton.title = "Refresh Models"
+        case .requiresAuthorization:
+            refreshButton.title = "Sign In"
+        case .authorizing:
+            refreshButton.title = "Cancel Sign In"
+        }
+    }
+
+    @objc private func showAddMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        accountStore.catalog.forEach { provider in
+            let item = menu.addItem(withTitle: provider.name, action: #selector(addProvider(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = provider.id
+            item.image = NSImage(systemSymbolName: provider.symbolName, accessibilityDescription: provider.name)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func addProvider(_ sender: NSMenuItem) {
+        guard let providerID = sender.representedObject as? String,
+              let provider = accountStore.catalog.first(where: { $0.id == providerID })
+        else { return }
+        switch provider.authentication {
+        case .apiKey: configureKeyProvider(provider)
+        case .oauth: configureSignInProvider(provider)
+        }
+    }
+
+    private func configureKeyProvider(_ provider: InferenceProviderDescriptor) {
+        let alert = NSAlert()
+        alert.messageText = "Add \(provider.name) Account"
+        alert.addButton(withTitle: "Add Account")
+        alert.addButton(withTitle: "Cancel")
+        let name = NSTextField(string: provider.name)
+        name.placeholderString = "Account name"
+        let key = NSSecureTextField(string: "")
+        key.placeholderString = "Application programming interface key"
+        let stack = NSStackView(views: [name, key])
+        stack.orientation = .vertical
+        stack.spacing = 10
+        stack.frame = NSRect(x: 0, y: 0, width: 360, height: 60)
+        name.widthAnchor.constraint(equalToConstant: 360).isActive = true
+        alert.accessoryView = stack
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        _ = accountStore.configureAPIKey(key.stringValue, named: name.stringValue, for: provider)
+    }
+
+    private func configureSignInProvider(_ provider: InferenceProviderDescriptor) {
+        let alert = NSAlert()
+        alert.messageText = "Add \(provider.name) Account"
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Cancel")
+        let name = NSTextField(string: provider.name)
+        name.placeholderString = "Account name"
+        name.frame = NSRect(x: 0, y: 0, width: 340, height: 24)
+        alert.accessoryView = name
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        _ = accountStore.beginOAuth(named: name.stringValue, for: provider)
+    }
+
+    private func presentAuthorization(url: URL?, code: String?, expiration: String?) {
+        guard let url, url != lastPresentedAuthorizationURL else { return }
+        lastPresentedAuthorizationURL = url
+        let alert = NSAlert()
+        alert.messageText = "Complete Sign In"
+        alert.informativeText = [
+            "Open the authorization page and enter the device code.",
+            code.map { "Code: \($0)" },
+            expiration.map { "Expires in \($0)" },
+        ].compactMap { $0 }.joined(separator: "\n")
+        alert.addButton(withTitle: "Open Authorization Page")
+        alert.addButton(withTitle: "Copy Code")
+        alert.addButton(withTitle: "Later")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(url)
+        } else if response == .alertSecondButtonReturn, let code {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(code, forType: .string)
+        }
+    }
+
+    @objc private func removeSelectedAccount(_: Any?) {
+        guard let account = selectedAccount else { return }
+        let alert = NSAlert()
+        alert.messageText = "Remove \(account.name)?"
+        alert.informativeText = "Sessions configured with this account will need another inference account before they can run."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        accountStore.remove(account)
+    }
+
+    @objc private func performAccountAction(_: Any?) {
+        guard let account = selectedAccount else { return }
+        switch account.state {
+        case .configured:
+            accountStore.refreshModels(for: account)
+        case .requiresAuthorization:
+            guard let provider = accountStore.provider(for: account) else { return }
+            _ = accountStore.reauthenticate(account, with: provider)
+        case .authorizing:
+            accountStore.cancelAuthorization(for: account.id)
+        }
+    }
+
+    private func showError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "Inference Account Error"
+        alert.informativeText = message
+        alert.runModal()
+        accountStore.errorMessage = nil
+    }
+}
+#endif
+
 private extension CharacterSet {
     static let oauthFormAllowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
 }
@@ -4572,6 +6222,7 @@ private extension ProcessInfo {
     }
 }
 
+#if os(iOS)
 private extension Color {
     init(rgb: UInt32) {
         self.init(
@@ -4581,3 +6232,4 @@ private extension Color {
         )
     }
 }
+#endif

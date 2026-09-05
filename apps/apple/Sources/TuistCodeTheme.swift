@@ -1,3 +1,4 @@
+#if os(iOS)
 import SwiftUI
 
 enum TuistCodeTheme: String, CaseIterable, Identifiable {
@@ -110,3 +111,4 @@ extension View {
             .preferredColorScheme(theme.preferredColorScheme)
     }
 }
+#endif

@@ -10,7 +10,7 @@ The applications use Rust for shared business logic, including the authenticatio
 
 ## Architecture
 
-The user interfaces stay with their platforms: SwiftUI renders the macOS and iOS applications, and the Android application uses Android views. Platform code also owns secure credential storage, deep links, and the sign-in browser. Rust defines and tests the authentication state transitions shared by those applications; it does not render a user interface.
+The user interfaces stay with their platforms: Apple Application Kit ([AppKit](https://developer.apple.com/documentation/appkit)) renders the macOS application, Swift user interface ([SwiftUI](https://developer.apple.com/documentation/swiftui)) renders the iPhone application, and the Android application uses Android views. Platform code also owns secure credential storage, deep links, and the sign-in browser. Rust defines and tests the authentication state transitions shared by those applications; it does not render a user interface.
 
 ## Requirements
 
