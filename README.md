@@ -1,96 +1,57 @@
+<p align="center">
+  <img src="assets/tuist-logo.svg" alt="Tuist Code logo" width="96">
+</p>
+
 # Tuist Code
 
-Tuist Code is an experimental native coding environment with three first-class applications:
+> [!WARNING]
+> Tuist Code is a work in progress. Expect rough edges and breaking changes while we explore the experience. The mobile applications are currently distributed through GitHub Releases, but we might distribute them through the [Apple App Store](https://developer.apple.com/app-store/) and [Google Play](https://play.google.com/) in the future.
 
-- macOS desktop
-- iOS simulator
-- Android
+Tuist Code is a native coding environment for macOS, iOS, and Android. We believe coding can flow naturally across environments without first requiring cache infrastructure, making it faster to move between a desk, phone, and tablet while staying in the same workspace.
 
-The applications use Rust for shared business logic, including the authentication lifecycle. [Once](https://buildonce.dev/) builds the native macOS and iOS application bundles, packages the Android application, and runs the shared Rust tests.
+The project is experimental, and the best way to try it today is to install the latest application for your platform.
 
-## Architecture
+## Install Tuist Code
 
-The user interfaces stay with their platforms: SwiftUI renders the macOS and iOS applications, and the Android application uses Android views. Platform code also owns secure credential storage, deep links, and the sign-in browser. Rust defines and tests the authentication state transitions shared by those applications; it does not render a user interface.
+Download the files for the latest version from [GitHub Releases](https://github.com/tuist/code/releases/latest). Each release includes checksum files named `SHA256SUMS.txt` and `SHA512SUMS.txt` so you can verify a download before installing it.
 
-## Requirements
+### macOS
 
-- [Mise](https://mise.jdx.dev/), which installs the pinned Rust, Java Development Kit, and Once toolchains.
-- macOS: Xcode command line tools, including an iOS simulator runtime for the iOS application.
-- Android: a connected device or emulator. Mise installs the Android Software Development Kit and Native Development Kit used by the build.
+1. Download `Tuist-Code-macOS-<version>.zip` and extract it.
+2. Move `Tuist Code.app` to the Applications folder.
+3. Open Tuist Code from the Applications folder.
 
-## Start the app
+The application is signed and notarized by Apple. After installation, [Sparkle](https://sparkle-project.org/) checks GitHub Releases for updates and offers new versions from within the application.
 
-```sh
-mise install
-mise run run
-```
+### iOS
 
-The first run builds and opens the Tuist Code macOS application bundle. Its dock icon is generated from the current Tuist brand logo.
+The iOS package uses ad hoc distribution and only works on devices whose identifiers are included in the provisioning profile.
 
-## Development commands
+1. Download `Tuist-Code-iOS-<version>.ipa` on a Mac.
+2. Connect a registered iPhone or iPad to the Mac.
+3. Open [Apple Configurator](https://support.apple.com/apple-configurator), select the device, and choose **Add > Apps > Choose from my Mac**.
+4. Select the downloaded package and wait for installation to finish.
 
-```sh
-mise run format
-mise run build
-mise run build:ios
-mise run build:android
-mise run test
-mise run validate
-```
+### Android
 
-The `once.toml` file declares all native targets directly: `TuistCodeDesktop`, `TuistCodeiOS`, `TuistCodeAndroid`, and their shared Rust libraries.
+1. Download `Tuist-Code-Android-<version>.apk` on the Android device.
+2. Allow the browser or file manager to install unknown applications when Android prompts you.
+3. Open the downloaded package and confirm the installation.
 
-## Releases
-
-Merges to `main` are checked with [git-cliff](https://git-cliff.org/) using conventional commits. A feature, fix, performance, refactoring, or breaking-change commit produces the next semantic version and starts a release. Documentation-only changes appear in release notes but do not trigger a version by themselves.
-
-Each release contains signed Android and iOS packages, a signed and notarized macOS archive, and [Secure Hash Algorithm](https://csrc.nist.gov/projects/hash-functions) 256-bit and 512-bit checksum files. The iOS package uses ad hoc distribution, so it can only be installed on devices registered in its provisioning profile.
-
-The macOS application uses [Sparkle](https://sparkle-project.org/) to check the stable `appcast` GitHub release for updates. Its framework archive is checksum-pinned and downloaded by `mise run prepare:sparkle`.
-
-Signing credentials live in the `Tuist Code` 1Password vault and are read in GitHub Actions through the `OP_SERVICE_ACCOUNT_TOKEN` repository secret. The vault contains a `Tuist Code Ad Hoc` document whose provisioning profile is issued for `dev.tuist.code.ios`.
-
-## Run every platform
+You can also install it from a computer with [Android Debug Bridge](https://developer.android.com/tools/adb):
 
 ```sh
-mise run run
-mise run run:ios
-mise run run:android
+adb install Tuist-Code-Android-*.apk
 ```
 
-The iOS task uses the booted simulator. The Android task provisions a `TuistCode` emulator when needed, then installs and launches the application.
+### Verify a download
 
-## Optional Tuist connection
-
-Tuist Code works locally without an account: users can add Git repositories and
-create worktree-backed agent sessions. Connecting a Tuist account enables
-Tuist-backed capabilities, including remote sessions and remote builds.
-
-The connection uses [OAuth 2.0](https://www.rfc-editor.org/rfc/rfc6749)
-Authorization Code with [Proof Key for Code Exchange](https://www.rfc-editor.org/rfc/rfc7636),
-matching the Tuist iOS application. This is a public-client flow, so the
-applications contain a client identifier but never a client secret.
-
-The default origin is `https://tuist.dev`. Each app also accepts another Tuist origin and public client identifier for development or self-hosted environments:
+Download `SHA256SUMS.txt` alongside the application package, then run the command for your file from the download directory. For example, to verify the macOS archive:
 
 ```sh
-TUIST_ORIGIN=http://localhost:8080 mise run run
-once run TuistCodeiOS --visible -- -tuist-origin http://localhost:8080
-adb shell am start -n dev.tuist.code/.MainActivity --es tuist_origin http://10.0.2.2:8080
+grep 'Tuist-Code-macOS-' SHA256SUMS.txt | shasum -a 256 --check
 ```
 
-Pass `TUIST_OAUTH_CLIENT_ID`, `-tuist-oauth-client-id`, or `--es tuist_oauth_client_id` when the selected origin has a different client identifier. The built-in Tuist development, staging, and canary origins use the same identifiers as the Tuist provider applications.
+## How it works
 
-## Android setup
-
-Mise installs the Android command-line tools. Run the following once to install Android Platform 35, Build Tools 35.0.0, and the Native Development Kit:
-
-```sh
-mise run android:setup
-```
-
-`mise run build:android` and `mise run run:android` run this setup task automatically. The first Android launch also downloads and creates the emulator image.
-
-## Updating the logo
-
-`assets/tuist-logo.svg` is the Tuist brand logo. Run `scripts/generate_app_icons.sh` after updating it to regenerate the macOS and iOS application icons and the in-app image assets.
+Tuist Code works locally without an account. You can add Git repositories and create worktree-backed coding sessions. Connecting a Tuist account adds Tuist-backed capabilities, including remote sessions and remote builds.
