@@ -35,6 +35,18 @@ target = "aarch64-apple-darwin"
 labels = ["unit"]
 
 [[target]]
+name = "TuistCodeAgent"
+kind = "rust_binary"
+srcs = ["shared/rust/src/**/*.rs"]
+deps = ["./TuistCodeSharedTestSupport"]
+
+[target.attrs]
+crate_name = "tuist_code_agent"
+crate_root = "shared/rust/src/bin/tuist_code_agent.rs"
+edition = "2024"
+env_inherit = ["TUIST_CODE_AGENT_API_KEY"]
+
+[[target]]
 name = "TuistCodeMobileShared"
 kind = "rust_mobile_library"
 srcs = ["shared/rust/src/**/*.rs"]
@@ -51,7 +63,7 @@ android_api = 35
 [[target]]
 name = "TuistCodeDesktop"
 kind = "apple_application"
-srcs = ["apps/desktop/Sources/**/*.swift"]
+srcs = ["apps/apple/Sources/**/*.swift", "apps/desktop/Sources/**/*.swift"]
 deps = ["./TuistCodeShared"]
 
 [target.attrs]
@@ -60,6 +72,8 @@ bundle_id = "dev.tuist.code"
 minimum_os = "15.0"
 families = ["mac"]
 product_name = "Tuist Code"
+resources = [".once/out/TuistCodeAgent/tuist_code_agent"]
+prebuild_actions = ["{\"name\":\"Build Rust Agent\",\"script\":\"once build TuistCodeAgent\",\"cacheable\":false}"]
 asset_catalogs = ["apps/desktop/Assets.xcassets"]
 app_icon = "AppIcon"
 info_plist = "apps/desktop/Info.plist"
@@ -77,7 +91,7 @@ linkopts = [
 [[target]]
 name = "TuistCodeiOS"
 kind = "apple_application"
-srcs = ["apps/ios/Sources/**/*.swift"]
+srcs = ["apps/apple/Sources/**/*.swift", "apps/ios/Sources/**/*.swift"]
 deps = ["./TuistCodeMobileShared"]
 
 [target.attrs]
@@ -94,7 +108,7 @@ info_plist = "apps/ios/Info.plist"
 [[target]]
 name = "TuistCodeiOSRelease"
 kind = "apple_application"
-srcs = ["apps/ios/Sources/**/*.swift"]
+srcs = ["apps/apple/Sources/**/*.swift", "apps/ios/Sources/**/*.swift"]
 deps = ["./TuistCodeiOSSharedRelease"]
 
 [target.attrs]
