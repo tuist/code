@@ -104,7 +104,18 @@ jobs:
           echo "::add-mask::$apple_id"
           echo "::add-mask::$app_password"
           xcrun notarytool store-credentials tuist-code-release --apple-id "$apple_id" --password "$app_password" --team-id "$TEAM_ID"
-          xcrun notarytool submit "$notarization_archive" --keychain-profile tuist-code-release --wait
+          set +e
+          notarization_result=$(xcrun notarytool submit "$notarization_archive" --keychain-profile tuist-code-release --wait --output-format json)
+          notarization_status=$?
+          set -e
+          printf '%s\n' "$notarization_result"
+          if [[ $notarization_status -ne 0 ]]; then
+            submission_id=$(jq -r '.id // empty' <<< "$notarization_result")
+            if [[ -n "$submission_id" ]]; then
+              xcrun notarytool log "$submission_id" --keychain-profile tuist-code-release
+            fi
+            exit "$notarization_status"
+          fi
           xcrun stapler staple "$app"
 
           ditto -c -k --keepParent "$app" "release/Tuist-Code-macOS-$VERSION.zip"
