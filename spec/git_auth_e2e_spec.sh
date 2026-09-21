@@ -11,7 +11,7 @@ Describe 'browser Git authentication onboarding'
       test \"\$GIT_CONFIG_GLOBAL\" = \"\$E2E_GITCONFIG\"
       test ! -e \"\$HOME/.gitconfig\" || test \"\$GIT_CONFIG_GLOBAL\" != \"\$HOME/.gitconfig\"
       git config --global http.\"\$E2E_HTTPS_URL\".sslCAInfo \"\$E2E_TLS_CERT\"
-      CURL_CA_BUNDLE=\"\$E2E_TLS_CERT\" PATH=\"\$E2E_GIT_HELPER_DIR:\$PATH\" ./scripts/configure-micelio-git --url \"\$E2E_HTTPS_URL\" --dynamic-registration
+      CURL_CA_BUNDLE=\"\$E2E_TLS_CERT\" PATH=\"\$E2E_GIT_HELPER_DIR:\$PATH\" ./scripts/configure-code-git --url \"\$E2E_HTTPS_URL\" --dynamic-registration
       test \"\$(git config --global --get credential.\"\$E2E_HTTPS_URL\".oauthClientId)\" = e2e-dynamic-client
       admin \"\$NODE1_ADMIN_URL\" POST /repositories -d '{\"repository\":\"$repo\"}' >/dev/null
       cd '$source'

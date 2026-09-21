@@ -1,0 +1,18 @@
+apiVersion: v2
+name: code
+description: Git hosting whose source of truth is a write-ahead log in object storage
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/tuist/code
+sources:
+  - https://github.com/tuist/code
+keywords:
+  - git
+  - mcp
+  - object-storage
+maintainers:
+  - name: Tuist
+    url: https://github.com/tuist
+annotations:
+  artifacthub.io/license: MPL-2.0

@@ -21,7 +21,7 @@ spec_helper_precheck() {
   # the developer's credential helper and block indefinitely.
   [ -f "${E2E_GITCONFIG:-}" ] || abort "hermetic gitconfig missing. Start the stack with: mise run e2e:up"
   if ! curl -fsS "${NODE1_ADMIN_URL}/health" >/dev/null 2>&1; then
-    abort "micelio is not running. Start the stack with: mise run e2e:up"
+    abort "code is not running. Start the stack with: mise run e2e:up"
   fi
 
   if ! curl -fsS "${NODE2_ADMIN_URL}/health" >/dev/null 2>&1; then

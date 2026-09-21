@@ -4,7 +4,7 @@
   "parameters": {
     "appName": {
       "type": "string",
-      "defaultValue": "[concat('micelio-', uniqueString(resourceGroup().id))]",
+      "defaultValue": "[concat('code-', uniqueString(resourceGroup().id))]",
       "metadata": {
         "description": "A unique name for the Container App."
       }
@@ -16,7 +16,7 @@
     "objectStorageBucket": {
       "type": "string",
       "metadata": {
-        "description": "Bucket that holds Micelio's write-ahead log."
+        "description": "Bucket that holds Code's write-ahead log."
       }
     },
     "objectStorageEndpoint": {
@@ -114,39 +114,39 @@
         "template": {
           "containers": [
             {
-              "name": "micelio",
-              "image": "ghcr.io/tuist/micelio:latest",
+              "name": "code",
+              "image": "ghcr.io/tuist/code:latest",
               "resources": {
                 "cpu": 0.5,
                 "memory": "1Gi"
               },
               "env": [
                 {
-                  "name": "MICELIO_S3_BUCKET",
+                  "name": "CODE_S3_BUCKET",
                   "value": "[parameters('objectStorageBucket')]"
                 },
                 {
-                  "name": "MICELIO_S3_ENDPOINT",
+                  "name": "CODE_S3_ENDPOINT",
                   "value": "[parameters('objectStorageEndpoint')]"
                 },
                 {
-                  "name": "MICELIO_S3_ACCESS_KEY_ID",
+                  "name": "CODE_S3_ACCESS_KEY_ID",
                   "secretRef": "object-storage-access-key"
                 },
                 {
-                  "name": "MICELIO_S3_SECRET_ACCESS_KEY",
+                  "name": "CODE_S3_SECRET_ACCESS_KEY",
                   "secretRef": "object-storage-secret-key"
                 },
                 {
-                  "name": "MICELIO_AUTH_BACKEND",
+                  "name": "CODE_AUTH_BACKEND",
                   "value": "static"
                 },
                 {
-                  "name": "MICELIO_AUTH_TOKENS",
+                  "name": "CODE_AUTH_TOKENS",
                   "secretRef": "auth-tokens"
                 },
                 {
-                  "name": "MICELIO_ADMIN_TOKEN",
+                  "name": "CODE_ADMIN_TOKEN",
                   "secretRef": "admin-token"
                 }
               ],

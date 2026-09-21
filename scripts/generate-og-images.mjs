@@ -19,7 +19,7 @@ const contentDirectory = join(root, "content");
 const outputDirectory = join(root, "static", "og");
 const temporaryDirectory = join(
   tmpdir(),
-  "micelio-og-" + process.pid + "-" + Math.random().toString(16).slice(2)
+  "code-og-" + process.pid + "-" + Math.random().toString(16).slice(2)
 );
 const defaultDescription = "Headless & scalable Git forge backed by a write-ahead log in object storage.";
 
@@ -204,7 +204,7 @@ function plainText(value) {
 
 function titleFromFilename(path) {
   const name = basename(path, ".md");
-  return name === "_index" ? "Micelio" : name.replaceAll("-", " ");
+  return name === "_index" ? "Code" : name.replaceAll("-", " ");
 }
 
 function routeFor(path) {
@@ -225,7 +225,7 @@ function destinationFor(route) {
 
 function documentFor({ title, description, route }) {
   const eyebrow =
-    route === "/" ? "HEADLESS & SCALABLE GIT FORGE" : "MICELIO // " + route.slice(1, -1).toUpperCase();
+    route === "/" ? "HEADLESS & SCALABLE GIT FORGE" : "CODE // " + route.slice(1, -1).toUpperCase();
 
   return (
     "<!doctype html>" +
@@ -248,7 +248,7 @@ function documentFor({ title, description, route }) {
     "</head>" +
     "<body>" +
     "<main>" +
-    "<header><div class='wordmark'>micelio</div><div class='eyebrow'>" +
+    "<header><div class='wordmark'>code</div><div class='eyebrow'>" +
     escapeHtml(eyebrow) +
     "</div></header>" +
     "<section><h1>" +
@@ -256,7 +256,7 @@ function documentFor({ title, description, route }) {
     "</h1><p>" +
     escapeHtml(truncate(description, 190)) +
     "</p></section>" +
-    "<footer>micelio.dev</footer>" +
+    "<footer>code.dev</footer>" +
     "</main>" +
     "</body>" +
     "</html>"

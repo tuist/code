@@ -5,7 +5,7 @@ template = "page.html"
 
 # 🚀 Getting started
 
-Run Micelio locally with one node and a filesystem-backed object store.
+Run Code locally with one node and a filesystem-backed object store.
 
 ```sh
 mise install

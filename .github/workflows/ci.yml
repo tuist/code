@@ -119,7 +119,7 @@ jobs:
       - name: Regenerate and diff
         run: |
           ./scripts/generate-proto.sh
-          git diff --exit-code lib/micelio/wal/v1 lib/micelio/policy/v1 \
+          git diff --exit-code lib/code/wal/v1 lib/code/policy/v1 \
             || { echo "::error::generated schema is out of date; run 'mise run proto' and commit the result"; exit 1; }
 
   image:
@@ -138,36 +138,36 @@ jobs:
           context: .
           push: false
           load: true
-          tags: micelio:ci
+          tags: code:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Smoke test the image
         run: |
-          docker network create micelio-ci
-          docker run -d --name minio --network micelio-ci \
-            -e MINIO_ROOT_USER=micelio -e MINIO_ROOT_PASSWORD=micelio-secret \
+          docker network create code-ci
+          docker run -d --name minio --network code-ci \
+            -e MINIO_ROOT_USER=code -e MINIO_ROOT_PASSWORD=code-secret \
             minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
-          docker run --rm --network micelio-ci --entrypoint sh minio/mc:RELEASE.2025-04-16T18-13-26Z -c \
-            'until mc alias set local http://minio:9000 micelio micelio-secret; do sleep 1; done; mc mb --ignore-existing local/micelio'
+          docker run --rm --network code-ci --entrypoint sh minio/mc:RELEASE.2025-04-16T18-13-26Z -c \
+            'until mc alias set local http://minio:9000 code code-secret; do sleep 1; done; mc mb --ignore-existing local/code'
 
-          docker run -d --name micelio --network micelio-ci \
-            -e MICELIO_S3_BUCKET=micelio \
-            -e MICELIO_S3_ENDPOINT=http://minio:9000 \
-            -e MICELIO_S3_ACCESS_KEY_ID=micelio \
-            -e MICELIO_S3_SECRET_ACCESS_KEY=micelio-secret \
-            -e MICELIO_S3_REGION=us-east-1 \
-            -e MICELIO_ADMIN_TOKEN=ci \
-            -e MICELIO_AUTH_BACKEND=static \
-            -e MICELIO_AUTH_TOKENS='ci-token=acme:read,write' \
-            micelio:ci
+          docker run -d --name code --network code-ci \
+            -e CODE_S3_BUCKET=code \
+            -e CODE_S3_ENDPOINT=http://minio:9000 \
+            -e CODE_S3_ACCESS_KEY_ID=code \
+            -e CODE_S3_SECRET_ACCESS_KEY=code-secret \
+            -e CODE_S3_REGION=us-east-1 \
+            -e CODE_ADMIN_TOKEN=ci \
+            -e CODE_AUTH_BACKEND=static \
+            -e CODE_AUTH_TOKENS='ci-token=acme:read,write' \
+            code:ci
 
           for i in $(seq 1 60); do
-            docker exec micelio curl -fsS http://127.0.0.1:4002/health >/dev/null 2>&1 && break
+            docker exec code curl -fsS http://127.0.0.1:4002/health >/dev/null 2>&1 && break
             sleep 1
           done
 
           # A push and a clone through the released artefact, not the source.
-          docker exec micelio sh -c '
+          docker exec code sh -c '
             set -e
             curl -sS -X POST -H "Authorization: Bearer ci" -H "Content-Type: application/json" \
               -d "{\"repository\":\"acme/ci\"}" http://127.0.0.1:4002/repositories
@@ -180,7 +180,7 @@ jobs:
           '
       - name: Container logs
         if: failure()
-        run: docker logs micelio || true
+        run: docker logs code || true
 
   chart:
     name: Helm chart
@@ -188,19 +188,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
-      - run: helm lint charts/micelio --set objectStore.endpoint=http://minio:9000 --set auth.oidc.audience=micelio
+      - run: helm lint charts/code --set objectStore.endpoint=http://minio:9000 --set auth.oidc.audience=code
       - name: Render with autoscaling and ingress enabled
         run: |
-          helm template micelio charts/micelio \
+          helm template code charts/code \
             --set objectStore.endpoint=http://minio:9000 \
-            --set auth.oidc.audience=micelio \
+            --set auth.oidc.audience=code \
             --set autoscaling.enabled=true \
             --set ingress.enabled=true \
             --set serviceMonitor.enabled=true > /dev/null
 
   # Linting and templating a chart proves it is valid YAML, and nothing more.
   # Two bugs that stopped every pod from starting — Kubernetes injecting
-  # MICELIO_ADMIN_PORT from a same-named Service, and Helm rendering large
+  # CODE_ADMIN_PORT from a same-named Service, and Helm rendering large
   # integers as "2.68435456e+08" — passed both. The only way to know a chart
   # deploys is to deploy it.
   deploy:
@@ -215,18 +215,18 @@ jobs:
       # architecture claims.
       - uses: helm/kind-action@v1
         with:
-          cluster_name: micelio
+          cluster_name: code
           config: .github/kind-cluster.yaml
 
       - name: Build the image and load it into the cluster
         run: |
-          docker build -t micelio:ci .
-          kind load docker-image micelio:ci --name micelio
+          docker build -t code:ci .
+          kind load docker-image code:ci --name code
 
       - name: Deploy MinIO
         run: |
-          kubectl create namespace micelio
-          kubectl -n micelio apply -f - <<'MANIFEST'
+          kubectl create namespace code
+          kubectl -n code apply -f - <<'MANIFEST'
           apiVersion: apps/v1
           kind: Deployment
           metadata: {name: minio}
@@ -241,8 +241,8 @@ jobs:
                     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
                     args: ["server", "/data"]
                     env:
-                      - {name: MINIO_ROOT_USER, value: micelio}
-                      - {name: MINIO_ROOT_PASSWORD, value: micelio-secret}
+                      - {name: MINIO_ROOT_USER, value: code}
+                      - {name: MINIO_ROOT_PASSWORD, value: code-secret}
                     ports: [{containerPort: 9000}]
           ---
           apiVersion: v1
@@ -252,25 +252,25 @@ jobs:
             selector: {app: minio}
             ports: [{port: 9000, targetPort: 9000}]
           MANIFEST
-          kubectl -n micelio wait --for=condition=available deployment/minio --timeout=180s
-          kubectl -n micelio run mc --rm -i --restart=Never \
+          kubectl -n code wait --for=condition=available deployment/minio --timeout=180s
+          kubectl -n code run mc --rm -i --restart=Never \
             --image=minio/mc:RELEASE.2025-04-16T18-13-26Z \
-            --env=MC_HOST_local="http://micelio:micelio-secret@minio:9000" \
-            -- mb --ignore-existing local/micelio
+            --env=MC_HOST_local="http://code:code-secret@minio:9000" \
+            -- mb --ignore-existing local/code
 
       - name: Install the chart
         run: |
-          kubectl -n micelio create secret generic micelio-s3 \
-            --from-literal=MICELIO_S3_ACCESS_KEY_ID=micelio \
-            --from-literal=MICELIO_S3_SECRET_ACCESS_KEY=micelio-secret
+          kubectl -n code create secret generic code-s3 \
+            --from-literal=CODE_S3_ACCESS_KEY_ID=code \
+            --from-literal=CODE_S3_SECRET_ACCESS_KEY=code-secret
 
-          helm install micelio charts/micelio -n micelio \
-            --set image.repository=micelio --set image.tag=ci --set image.pullPolicy=IfNotPresent \
+          helm install code charts/code -n code \
+            --set image.repository=code --set image.tag=ci --set image.pullPolicy=IfNotPresent \
             --set replicaCount=3 \
             --set objectStore.endpoint=http://minio:9000 \
-            --set objectStore.bucket=micelio \
+            --set objectStore.bucket=code \
             --set objectStore.region=us-east-1 \
-            --set objectStore.existingSecret=micelio-s3 \
+            --set objectStore.existingSecret=code-s3 \
             --set auth.backend=static \
             --set auth.static.tokens='ci-token=acme:read\,write' \
             --set adminToken=ci-admin \
@@ -279,25 +279,25 @@ jobs:
 
       - name: The pods landed on different nodes
         run: |
-          nodes=$(kubectl -n micelio get pods -l app.kubernetes.io/name=micelio \
+          nodes=$(kubectl -n code get pods -l app.kubernetes.io/name=code \
             -o 'custom-columns=NODE:.spec.nodeName' --no-headers | sort -u | wc -l)
           echo "pods are spread across $nodes nodes"
           [ "$nodes" -ge 2 ] || { echo "::error::all replicas landed on one node"; exit 1; }
 
       - name: The pods clustered themselves
         run: |
-          pod=$(kubectl -n micelio get pods -l app.kubernetes.io/name=micelio -o jsonpath='{.items[0].metadata.name}')
-          members=$(kubectl -n micelio exec "$pod" -- \
+          pod=$(kubectl -n code get pods -l app.kubernetes.io/name=code -o jsonpath='{.items[0].metadata.name}')
+          members=$(kubectl -n code exec "$pod" -- \
             curl -sS -H 'Authorization: Bearer ci-admin' http://127.0.0.1:4002/cluster)
           echo "$members"
-          echo "$members" | grep -q 'micelio@.*micelio@' \
+          echo "$members" | grep -q 'code@.*code@' \
             || { echo "::error::the pods did not form a cluster"; exit 1; }
 
       - name: A push to one pod is served by another
         run: |
-          mapfile -t pods < <(kubectl -n micelio get pods -l app.kubernetes.io/name=micelio -o name | sed 's|pod/||')
+          mapfile -t pods < <(kubectl -n code get pods -l app.kubernetes.io/name=code -o name | sed 's|pod/||')
 
-          kubectl -n micelio exec "${pods[0]}" -- sh -c '
+          kubectl -n code exec "${pods[0]}" -- sh -c '
             set -e
             curl -sS -X POST -H "Authorization: Bearer ci-admin" -H "Content-Type: application/json" \
               -d "{\"repository\":\"acme/ci\"}" http://127.0.0.1:4002/repositories >/dev/null
@@ -309,7 +309,7 @@ jobs:
 
           # The second pod has never seen this repository and must materialize
           # it from the log on the first request.
-          kubectl -n micelio exec "${pods[1]}" -- sh -c '
+          kubectl -n code exec "${pods[1]}" -- sh -c '
             export HOME=/tmp
             git clone -q http://x-access-token:ci-token@127.0.0.1:4000/acme/ci.git /tmp/c
             grep -q hello /tmp/c/README.md
@@ -319,27 +319,27 @@ jobs:
         run: |
           # The claim the whole design rests on. Evicting everywhere leaves the
           # log in object storage as the only copy; serving must still work.
-          for pod in $(kubectl -n micelio get pods -l app.kubernetes.io/name=micelio -o name | sed 's|pod/||'); do
-            kubectl -n micelio exec "$pod" -- \
+          for pod in $(kubectl -n code get pods -l app.kubernetes.io/name=code -o name | sed 's|pod/||'); do
+            kubectl -n code exec "$pod" -- \
               curl -sS -m 10 -X POST -H 'Authorization: Bearer ci-admin' \
               http://127.0.0.1:4002/evict/acme/ci >/dev/null
-            remaining=$(kubectl -n micelio exec "$pod" -- sh -c 'ls /var/lib/micelio/repositories/acme 2>/dev/null | wc -l')
+            remaining=$(kubectl -n code exec "$pod" -- sh -c 'ls /var/lib/code/repositories/acme 2>/dev/null | wc -l')
             [ "$remaining" = "0" ] || { echo "::error::$pod still holds a copy"; exit 1; }
           done
 
-          kubectl -n micelio run rebuild --rm -i --restart=Never --image=alpine/git:latest --command -- sh -c '
+          kubectl -n code run rebuild --rm -i --restart=Never --image=alpine/git:latest --command -- sh -c '
             export HOME=/tmp
-            git clone -q http://x-access-token:ci-token@micelio:4000/acme/ci.git /tmp/r
+            git clone -q http://x-access-token:ci-token@code:4000/acme/ci.git /tmp/r
             grep -q hello /tmp/r/README.md
           '
 
       - name: Serving through the Service, which round-robins across pods
         run: |
-          kubectl -n micelio run gitclient --rm -i --restart=Never --image=alpine/git:latest --command -- sh -c '
+          kubectl -n code run gitclient --rm -i --restart=Never --image=alpine/git:latest --command -- sh -c '
             set -e
             export HOME=/tmp
             for i in 1 2 3 4; do
-              git clone -q http://x-access-token:ci-token@micelio:4000/acme/ci.git /tmp/c$i
+              git clone -q http://x-access-token:ci-token@code:4000/acme/ci.git /tmp/c$i
               grep -q hello /tmp/c$i/README.md
             done
           '
@@ -347,6 +347,6 @@ jobs:
       - name: Diagnostics
         if: failure()
         run: |
-          kubectl -n micelio get pods -o wide || true
-          kubectl -n micelio describe pods -l app.kubernetes.io/name=micelio || true
-          kubectl -n micelio logs -l app.kubernetes.io/name=micelio --tail=100 --prefix || true
+          kubectl -n code get pods -o wide || true
+          kubectl -n code describe pods -l app.kubernetes.io/name=code || true
+          kubectl -n code logs -l app.kubernetes.io/name=code --tail=100 --prefix || true

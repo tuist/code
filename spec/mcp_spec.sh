@@ -28,7 +28,7 @@ Describe 'MCP'
       The status should equal 0
       The output should include '"supportedVersions"'
       The output should include "2026-07-28"
-      The output should include "micelio"
+      The output should include "code"
     End
 
     It 'refuses a protocol version it does not implement, and says which it does'
@@ -44,7 +44,7 @@ Describe 'MCP'
       When run bash -c "mcp '$NODE1_URL' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}'"
       The status should equal 0
       The output should include '"serverInfo"'
-      The output should include "micelio"
+      The output should include "code"
     End
 
     It 'lists tools'

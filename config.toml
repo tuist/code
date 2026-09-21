@@ -1,5 +1,5 @@
-base_url = "https://micelio.dev"
-title = "Micelio"
+base_url = "https://code.dev"
+title = "Code"
 description = "Headless & scalable Git forge backed by a write-ahead log in object storage."
 default_language = "en"
 compile_sass = true

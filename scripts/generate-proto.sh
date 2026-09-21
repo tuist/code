@@ -37,5 +37,5 @@ generate() {
   grep '^defmodule' "$out" | sed 's/^/  /'
 }
 
-generate priv/proto/micelio/wal/v1/wal.proto lib/micelio/wal/v1/wal.pb.ex
-generate priv/proto/micelio/policy/v1/policy.proto lib/micelio/policy/v1/policy.pb.ex
+generate priv/proto/code/wal/v1/wal.proto lib/code/wal/v1/wal.pb.ex
+generate priv/proto/code/policy/v1/policy.proto lib/code/policy/v1/policy.pb.ex

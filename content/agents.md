@@ -5,16 +5,16 @@ template = "page.html"
 
 # 🤖 Use it with agents
 
-Micelio has a [Model Context Protocol](https://modelcontextprotocol.io/)
+Code has a [Model Context Protocol](https://modelcontextprotocol.io/)
 endpoint at `POST /mcp`. An agent can read a file at a revision, search a
 repository, inspect history, or create a commit without cloning a working tree.
 
 ```json
 {
   "mcpServers": {
-    "micelio": {
-      "url": "https://micelio.example.com/mcp",
-      "headers": { "Authorization": "Bearer ${MICELIO_TOKEN}" }
+    "code": {
+      "url": "https://code.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${CODE_TOKEN}" }
     }
   }
 }
@@ -25,4 +25,4 @@ The everyday tools are `list_repositories`, `read_file`, `search`, `log`,
 an agent cannot quietly overwrite a concurrent change.
 
 The full list of tools and the protocol details live in the
-[agent-facing reference](https://github.com/tuist/micelio/blob/main/docs/mcp.md).
+[agent-facing reference](https://github.com/tuist/code/blob/main/docs/mcp.md).

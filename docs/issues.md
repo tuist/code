@@ -5,8 +5,8 @@ a shared service or in a database on a node's local disk.
 
 ## Storage and durability
 
-Micelio stores issue state in the repository's private
-`refs/micelio/issues` Git reference. Every create, change, comment, or delete
+Code stores issue state in the repository's private
+`refs/code/issues` Git reference. Every create, change, comment, or delete
 operation creates a Git commit in that reference and sends its objects through
 the normal write-ahead log path. Object storage is therefore the source of
 truth for issue history as well as source history; a node can rebuild either
@@ -18,7 +18,7 @@ Each commit contains two forms of data:
 - an immutable issue or comment event, including the verified caller identity
   and the time of the operation.
 
-The commit's Git author is the Micelio service. The event actor is the
+The commit's Git author is the Code service. The event actor is the
 authenticated principal, so a client cannot forge authorship with a Git author
 header.
 
@@ -28,12 +28,12 @@ readers.
 
 The reference is hidden from Git advertisement and fetch, cannot be updated by
 Git push, and is rejected by ordinary agent source-code tools. It is reserved
-for Micelio's own issue implementation.
+for Code's own issue implementation.
 
 ## Concurrency
 
 An issue mutation is conditional on the current private-reference commit. If
-another mutation wins first, Micelio rereads the projection, rebuilds the
+another mutation wins first, Code rereads the projection, rebuilds the
 change, and retries. The repository's existing writer serializes competing
 object-storage compare-and-swap operations, so this requires no separate
 leader or issue database.

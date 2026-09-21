@@ -1,4 +1,4 @@
-# Micelio — Git replication built on a write-ahead log in object storage.
+# Code — Git replication built on a write-ahead log in object storage.
 #
 # The toolchain is pinned so laptops, CI and build images produce identical
 # BEAM bytecode. Bump erlang and elixir together: an Elixir build is tied to
@@ -39,7 +39,7 @@ description = "Run the unit test suite"
 run = "mix test"
 
 [tasks."e2e:up"]
-description = "Start MinIO and two clustered Micelio nodes"
+description = "Start MinIO and two clustered Code nodes"
 # MinIO comes from a pinned container image rather than a mise tool: upstream
 # no longer publishes per-version archives for every platform, and a pinned
 # image is what CI runs anyway.
@@ -72,14 +72,14 @@ description = "Run a single node against the local filesystem object store"
 run = "iex -S mix"
 
 [tasks.site]
-description = "Build the Micelio website"
+description = "Build the Code website"
 run = ["node scripts/generate-og-images.mjs", "zola build"]
 
 [tasks."site:serve"]
-description = "Serve the Micelio website locally"
+description = "Serve the Code website locally"
 run = ["node scripts/generate-og-images.mjs", "zola serve"]
 
 [tasks."site:deploy"]
-description = "Build and deploy the Micelio website to Cloudflare Workers"
+description = "Build and deploy the Code website to Cloudflare Workers"
 depends = ["site"]
 run = "wrangler deploy"

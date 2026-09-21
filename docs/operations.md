@@ -3,50 +3,50 @@
 ## Configuration
 
 Everything is read from the environment so one image can be rolled out
-unchanged to every node. The only per-node value is `MICELIO_NODE_ID`.
+unchanged to every node. The only per-node value is `CODE_NODE_ID`.
 
 ### Required
 
 | Variable | Meaning |
 |---|---|
-| `MICELIO_S3_BUCKET` | Bucket holding the write-ahead log |
-| `MICELIO_S3_ENDPOINT` | Object store endpoint |
-| `MICELIO_S3_ACCESS_KEY_ID` | |
-| `MICELIO_S3_SECRET_ACCESS_KEY` | |
-| `MICELIO_ADMIN_TOKEN` | Bearer token for the admin API |
+| `CODE_S3_BUCKET` | Bucket holding the write-ahead log |
+| `CODE_S3_ENDPOINT` | Object store endpoint |
+| `CODE_S3_ACCESS_KEY_ID` | |
+| `CODE_S3_SECRET_ACCESS_KEY` | |
+| `CODE_ADMIN_TOKEN` | Bearer token for the admin API |
 
 ### Object storage
 
 | Variable | Default | Notes |
 |---|---|---|
-| `MICELIO_S3_REGION` | `auto` | |
-| `MICELIO_S3_PREFIX` | | Key prefix, for sharing a bucket |
-| `MICELIO_S3_PATH_STYLE` | `true` | `false` for virtual-hosted AWS buckets |
+| `CODE_S3_REGION` | `auto` | |
+| `CODE_S3_PREFIX` | | Key prefix, for sharing a bucket |
+| `CODE_S3_PATH_STYLE` | `true` | `false` for virtual-hosted AWS buckets |
 
 The store **must** support conditional writes (`If-Match`, `If-None-Match`) and
 conditional reads (`If-None-Match`). AWS S3, MinIO, Tigris, Cloudflare R2 and
 Ceph all do. Without them the compare-and-swap that orders pushes does not
-exist, and Micelio will not be safe.
+exist, and Code will not be safe.
 
 ### Behaviour
 
 | Variable | Default | Notes |
 |---|---|---|
-| `MICELIO_MAX_PORTS` | `65536` | Ceiling on concurrent Git streams and connections. Raising it costs memory: the BEAM pre-allocates the whole table, and a container's default file-descriptor limit would otherwise make that 1.5 GB |
-| `MICELIO_DEFAULT_REPLICAS` | `3` | Per-repository, overridable |
-| `MICELIO_STALENESS_BUDGET_MS` | `0` | See below |
-| `MICELIO_COMPACTION_ENTRY_THRESHOLD` | `250` | |
-| `MICELIO_COMPACTION_BYTES_THRESHOLD` | `268435456` | |
-| `MICELIO_ROLES` | `serve,maintain,events` | Comma-separated node capabilities |
-| `MICELIO_MAINTENANCE_COMPACTION_CONCURRENCY` | `1` | Repack jobs per maintenance node |
-| `MICELIO_MAINTENANCE_LOOKUP_CONCURRENCY` | `1` | Multi-pack lookup rebuilds per maintenance node |
-| `MICELIO_MAINTENANCE_BUNDLE_CONCURRENCY` | `1` | Reserved for bundle creation, which is not implemented |
-| `MICELIO_MAINTENANCE_EVENTS_CONCURRENCY` | `4` | Reserved for event delivery, which is not implemented |
-| `MICELIO_MAINTENANCE_SWEEP_MS` | `300000` | How often resident repositories are considered |
-| `MICELIO_IDLE_EVICTION_MS` | `3600000` | Drop untouched repositories from disk |
-| `MICELIO_DATA_DIR` | `/var/lib/micelio/repositories` | Put this on fast local NVMe |
+| `CODE_MAX_PORTS` | `65536` | Ceiling on concurrent Git streams and connections. Raising it costs memory: the BEAM pre-allocates the whole table, and a container's default file-descriptor limit would otherwise make that 1.5 GB |
+| `CODE_DEFAULT_REPLICAS` | `3` | Per-repository, overridable |
+| `CODE_STALENESS_BUDGET_MS` | `0` | See below |
+| `CODE_COMPACTION_ENTRY_THRESHOLD` | `250` | |
+| `CODE_COMPACTION_BYTES_THRESHOLD` | `268435456` | |
+| `CODE_ROLES` | `serve,maintain,events` | Comma-separated node capabilities |
+| `CODE_MAINTENANCE_COMPACTION_CONCURRENCY` | `1` | Repack jobs per maintenance node |
+| `CODE_MAINTENANCE_LOOKUP_CONCURRENCY` | `1` | Multi-pack lookup rebuilds per maintenance node |
+| `CODE_MAINTENANCE_BUNDLE_CONCURRENCY` | `1` | Reserved for bundle creation, which is not implemented |
+| `CODE_MAINTENANCE_EVENTS_CONCURRENCY` | `4` | Reserved for event delivery, which is not implemented |
+| `CODE_MAINTENANCE_SWEEP_MS` | `300000` | How often resident repositories are considered |
+| `CODE_IDLE_EVICTION_MS` | `3600000` | Drop untouched repositories from disk |
+| `CODE_DATA_DIR` | `/var/lib/code/repositories` | Put this on fast local NVMe |
 
-**`MICELIO_STALENESS_BUDGET_MS` deserves a moment.** At `0`, every read
+**`CODE_STALENESS_BUDGET_MS` deserves a moment.** At `0`, every read
 re-validates against object storage before serving, which is what makes a client
 able to talk to any replica and get an answer consistent with every other. The
 check is a conditional GET returning `304` — a metadata operation, typically a
@@ -61,7 +61,7 @@ if you know the workload tolerates that.
 
 The default `serve,maintain,events` role set is appropriate for a small
 deployment. At larger sizes, a dedicated maintenance deployment can set
-`MICELIO_ROLES=maintain` and share the same object store and distributed Erlang
+`CODE_ROLES=maintain` and share the same object store and distributed Erlang
 cluster. It receives no public listeners and never joins replica placement, so
 Git repacks remain isolated from clone and push traffic.
 
@@ -79,9 +79,9 @@ are intentionally unavailable until their public contracts are implemented.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `MICELIO_CLUSTER_STRATEGY` | `none` | `kubernetes`, `dns`, `epmd` |
-| `MICELIO_HEADLESS_SERVICE` | `micelio-headless` | For the Kubernetes strategy |
-| `MICELIO_NAMESPACE` | `default` | |
+| `CODE_CLUSTER_STRATEGY` | `none` | `kubernetes`, `dns`, `epmd` |
+| `CODE_HEADLESS_SERVICE` | `code-headless` | For the Kubernetes strategy |
+| `CODE_NAMESPACE` | `default` | |
 | `RELEASE_COOKIE` | | **Required for clustering.** Distributed Erlang's shared secret |
 
 A single node works with no clustering at all. Clustering buys read scaling and
@@ -93,18 +93,18 @@ See [kubernetes.md](kubernetes.md) for the full picture.
 
 | Variable | Notes |
 |---|---|
-| `MICELIO_AUTH_BACKEND` | `webhook` (default), `oidc`, `static`, `none` |
-| `MICELIO_OIDC_ISSUER` | Token issuer, used to discover the JWKS |
-| `MICELIO_OIDC_AUDIENCE` | **Set this.** Binds tokens to this deployment |
-| `MICELIO_AUTH_ENDPOINT` | For the webhook backend |
+| `CODE_AUTH_BACKEND` | `webhook` (default), `oidc`, `static`, `none` |
+| `CODE_OIDC_ISSUER` | Token issuer, used to discover the JWKS |
+| `CODE_OIDC_AUDIENCE` | **Set this.** Binds tokens to this deployment |
+| `CODE_AUTH_ENDPOINT` | For the webhook backend |
 
 ### Browser login for Git
 
 Git's HTTP transport can prompt for a password, but it cannot by itself run a
-browser sign-in. Micelio therefore supports [Git Credential
+browser sign-in. Code therefore supports [Git Credential
 Manager](https://github.com/git-ecosystem/git-credential-manager) as an
 optional client-side bridge to an [OpenID Connect](https://openid.net/developers/how-connect-works/)
-issuer. Micelio remains only a token validator: it does not issue, store, or
+issuer. Code remains only a token validator: it does not issue, store, or
 exchange credentials.
 
 This is available only with the `oidc` backend and an external issuer, not the
@@ -115,25 +115,25 @@ Credential Manager. For a fixed public client, set:
 
 | Variable | Meaning |
 |---|---|
-| `MICELIO_GIT_AUTH_CLIENT_ID` | The public OAuth client identifier. Never put a client secret in Micelio. Mutually exclusive with dynamic registration. |
-| `MICELIO_GIT_AUTH_REGISTRATION_ENDPOINT` | Optional [OpenID Connect Dynamic Client Registration](https://openid.net/specs/openid-connect-registration-1_0-24.html) endpoint. Set this instead of `MICELIO_GIT_AUTH_CLIENT_ID`. |
-| `MICELIO_GIT_AUTH_AUTHORIZATION_ENDPOINT` | HTTPS browser authorization endpoint. |
-| `MICELIO_GIT_AUTH_TOKEN_ENDPOINT` | HTTPS token endpoint. |
-| `MICELIO_GIT_AUTH_REDIRECT_URI` | Loopback redirect URI; defaults to `http://127.0.0.1`. Register this exact value with the identity provider. |
-| `MICELIO_GIT_AUTH_SCOPES` | Space-separated scopes required to obtain a token Micelio accepts. |
-| `MICELIO_GIT_AUTH_USERNAME` | HTTP Basic username used for tokens; defaults to `oauth2`. |
+| `CODE_GIT_AUTH_CLIENT_ID` | The public OAuth client identifier. Never put a client secret in Code. Mutually exclusive with dynamic registration. |
+| `CODE_GIT_AUTH_REGISTRATION_ENDPOINT` | Optional [OpenID Connect Dynamic Client Registration](https://openid.net/specs/openid-connect-registration-1_0-24.html) endpoint. Set this instead of `CODE_GIT_AUTH_CLIENT_ID`. |
+| `CODE_GIT_AUTH_AUTHORIZATION_ENDPOINT` | HTTPS browser authorization endpoint. |
+| `CODE_GIT_AUTH_TOKEN_ENDPOINT` | HTTPS token endpoint. |
+| `CODE_GIT_AUTH_REDIRECT_URI` | Loopback redirect URI; defaults to `http://127.0.0.1`. Register this exact value with the identity provider. |
+| `CODE_GIT_AUTH_SCOPES` | Space-separated scopes required to obtain a token Code accepts. |
+| `CODE_GIT_AUTH_USERNAME` | HTTP Basic username used for tokens; defaults to `oauth2`. |
 
-When enabled, `GET /.well-known/micelio-git-auth` publishes this public client
+When enabled, `GET /.well-known/code-git-auth` publishes this public client
 configuration. It publishes no secret or token. Developers can configure their
 existing Git installation from a verified checkout. The machine needs Git
 Credential Manager already installed; the script does not install it or change
 credentials for other hosts:
 
 ```sh
-./scripts/configure-micelio-git --url https://git.example.com
+./scripts/configure-code-git --url https://git.example.com
 ```
 
-The script defaults to `https://micelio.dev`, downloads metadata only over
+The script defaults to `https://code.dev`, downloads metadata only over
 HTTPS without redirects, validates its strict `key=value` document, and writes
 Git configuration scoped to that exact origin. It neither receives nor stores a
 token. For a release
@@ -142,12 +142,12 @@ do not make `curl | bash` the documented installation path.
 
 #### Dynamic registration
 
-Set `MICELIO_GIT_AUTH_REGISTRATION_ENDPOINT` rather than a client identifier
+Set `CODE_GIT_AUTH_REGISTRATION_ENDPOINT` rather than a client identifier
 when the identity provider explicitly permits OpenID Connect Dynamic Client
 Registration. Developers then opt in with:
 
 ```sh
-./scripts/configure-micelio-git --url https://git.example.com --dynamic-registration
+./scripts/configure-code-git --url https://git.example.com --dynamic-registration
 ```
 
 This mode requires [jq](https://jqlang.org/) to safely construct and inspect
@@ -163,15 +163,15 @@ access token and does not retain the registration management token returned by
 some providers. A new invocation therefore creates a new client; use the
 static public-client configuration when that operational cost is unsuitable.
 
-The identity provider must issue an access token Micelio can validate: a signed
-JSON Web Token whose audience is `MICELIO_OIDC_AUDIENCE`. An identity token is
+The identity provider must issue an access token Code can validate: a signed
+JSON Web Token whose audience is `CODE_OIDC_AUDIENCE`. An identity token is
 not a substitute for that access token. The necessary audience or resource
-parameter is provider-specific, so include it in `MICELIO_GIT_AUTH_SCOPES` or
+parameter is provider-specific, so include it in `CODE_GIT_AUTH_SCOPES` or
 the registered client configuration.
 
 Some identity providers require an exact loopback port instead of accepting the
 standard dynamic port. In that case, configure the same explicit port in
-`MICELIO_GIT_AUTH_REDIRECT_URI` and register that exact URI.
+`CODE_GIT_AUTH_REDIRECT_URI` and register that exact URI.
 
 To remove this setup, run:
 
@@ -188,15 +188,15 @@ adds Git Credential Manager, so credentials for other Git hosts are unaffected.
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Setting an [OpenTelemetry](https://opentelemetry.io/docs/) Protocol endpoint enables tracing |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | `http_protobuf` | Export protocol used for traces |
-| `MICELIO_PUBLIC_URL` | unset | Overrides the URL advertised to clients |
+| `CODE_PUBLIC_URL` | unset | Overrides the URL advertised to clients |
 
 Tracing begins at every listener and adds spans for public requests, pushes,
 replica refreshes and synchronization, and each object-store operation. Request
 trace headers from public clients are linked for correlation rather than used as
-the parent of Micelio work. This prevents an untrusted caller from choosing the
+the parent of Code work. This prevents an untrusted caller from choosing the
 service's trace tree.
 
-When tracing is enabled, logs emitted inside Micelio's explicit spans include
+When tracing is enabled, logs emitted inside Code's explicit spans include
 `otel_trace_id` and `otel_span_id`. Operational logs use fields such as
 `repo_id`, `seq`, `epoch`, `reason`, `service`, and `duration_ms`; configure
 the log collector to retain those fields. Credentials, object keys, and request
@@ -219,7 +219,7 @@ written to disk. It must never be exposed.
 
 ### The one to watch
 
-**`micelio_wal_read_duration_seconds{outcome}`.** A healthy node's reads are
+**`code_wal_read_duration_seconds{outcome}`.** A healthy node's reads are
 overwhelmingly `not_modified`: replicas confirm they are current with a
 metadata-only round trip and serve immediately. If `modified` starts dominating,
 replicas are doing real catch-up work on the read path, and latency will follow.
@@ -228,23 +228,23 @@ replicas are doing real catch-up work on the read path, and latency will follow.
 
 | Metric | Question it answers |
 |---|---|
-| `micelio_wal_cas_retry_count` | Is there write contention the writer could not absorb? A few are normal; many mean pushes are arriving at several nodes at once, so routing to the preferred writer is not taking effect |
-| `micelio_wal_append_batch_size` | Pushes absorbed per compare-and-swap. Rising with load is group commit doing its job |
-| `micelio_replica_sync_entries_behind` | How far behind is this node? Persistent non-zero means hints are not arriving, or the store is slow |
-| `micelio_git_requests_in_flight` | Should we scale? See below |
-| `micelio_push_rejected_count{reason}` | `non_fast_forward` is users; `storage` and `contention` are yours |
-| `micelio_git_aborted_count` | Clients disconnecting mid-clone |
-| `micelio_replica_evict_count` | Cache churn. High values with high sync duration means the working set does not fit |
-| `micelio_object_store_request_duration_seconds{operation,outcome}` | Is the source of truth slow or failing? `operation` and `outcome` have bounded values; no repository identifier is a label |
-| `micelio_object_store_request_count{operation,outcome}` | Is object-store traffic or a particular failure outcome rising? |
-| `micelio_http_request_duration_seconds{listener,method,status}` | Is any public, hook, or administration listener slow or returning errors? `method` and `status` use bounded classes; `status` is a response class such as `5xx` |
-| `micelio_http_exception_count{listener}` | Did a request terminate unexpectedly before it could return a response? |
-| `micelio_factory_operation_duration_seconds{operation,outcome}` | Are durable graph-run or account configuration operations slow or failing? Operation and outcome are bounded, so repository work does not create metric-label cardinality. |
-| `micelio_factory_operation_count{operation,outcome}` | Which durable graph-run or account configuration operations are succeeding or failing? |
+| `code_wal_cas_retry_count` | Is there write contention the writer could not absorb? A few are normal; many mean pushes are arriving at several nodes at once, so routing to the preferred writer is not taking effect |
+| `code_wal_append_batch_size` | Pushes absorbed per compare-and-swap. Rising with load is group commit doing its job |
+| `code_replica_sync_entries_behind` | How far behind is this node? Persistent non-zero means hints are not arriving, or the store is slow |
+| `code_git_requests_in_flight` | Should we scale? See below |
+| `code_push_rejected_count{reason}` | `non_fast_forward` is users; `storage` and `contention` are yours |
+| `code_git_aborted_count` | Clients disconnecting mid-clone |
+| `code_replica_evict_count` | Cache churn. High values with high sync duration means the working set does not fit |
+| `code_object_store_request_duration_seconds{operation,outcome}` | Is the source of truth slow or failing? `operation` and `outcome` have bounded values; no repository identifier is a label |
+| `code_object_store_request_count{operation,outcome}` | Is object-store traffic or a particular failure outcome rising? |
+| `code_http_request_duration_seconds{listener,method,status}` | Is any public, hook, or administration listener slow or returning errors? `method` and `status` use bounded classes; `status` is a response class such as `5xx` |
+| `code_http_exception_count{listener}` | Did a request terminate unexpectedly before it could return a response? |
+| `code_factory_operation_duration_seconds{operation,outcome}` | Are durable graph-run or account configuration operations slow or failing? Operation and outcome are bounded, so repository work does not create metric-label cardinality. |
+| `code_factory_operation_count{operation,outcome}` | Which durable graph-run or account configuration operations are succeeding or failing? |
 
 ### What to autoscale on
 
-`micelio_git_requests_in_flight`, not CPU. A clone occupies a connection, a
+`code_git_requests_in_flight`, not CPU. A clone occupies a connection, a
 process and a `git upload-pack` for its entire duration, which can be minutes,
 while CPU stays unremarkable. Scaling on CPU alone reacts far too late.
 
@@ -263,7 +263,7 @@ data.
 
 ## Admin API
 
-Bearer `MICELIO_ADMIN_TOKEN`. Any node answers any question.
+Bearer `CODE_ADMIN_TOKEN`. Any node answers any question.
 
 ```sh
 curl :4002/status                            # this node
@@ -294,7 +294,7 @@ fail, because the node cannot confirm it is current and would rather refuse than
 lie. Writes fail. `/ready` goes red and the node leaves rotation. This is a hard
 dependency by design.
 
-**A git command hangs with no output on macOS.** Not Micelio. The `osxkeychain`
+**A git command hangs with no output on macOS.** Not Code. The `osxkeychain`
 credential helper blocks storing a credential for a host and port it has not
 seen before. Add `-c credential.helper=` to confirm, then approve it once.
 
@@ -304,14 +304,14 @@ fetch and retry. If it happens constantly on one repository, that repository is
 a write hotspot.
 
 **`cas_exhausted`.** Too many concurrent writers on one repository for the retry
-budget. Bounded by object store latency, not by Micelio.
+budget. Bounded by object store latency, not by Code.
 
 **A replica cannot converge.** Almost always a log entry naming an object no
 pack provides, which the sync will refuse loudly rather than paper over. Check
-`micelio_replica_sync_*` and the node's logs; the repository is intact in the
+`code_replica_sync_*` and the node's logs; the repository is intact in the
 log, so evicting the replica and letting it rebuild is safe and usually enough.
 
-**Disk fills.** Lower `MICELIO_IDLE_EVICTION_MS` or add nodes. The cache tracks
+**Disk fills.** Lower `CODE_IDLE_EVICTION_MS` or add nodes. The cache tracks
 the working set, so this means the working set grew.
 
 ## Capacity
@@ -329,7 +329,7 @@ the working set, so this means the working set grew.
 
 ## Storage growth, and what is safe to delete
 
-Object storage only grows. Nothing in Micelio deletes an object except
+Object storage only grows. Nothing in Code deletes an object except
 `DELETE /repositories/<id>`, which removes that repository's prefix entirely.
 That is a deliberate consequence of the provenance guarantee — every state a
 repository has been in stays reconstructible — but it is a cost, and it is
@@ -346,7 +346,7 @@ Per repository:
 
 A repository pushed to constantly will therefore accumulate roughly one full
 copy of itself per compaction. The compaction thresholds are what control that
-rate: raising `MICELIO_COMPACTION_ENTRY_THRESHOLD` compacts less often and
+rate: raising `CODE_COMPACTION_ENTRY_THRESHOLD` compacts less often and
 stores less, at the cost of slower materialization for a replica starting cold.
 
 **Automatic garbage collection is not implemented.** Deciding a pack is
@@ -360,7 +360,7 @@ you would use for any other prefix-organised data:
 {
   "Rules": [
     {
-      "ID": "micelio-history",
+      "ID": "code-history",
       "Filter": {"Prefix": "repos/"},
       "Status": "Enabled",
       "NoncurrentVersionExpiration": {"NoncurrentDays": 30}

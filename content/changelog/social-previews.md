@@ -7,7 +7,7 @@ template = "page.html"
 
 # 🖼️ Every page now carries its own social preview
 
-Micelio now builds a dedicated social-preview image for every page, including
+Code now builds a dedicated social-preview image for every page, including
 every individual changelog item.
 
 ## What changed

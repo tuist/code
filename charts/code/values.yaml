@@ -1,0 +1,271 @@
+# Code.
+#
+# Deployed as a Deployment rather than a StatefulSet, on purpose: a node's disk
+# is a cache of the write-ahead log in object storage, not the source of truth,
+# so pods need no stable identity and no durable volume.
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/tuist/code
+  pullPolicy: IfNotPresent
+  # Defaults to the chart's appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# --------------------------------------------------------------------------
+# Object storage. This is the source of truth; everything else is disposable.
+#
+# The store must support conditional writes (If-Match, If-None-Match) and
+# conditional reads (If-None-Match). Without them the compare-and-swap that
+# orders pushes does not exist. S3, MinIO, Tigris, R2 and Ceph all qualify.
+# --------------------------------------------------------------------------
+objectStore:
+  bucket: code
+  endpoint: ""
+  region: auto
+  prefix: ""
+  # true for MinIO, Tigris, Ceph; false for virtual-hosted AWS buckets.
+  pathStyle: true
+
+  # Preferred: a Secret with CODE_S3_ACCESS_KEY_ID and
+  # CODE_S3_SECRET_ACCESS_KEY.
+  existingSecret: ""
+
+  # Only for evaluation. Values here end up in the release manifest.
+  accessKeyId: ""
+  secretAccessKey: ""
+
+# --------------------------------------------------------------------------
+# Authentication. Code validates tokens; it never issues them.
+# --------------------------------------------------------------------------
+auth:
+  # oidc | webhook | static | none
+  backend: oidc
+
+  oidc:
+    # Verify tokens against the cluster's own issuer, so pods authenticate with
+    # the projected service account token they already have and no secret is
+    # ever distributed.
+    #
+    # This grants Code the `system:service-account-issuer-discovery` role
+    # and mounts its own service account token, because the cluster's discovery
+    # endpoint requires authentication and is served with the cluster CA.
+    # Everything else Code does needs no API access at all.
+    kubernetes: true
+
+    # Leave empty when kubernetes is true: the issuer is read from the cluster
+    # rather than assumed. Kubernetes is reached at `kubernetes.default.svc`
+    # but issues tokens naming `kubernetes.default.svc.cluster.local`, so
+    # configuring the address you connect to rejects every token.
+    issuer: ""
+    # Must match the audience on the projected token. Binding tokens to this
+    # deployment is what stops a token minted for another service being
+    # replayed here.
+    audience: code
+    jwksUri: ""
+    # Turn `system:serviceaccount:<ns>:<name>` into read/write on `<ns>/**`,
+    # so a pod can use its own namespace's repositories with no configuration.
+    namespaceGrants: true
+    grantsClaim: code_grants
+
+  webhook:
+    endpoint: ""
+    existingSecret: ""
+
+  static:
+    # "token=account:read,write;other=beta:read"
+    tokens: ""
+    existingSecret: ""
+
+  # Optional browser login for developers using Git Credential Manager. These
+  # values are public OAuth client configuration, never a client secret. It is
+  # available only with `backend: oidc` and `oidc.kubernetes: false`.
+  gitAuth:
+    clientId: ""
+    # Optional OpenID Connect Dynamic Client Registration endpoint. Set this
+    # instead of clientId to let each developer register a public client.
+    registrationEndpoint: ""
+    authorizationEndpoint: ""
+    tokenEndpoint: ""
+    # Register this exact loopback redirect URI with the identity provider.
+    redirectUri: http://127.0.0.1
+    scopes: ""
+    username: oauth2
+
+# Bearer token for the admin API. Generated and stored in a Secret if empty.
+adminToken: ""
+
+# Shared secret for distributed Erlang. Generated if empty. Nodes with
+# different cookies silently fail to cluster.
+releaseCookie: ""
+
+# --------------------------------------------------------------------------
+# Behaviour
+# --------------------------------------------------------------------------
+config:
+  defaultReplicas: 3
+
+  # 0 means every read re-validates against object storage before serving,
+  # which is what lets a client talk to any replica and get a consistent
+  # answer. Raising it trades that for fewer round trips.
+  stalenessBudgetMs: 0
+
+  # How long a node may reuse a cached authorization policy. Not zero, unlike
+  # stalenessBudgetMs: authorization is checked on every request, and a
+  # bounded window here is still far tighter than the token lifetime it
+  # replaces. See docs/multi-tenancy.md.
+  policyStalenessBudgetMs: 5000
+
+  compactionEntryThreshold: 250
+  compactionBytesThreshold: 268435456
+  # Comma-separated node capabilities. The default single Deployment performs
+  # every role; a dedicated maintenance Deployment can use extraEnv to set
+  # this to "maintain" and keep expensive Git work off serving pods.
+  roles: "serve,maintain,events"
+  maintenanceCompactionConcurrency: 1
+  maintenanceLookupConcurrency: 1
+  # Reserved until Code publishes a bundle contract.
+  maintenanceBundleConcurrency: 1
+  # Reserved until Code publishes a durable event-delivery contract.
+  maintenanceEventsConcurrency: 4
+  maintenanceSweepMs: 300000
+  idleEvictionMs: 3600000
+
+  # Advertised to clients and used as the OAuth resource identifier.
+  publicUrl: ""
+
+extraEnv: []
+
+# --------------------------------------------------------------------------
+# Storage for the warm cache. emptyDir is the default because the cache is
+# disposable; a PVC only saves re-materialization after a restart.
+# --------------------------------------------------------------------------
+# Each pod gets its own volume, because the cache is per-pod: several replicas
+# sharing one set of Git directories would have several nodes repacking and
+# updating the same refs at once.
+persistence:
+  enabled: false
+  storageClass: ""
+  accessModes: [ReadWriteOnce]
+  size: 100Gi
+  # For emptyDir.
+  sizeLimit: 50Gi
+
+# --------------------------------------------------------------------------
+# Autoscaling.
+#
+# Scale on in-flight requests, not CPU. A clone holds a connection, a process
+# and a git upload-pack for its whole duration, so concurrency saturates long
+# before CPU does and CPU alone reacts far too late.
+#
+# The custom metric needs prometheus-adapter or KEDA; CPU is kept as a
+# secondary trigger for compaction load.
+# --------------------------------------------------------------------------
+autoscaling:
+  enabled: false
+  minReplicas: 3
+  maxReplicas: 50
+  targetCPUUtilizationPercentage: 75
+
+  # In-flight requests are the better signal, but the metric needs
+  # prometheus-adapter or KEDA to reach the HPA — and a HorizontalPodAutoscaler
+  # that names a metric nobody serves does not fall back to the others: it
+  # reports ScalingActive=False and stops scaling entirely, while still looking
+  # healthy at a glance. So this is off unless you have an adapter.
+  inFlightMetric:
+    enabled: false
+    target: 40
+  behavior:
+    scaleDown:
+      # Unhurried: a scale-down costs re-materialization on whoever inherits
+      # the repositories, so flapping is more expensive than a little lag.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+service:
+  type: ClusterIP
+  gitPort: 4000
+  adminPort: 4002
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: code.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+# Long enough for in-flight clones to finish. Scale-down is safe at any moment
+# because the log already has everything; this is purely about not cutting off
+# a client mid-transfer.
+terminationGracePeriodSeconds: 120
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+
+nodeSelector: {}
+tolerations: []
+
+# Spread replicas across nodes: losing a node should cost a fraction of
+# capacity, not all of it.
+affinity: {}
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: code
+
+tracing:
+  enabled: false
+  otlpEndpoint: ""
+  otlpProtocol: http_protobuf

@@ -1,6 +1,6 @@
 # MCP: a headless Git forge for agents
 
-Every Micelio node serves the Model Context Protocol at `POST /mcp`, alongside
+Every Code node serves the Model Context Protocol at `POST /mcp`, alongside
 the Git protocol on the same port.
 
 The premise is that an agent usually does not want a working tree. It wants to
@@ -14,20 +14,20 @@ clone entirely.
 ```json
 {
   "mcpServers": {
-    "micelio": {
-      "url": "https://micelio.example.com/mcp",
-      "headers": { "Authorization": "Bearer ${MICELIO_TOKEN}" }
+    "code": {
+      "url": "https://code.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${CODE_TOKEN}" }
     }
   }
 }
 ```
 
-Transport is Streamable HTTP. `GET /mcp` returns `405`: Micelio never initiates
+Transport is Streamable HTTP. `GET /mcp` returns `405`: Code never initiates
 messages, so there is nothing a server-to-client stream would carry.
 
 ## Stateless, in the protocol's own terms
 
-Micelio implements revision **2026-07-28**, which removed the `initialize`
+Code implements revision **2026-07-28**, which removed the `initialize`
 handshake. Every request declares its own protocol version — in `_meta` under
 `io.modelcontextprotocol/protocolVersion`, and on HTTP also in the
 `MCP-Protocol-Version` header — and the server accepts or rejects each one
@@ -155,7 +155,7 @@ authorization details.
 
 An agent node can name a [Condukt](https://github.com/tuist/condukt) operation
 and typed input. It can also select a versioned account inference profile.
-Micelio returns the profile name, version, endpoint, and model to a caller with
+Code returns the profile name, version, endpoint, and model to a caller with
 repository execution permission, but not a secret backend or credential
 binding. See [factory.md](factory.md) for profile, graph, storage, and lease
 semantics.
@@ -180,15 +180,15 @@ actually read, for the same reason.
 Discovery follows OAuth 2.1: a `401` carries
 
 ```
-WWW-Authenticate: Bearer realm="micelio",
-  resource_metadata="https://micelio.example.com/.well-known/oauth-protected-resource"
+WWW-Authenticate: Bearer realm="code",
+  resource_metadata="https://code.example.com/.well-known/oauth-protected-resource"
 ```
 
 and that document names the authorization servers and this deployment's resource
 identifier. An MCP client can therefore find out where to get a token instead of
 being handed one out of band.
 
-Micelio validates tokens and never issues them. See
+Code validates tokens and never issues them. See
 [kubernetes.md](kubernetes.md) for how a pod authenticates with a credential it
 was born with.
 
@@ -197,8 +197,8 @@ was born with.
 Two templates, rather than an enumeration:
 
 ```
-micelio://{repository}/refs
-micelio://{repository}/blob/{ref}/{path}
+code://{repository}/refs
+code://{repository}/blob/{ref}/{path}
 ```
 
 Listing every repository as a resource would be a poor trade at any real scale;

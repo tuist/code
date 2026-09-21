@@ -26,12 +26,12 @@ done
 mkdir -p "${dist}"
 
 # The chart version and the appVersion move together. Keeping them in step
-# means "which Micelio does this chart deploy" never needs looking up.
-helm package charts/micelio \
+# means "which Code does this chart deploy" never needs looking up.
+helm package charts/code \
   --version "${version}" \
   --app-version "${version}" \
   --destination "${dist}"
 
 if [[ "${push}" == true ]]; then
-  helm push "${dist}/micelio-${version}.tgz" "${registry}"
+  helm push "${dist}/code-${version}.tgz" "${registry}"
 fi

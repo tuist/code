@@ -1,13 +1,13 @@
 +++
 title = "Maintenance work stays off the serving path"
-description = "Micelio separates Git serving from compaction and lookup rebuilding without requiring a cluster leader."
+description = "Code separates Git serving from compaction and lookup rebuilding without requiring a cluster leader."
 date = "2026-08-24"
 template = "page.html"
 +++
 
 # 🧰 Maintenance work stays off the serving path
 
-Micelio can now run Git serving and background maintenance on different nodes
+Code can now run Git serving and background maintenance on different nodes
 without making either node authoritative.
 
 ## What changed

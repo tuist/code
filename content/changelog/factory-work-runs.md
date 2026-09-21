@@ -1,6 +1,6 @@
 +++
 title = "Repository work can now run as a durable graph"
-description = "Micelio coordinates sandboxed repository work through durable, leaderless graph runs."
+description = "Code coordinates sandboxed repository work through durable, leaderless graph runs."
 date = "2026-08-25"
 template = "page.html"
 +++
@@ -9,7 +9,7 @@ template = "page.html"
 
 Work should not disappear when a sandbox finishes or a worker goes away.
 
-Micelio can now coordinate repository work as a durable graph. A work run
+Code can now coordinate repository work as a durable graph. A work run
 starts from a frozen source commit, exposes ready nodes to workers, and keeps
 the claim, result, and evidence in object storage.
 
@@ -26,10 +26,10 @@ endpoint, model, and a non-secret secret reference. Runs pin both versions.
 The worker claim returns the profile name, version, endpoint, and model, but
 not the secret backend, machine identity, or secret reference.
 
-Micelio never stores a model credential or conversation. A future trusted
+Code never stores a model credential or conversation. A future trusted
 Condukt egress proxy will exchange the sandbox workload identity directly with
 Infisical and inject the inference credential into outbound requests. The
-worker reports artifacts and an outcome when it is done, and Micelio retains
+worker reports artifacts and an outcome when it is done, and Code retains
 the evidence even when a lease expires or a run is cancelled.
 
 The application programming interface and Model Context Protocol both expose
@@ -44,7 +44,7 @@ any node.
 
 ## Current scope
 
-Micelio coordinates work but does not provision a sandbox, start a model
+Code coordinates work but does not provision a sandbox, start a model
 session, resolve a secret-manager credential, or select a model provider. That
 boundary keeps worker credentials and sessions inside the worker environment,
 while the durable coordination contract stays portable.

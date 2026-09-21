@@ -1,6 +1,6 @@
-# Working on Micelio
+# Working on Code
 
-Instructions for coding agents working *on this repository*. Micelio is also a
+Instructions for coding agents working *on this repository*. Code is also a
 Git forge *for* agents, so both readings of the filename exist here; if you are
 looking for the tools an agent calls over MCP, that is [`docs/mcp.md`](docs/mcp.md).
 
@@ -13,7 +13,7 @@ a warm cache that can be deleted at any moment and rebuilt from the log.
 Nearly every design question resolves against that sentence. If a change makes a
 node's local disk authoritative for anything, it is wrong, however convenient.
 Read [`docs/architecture.md`](docs/architecture.md) before changing anything
-under `lib/micelio/wal/`, `lib/micelio/replica/` or `lib/micelio/ingest/`.
+under `lib/code/wal/`, `lib/code/replica/` or `lib/code/ingest/`.
 
 ## Commands
 
@@ -41,10 +41,10 @@ exactly those bugs.
 
 What makes it safe, and what you must preserve:
 
-- Configuration is **process-local**. `Micelio.Config.put_overrides/1` gives each
+- Configuration is **process-local**. `Code.Config.put_overrides/1` gives each
   test its own object store, data directory and node id. Never read configuration
   through a global that a test cannot override.
-- Repository ids are **unique per test** (`Micelio.Case` provides `repo/1`). The
+- Repository ids are **unique per test** (`Code.Case` provides `repo/1`). The
   replica registry is global, so two tests sharing an id share a process.
 - Cleanup is **scoped** to the replicas a test started, never all of them.
 
@@ -55,7 +55,7 @@ and only for failures that cannot be provoked with a real one, such as sustained
 compare-and-swap contention or corruption on the wire.
 
 Prefer a test that asserts a **property** over one that measures a symptom. There
-is a worked example of why in `test/micelio/wal_test.exs`: an attempt to catch
+is a worked example of why in `test/code/wal_test.exs`: an attempt to catch
 pack buffering by measuring memory passed against the buggy implementation,
 because refc binaries are freed before they can be sampled. The test that works
 asserts the pack path never calls the buffering API at all.
@@ -69,16 +69,16 @@ These are all things that have already cost someone a day.
   decision. Use `ObjectStore.put_file/3`, `get_file/3` and `digest_file/1`. A
   test enforces this.
 - **MuonTrap only for output-free commands.** Capturing output through MuonTrap
-  kills the calling process with `:epipe` on Linux, reproducibly. `Micelio.Git`
+  kills the calling process with `:epipe` on Linux, reproducibly. `Code.Git`
   uses it for `repack` and nothing else; everything that reads output goes
   through `System.cmd` inside `isolated/2`, and streaming goes through a raw Port.
 - **Never hand-edit `*.pb.ex`.** Edit `priv/proto/**` and run `mise run proto`.
 - **Helm values that are numbers need `int64`.** A bare large integer renders as
   `2.68435456e+08` in the manifest and Kubernetes rejects it.
 - **`enableServiceLinks: false` must stay set.** Otherwise Kubernetes injects
-  `MICELIO_ADMIN_PORT=tcp://10.x.x.x:9000` and clobbers our own configuration
+  `CODE_ADMIN_PORT=tcp://10.x.x.x:9000` and clobbers our own configuration
   environment variables.
-- **Modules are `Micelio.*`, never `Tuist.*`.** The project carries its own name;
+- **Modules are `Code.*`, never `Tuist.*`.** The project carries its own name;
   the organisation does not prefix it.
 
 ## Auth
@@ -89,7 +89,7 @@ it reads out of the same object store as the log. Anything that introduces a
 service which must be reachable for a clone to succeed is a departure from the
 design and needs to be argued for, not assumed.
 
-`Micelio.Auth.Webhook` is the one existing exception, and it is opt-in.
+`Code.Auth.Webhook` is the one existing exception, and it is opt-in.
 
 ## Docs
 

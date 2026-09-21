@@ -1,13 +1,13 @@
 +++
 title = "More ways to deploy"
-description = "Micelio added one-click deployment routes for several cloud platforms."
+description = "Code added one-click deployment routes for several cloud platforms."
 date = "2026-08-20"
 template = "page.html"
 +++
 
 # ⚡ More ways to deploy
 
-Micelio now includes one-click deployments for Render, DigitalOcean, Heroku,
+Code now includes one-click deployments for Render, DigitalOcean, Heroku,
 Azure, and Vercel.
 
 ## What changed
@@ -18,7 +18,7 @@ the durable source of truth even in this smallest deployment shape.
 
 ## Why
 
-Trying Micelio should not require assembling an infrastructure stack before
+Trying Code should not require assembling an infrastructure stack before
 the Git workflow is visible. The deployment options make a small, explicit
 starting point available while retaining the same storage model as larger
 clusters.

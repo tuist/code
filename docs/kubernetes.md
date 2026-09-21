@@ -20,15 +20,15 @@ recorded — only computed.
 ## Install
 
 ```sh
-helm install micelio oci://ghcr.io/tuist/charts/micelio \
-  --set objectStore.bucket=micelio \
+helm install code oci://ghcr.io/tuist/charts/code \
+  --set objectStore.bucket=code \
   --set objectStore.endpoint=https://s3.eu-west-1.amazonaws.com \
-  --set objectStore.existingSecret=micelio-s3 \
+  --set objectStore.existingSecret=code-s3 \
   --set auth.oidc.kubernetes=true \
-  --set auth.oidc.audience=micelio
+  --set auth.oidc.audience=code
 ```
 
-See [`charts/micelio/values.yaml`](../charts/micelio/values.yaml).
+See [`charts/code/values.yaml`](../charts/code/values.yaml).
 
 ## Clustering
 
@@ -80,7 +80,7 @@ to finish (the chart defaults to 120s).
 This is the part that makes "no control plane" hold up in practice.
 
 Every pod already has a projected service account token, which is an OIDC JWT
-the cluster's own issuer will vouch for. Micelio validates it against the
+the cluster's own issuer will vouch for. Code validates it against the
 cluster's JWKS. Nothing has to be created, distributed, rotated or revoked,
 because the kubelet already rotates it.
 
@@ -88,9 +88,9 @@ Set `auth.oidc.kubernetes=true` and leave `auth.oidc.issuer` empty. Two details
 matter, and both are handled by the chart:
 
   * **The cluster's discovery endpoint is not public.** It is served with the
-    cluster CA and requires authentication, so Micelio uses its own service
+    cluster CA and requires authentication, so Code uses its own service
     account token and the mounted CA to read it. That is the one API
-    permission Micelio ever needs — the read-only
+    permission Code ever needs — the read-only
     `system:service-account-issuer-discovery` role — and the chart grants it
     only when this backend is configured. Everything else, clustering
     included, needs no API access at all.
@@ -98,23 +98,23 @@ matter, and both are handled by the chart:
   * **Do not configure the issuer by hand.** Kubernetes is *reached* at
     `https://kubernetes.default.svc` but *issues* tokens naming
     `https://kubernetes.default.svc.cluster.local`. Configuring the address you
-    connect to rejects every token with an issuer mismatch, so Micelio asks the
+    connect to rejects every token with an issuer mismatch, so Code asks the
     cluster instead of guessing.
 
 ```yaml
 volumes:
-  - name: micelio-token
+  - name: code-token
     projected:
       sources:
         - serviceAccountToken:
-            audience: micelio      # must match auth.oidc.audience
+            audience: code      # must match auth.oidc.audience
             expirationSeconds: 3600
             path: token
 ```
 
 ```sh
-git -c http.extraHeader="Authorization: Bearer $(cat /var/run/secrets/micelio/token)" \
-    clone https://micelio.internal/acme/ios-app.git
+git -c http.extraHeader="Authorization: Bearer $(cat /var/run/secrets/code/token)" \
+    clone https://code.internal/acme/ios-app.git
 ```
 
 The subject arrives as `system:serviceaccount:<namespace>:<name>`. With
@@ -131,14 +131,14 @@ and egress proxy, not by the sandbox or repository-command environment.
 For finer control, put explicit grants in a claim:
 
 ```json
-{ "micelio_grants": ["acme/**:read", "acme/sandbox-*:read,write,execute"] }
+{ "code_grants": ["acme/**:read", "acme/sandbox-*:read,write,execute"] }
 ```
 
 ### Audience binding is not optional
 
 `aud` is verified against this deployment's resource identifier. Without it, a
 token minted for any other service sharing the issuer would be replayable here —
-the confused-deputy problem the MCP authorization spec exists to prevent. Micelio
+the confused-deputy problem the MCP authorization spec exists to prevent. Code
 logs a warning if you run without an audience configured.
 
 ## Storage
@@ -193,7 +193,7 @@ Nodes in different regions can share one bucket and one cluster, but each push
 pays cross-region latency to the object store, and distributed Erlang across
 regions is not something to do casually.
 
-The better arrangement is one Micelio cluster per region against a regional
+The better arrangement is one Code cluster per region against a regional
 bucket, with replication handled at the bucket level if you need it. The
 architecture does not require a single global cluster, and rendezvous hashing
 makes each regional cluster self-sufficient.

@@ -22,12 +22,12 @@ Describe 'Admin API'
 
   It 'exposes prometheus metrics'
     # Two things have to be true, and they fail differently: the endpoint must
-    # serve Prometheus format at all, and Micelio's own metrics must appear
+    # serve Prometheus format at all, and Code's own metrics must appear
     # once there is something to report.
     #
     # A metric with no observations is not emitted, so the log has to be read
     # first. Creating a repository is not enough: that only writes. Describing
-    # it performs the conditional read whose outcome micelio_wal_read reports,
+    # it performs the conditional read whose outcome code_wal_read reports,
     # which is the metric that actually matters.
     When run bash -c '
       repo=$(new_repo)
@@ -36,13 +36,13 @@ Describe 'Admin API'
 
       for _ in $(seq 1 20); do
         body=$(curl -sS "${NODE1_ADMIN_URL}/metrics")
-        if printf "%s" "$body" | grep -q "micelio_wal_"; then
-          printf "%s" "$body" | grep -q "micelio_prom_ex_beam" && echo "metrics ok"
+        if printf "%s" "$body" | grep -q "code_wal_"; then
+          printf "%s" "$body" | grep -q "code_prom_ex_beam" && echo "metrics ok"
           exit 0
         fi
         sleep 1
       done
-      echo "micelio metrics never appeared"
+      echo "code metrics never appeared"
       exit 1
     '
     The status should equal 0
@@ -52,7 +52,7 @@ Describe 'Admin API'
   It 'reports cluster membership'
     When run bash -c "admin '$NODE1_ADMIN_URL' GET /cluster"
     The status should equal 0
-    The output should include "micelio-e2e-1@127.0.0.1"
+    The output should include "code-e2e-1@127.0.0.1"
   End
 
   It 'creates and describes a repository'

@@ -1,6 +1,6 @@
 # Factory work runs
 
-Micelio can coordinate repository work as a durable directed graph. A work run
+Code can coordinate repository work as a durable directed graph. A work run
 is an immutable graph specification plus a small mutable projection in object
 storage. It is the coordination layer for a sandboxed worker, not a second
 source of truth for Git history: the repository write-ahead log remains the
@@ -61,7 +61,7 @@ contains the tenant-facing project identifier:
 The Infisical address, the workload-token audience, and the trust relationship
 with the Kubernetes cluster are deployment configuration, not account input.
 This prevents an account administrator from asking a sandbox to project a
-workload token for an arbitrary receiver. Micelio does not create, rotate, or
+workload token for an arbitrary receiver. Code does not create, rotate, or
 delete Infisical machine identities.
 
 An account administrator may then create a named inference profile and
@@ -77,7 +77,7 @@ reference it from an operation using `inference_profile`:
 }
 ```
 
-Micelio persists the endpoint, model, and a version-pinned, non-secret
+Code persists the endpoint, model, and a version-pinned, non-secret
 credential binding. For example:
 
 ```json
@@ -96,13 +96,13 @@ The binding pins the backend's immutable version with the profile. Secret
 values, bearer tokens, provider endpoints, workload-token audiences, and user
 information in inference endpoints are rejected.
 
-Micelio does not resolve this binding. A work claim returns only the profile
+Code does not resolve this binding. A work claim returns only the profile
 name, version, inference endpoint, and model. It does not return the backend,
 machine identity, or logical secret reference.
 
 ### Trusted runtime delivery
 
-The Kubernetes provisioner and a Condukt egress proxy are outside Micelio and
+The Kubernetes provisioner and a Condukt egress proxy are outside Code and
 are **not implemented by this repository**. Their required contract is:
 
 1. The provisioner reads the immutable profile and backend configuration from
@@ -115,18 +115,18 @@ are **not implemented by this repository**. Their required contract is:
 3. The proxy exchanges the projected token directly with the managed Infisical
    service, obtains the inference credential, and injects it into the outbound
    inference request. It never exposes the credential to the model, tool
-   environment, session history, or Micelio.
+   environment, session history, or Code.
 
 This arrangement means the secret manager and Kubernetes are runtime
-dependencies for factory work, but not for Git clone, fetch, push, or Micelio
+dependencies for factory work, but not for Git clone, fetch, push, or Code
 claim coordination. A later backend driver can extend the account backend
 schema without changing the graph or storage semantics.
 
-Micelio accepts a base commit only when it is the current head of a public
-repository reference at creation time. When a worker claims a node, Micelio
+Code accepts a base commit only when it is the current head of a public
+repository reference at creation time. When a worker claims a node, Code
 returns that frozen repository id, commit, optional issue number, and normalized
 node definition. The worker must use that exact revision. It records any durable
-outputs as artifact references; Micelio does not accept pod-local files as
+outputs as artifact references; Code does not accept pod-local files as
 evidence.
 
 ## Storage and races

@@ -1,4 +1,4 @@
-defmodule Micelio.E2EOIDCIssuer do
+defmodule Code.E2EOIDCIssuer do
   @moduledoc false
 
   import Plug.Conn
@@ -14,11 +14,11 @@ defmodule Micelio.E2EOIDCIssuer do
       key
       |> JOSE.JWT.sign(%{"alg" => "RS256", "kid" => "e2e-key"}, %{
         "iss" => issuer,
-        "aud" => "micelio",
+        "aud" => "code",
         "sub" => "e2e-developer",
         "exp" => now + 3600,
         "iat" => now,
-        "micelio_grants" => ["acme/**:read,write"]
+        "code_grants" => ["acme/**:read,write"]
       })
       |> JOSE.JWS.compact()
 

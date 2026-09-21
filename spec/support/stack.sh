@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bring up the stack the end-to-end suite runs against: MinIO, and two Micelio
+# Bring up the stack the end-to-end suite runs against: MinIO, and two Code
 # nodes clustered with each other.
 #
 # Two nodes rather than one, because most of what is interesting here happens
@@ -9,24 +9,24 @@
 # to bring the stack up and down. No `set -e` at the top level: sourcing this
 # must not change the shell options of whatever sourced it.
 
-MICELIO_ROOT="${MICELIO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-STACK_DIR="${MICELIO_ROOT}/tmp/e2e"
+CODE_ROOT="${CODE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+STACK_DIR="${CODE_ROOT}/tmp/e2e"
 
 # A high port on purpose. MinIO's own default of 9000, and the range around
 # it, is the most contended real estate on a developer machine — ClickHouse in
 # particular listens across it. Set E2E_S3_ENDPOINT to use an existing store.
 export E2E_S3_PORT="${E2E_S3_PORT:-19010}"
 export E2E_S3_ENDPOINT="${E2E_S3_ENDPOINT:-http://127.0.0.1:${E2E_S3_PORT}}"
-export E2E_S3_BUCKET="${E2E_S3_BUCKET:-micelio-e2e}"
-export E2E_S3_KEY="${E2E_S3_KEY:-micelio}"
-export E2E_S3_SECRET="${E2E_S3_SECRET:-micelio-secret}"
+export E2E_S3_BUCKET="${E2E_S3_BUCKET:-code-e2e}"
+export E2E_S3_KEY="${E2E_S3_KEY:-code}"
+export E2E_S3_SECRET="${E2E_S3_SECRET:-code-secret}"
 
 # A git configuration of our own, so the suite cannot be influenced by — or
 # blocked on — whatever the developer has configured. On macOS in particular,
 # the keychain credential helper blocks storing a credential for a host it has
 # not seen before, and the symptom is a git command that hangs forever with no
 # output at all.
-export E2E_GITCONFIG="${STACK_DIR:-${MICELIO_ROOT}/tmp/e2e}/gitconfig"
+export E2E_GITCONFIG="${STACK_DIR:-${CODE_ROOT}/tmp/e2e}/gitconfig"
 export GIT_CONFIG_GLOBAL="$E2E_GITCONFIG"
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_TERMINAL_PROMPT=0
@@ -50,7 +50,7 @@ export NODE1_ADMIN_URL="http://127.0.0.1:${NODE1_ADMIN}"
 export NODE2_ADMIN_URL="http://127.0.0.1:${NODE2_ADMIN}"
 
 stack::minio_up() {
-  if docker ps --filter name=micelio-e2e-minio --format '{{.Names}}' 2>/dev/null | grep -q micelio-e2e-minio; then
+  if docker ps --filter name=code-e2e-minio --format '{{.Names}}' 2>/dev/null | grep -q code-e2e-minio; then
     echo "minio: already running at ${E2E_S3_ENDPOINT}"
     return 0
   fi
@@ -83,7 +83,7 @@ stack::minio_up() {
   fi
 
   echo "minio: starting on :${E2E_S3_PORT}"
-  docker run -d --rm --name micelio-e2e-minio \
+  docker run -d --rm --name code-e2e-minio \
     -p "${E2E_S3_PORT}:9000" \
     -e MINIO_ROOT_USER="${E2E_S3_KEY}" \
     -e MINIO_ROOT_PASSWORD="${E2E_S3_SECRET}" \
@@ -145,29 +145,29 @@ stack::node_up() {
   echo "${name}: starting on :${git_port}"
 
   (
-    cd "${MICELIO_ROOT}"
-    MICELIO_S3_BUCKET="${E2E_S3_BUCKET}" \
-    MICELIO_S3_ENDPOINT="${E2E_S3_ENDPOINT}" \
-    MICELIO_S3_ACCESS_KEY_ID="${E2E_S3_KEY}" \
-    MICELIO_S3_SECRET_ACCESS_KEY="${E2E_S3_SECRET}" \
-    MICELIO_S3_REGION="us-east-1" \
-    MICELIO_S3_PATH_STYLE="true" \
-    MICELIO_S3_PREFIX="${MICELIO_S3_PREFIX:-}" \
-    MICELIO_NODE_ID="${name}" \
-    MICELIO_DATA_DIR="${STACK_DIR}/${name}/repositories" \
-    MICELIO_GIT_PORT="${git_port}" \
-    MICELIO_HOOK_PORT="${hook_port}" \
-    MICELIO_ADMIN_PORT="${admin_port}" \
-    MICELIO_ADMIN_TOKEN="${E2E_ADMIN_TOKEN}" \
-    MICELIO_AUTH_BACKEND="static" \
-    MICELIO_AUTH_TOKENS="${E2E_TOKEN}=acme:read,write,execute;${E2E_OUTSIDER_TOKEN}=outsider:read" \
-    MICELIO_POLICY_STALENESS_BUDGET_MS="500" \
-    MICELIO_DEFAULT_REPLICAS="2" \
-    MICELIO_CLUSTER_STRATEGY="epmd" \
-    MICELIO_PEERS="micelio-e2e-1@127.0.0.1,micelio-e2e-2@127.0.0.1" \
-    MICELIO_PUBLIC_URL="http://127.0.0.1:${git_port}" \
-    RELEASE_COOKIE="micelio-e2e-cookie" \
-      ${MISE_PREFIX} elixir --name "${name}@127.0.0.1" --cookie micelio-e2e-cookie \
+    cd "${CODE_ROOT}"
+    CODE_S3_BUCKET="${E2E_S3_BUCKET}" \
+    CODE_S3_ENDPOINT="${E2E_S3_ENDPOINT}" \
+    CODE_S3_ACCESS_KEY_ID="${E2E_S3_KEY}" \
+    CODE_S3_SECRET_ACCESS_KEY="${E2E_S3_SECRET}" \
+    CODE_S3_REGION="us-east-1" \
+    CODE_S3_PATH_STYLE="true" \
+    CODE_S3_PREFIX="${CODE_S3_PREFIX:-}" \
+    CODE_NODE_ID="${name}" \
+    CODE_DATA_DIR="${STACK_DIR}/${name}/repositories" \
+    CODE_GIT_PORT="${git_port}" \
+    CODE_HOOK_PORT="${hook_port}" \
+    CODE_ADMIN_PORT="${admin_port}" \
+    CODE_ADMIN_TOKEN="${E2E_ADMIN_TOKEN}" \
+    CODE_AUTH_BACKEND="static" \
+    CODE_AUTH_TOKENS="${E2E_TOKEN}=acme:read,write,execute;${E2E_OUTSIDER_TOKEN}=outsider:read" \
+    CODE_POLICY_STALENESS_BUDGET_MS="500" \
+    CODE_DEFAULT_REPLICAS="2" \
+    CODE_CLUSTER_STRATEGY="epmd" \
+    CODE_PEERS="code-e2e-1@127.0.0.1,code-e2e-2@127.0.0.1" \
+    CODE_PUBLIC_URL="http://127.0.0.1:${git_port}" \
+    RELEASE_COOKIE="code-e2e-cookie" \
+      ${MISE_PREFIX} elixir --name "${name}@127.0.0.1" --cookie code-e2e-cookie \
         -S mix run --no-halt >"${log}" 2>&1 &
     echo $! > "${STACK_DIR}/${name}.pid"
   )
@@ -186,7 +186,7 @@ stack::oidc_up() {
     -addext 'subjectAltName=IP:127.0.0.1' \
     -keyout "${STACK_DIR}/tls/key.pem" -out "${STACK_DIR}/tls/cert.pem" >/dev/null 2>&1
 
-  MIX_ENV=test mix run -e "Micelio.E2EOIDCIssuer.run(${E2E_OIDC_PORT}, \"${STACK_DIR}/oidc-token\")" \
+  MIX_ENV=test mix run -e "Code.E2EOIDCIssuer.run(${E2E_OIDC_PORT}, \"${STACK_DIR}/oidc-token\")" \
     >"${STACK_DIR}/oidc.log" 2>&1 &
   echo $! > "${STACK_DIR}/oidc.pid"
 
@@ -210,7 +210,7 @@ stack::oidc_up() {
   cat > "${STACK_DIR}/Caddyfile" <<EOF
 :${E2E_TLS_PORT} {
   tls /work/tls/cert.pem /work/tls/key.pem
-  handle /.well-known/micelio-git-auth {
+  handle /.well-known/code-git-auth {
     root * /work
     rewrite * /git-auth-metadata
     header Content-Type text/plain
@@ -221,7 +221,7 @@ stack::oidc_up() {
   reverse_proxy host.docker.internal:${NODE1_GIT}
 }
 EOF
-  docker run -d --rm --name micelio-e2e-tls --add-host=host.docker.internal:host-gateway \
+  docker run -d --rm --name code-e2e-tls --add-host=host.docker.internal:host-gateway \
     -p "${E2E_TLS_PORT}:4443" -v "${STACK_DIR}:/work:ro" \
     caddy:2.10.2-alpine caddy run --config /work/Caddyfile --adapter caddyfile >/dev/null
   stack::wait_for "${E2E_HTTPS_URL}/issuer/keys" 30 "TLS proxy"
@@ -250,7 +250,7 @@ stack::gitconfig() {
 [credential]
 	helper =
 [user]
-	name = Micelio E2E
+	name = Code E2E
 	email = e2e@example.com
 [init]
 	defaultBranch = main
@@ -287,11 +287,11 @@ stack::up() {
   export MISE_PREFIX
 
   # Compile once up front so the two nodes do not race on _build.
-  (cd "${MICELIO_ROOT}" && ${MISE_PREFIX} mix compile >/dev/null 2>&1) || true
+  (cd "${CODE_ROOT}" && ${MISE_PREFIX} mix compile >/dev/null 2>&1) || true
 
   stack::oidc_up
-  stack::node_up micelio-e2e-1 "$NODE1_GIT" "$NODE1_HOOK" "$NODE1_ADMIN"
-  stack::node_up micelio-e2e-2 "$NODE2_GIT" "$NODE2_HOOK" "$NODE2_ADMIN"
+  stack::node_up code-e2e-1 "$NODE1_GIT" "$NODE1_HOOK" "$NODE1_ADMIN"
+  stack::node_up code-e2e-2 "$NODE2_GIT" "$NODE2_HOOK" "$NODE2_ADMIN"
 }
 
 stack::down() {
@@ -299,8 +299,8 @@ stack::down() {
     kill "$(cat "${STACK_DIR}/oidc.pid")" 2>/dev/null || true
     rm -f "${STACK_DIR}/oidc.pid"
   fi
-  docker rm -f micelio-e2e-tls >/dev/null 2>&1 || true
-  for name in micelio-e2e-1 micelio-e2e-2; do
+  docker rm -f code-e2e-tls >/dev/null 2>&1 || true
+  for name in code-e2e-1 code-e2e-2; do
     if [ -f "${STACK_DIR}/${name}.pid" ]; then
       kill "$(cat "${STACK_DIR}/${name}.pid")" 2>/dev/null || true
       rm -f "${STACK_DIR}/${name}.pid"
@@ -308,10 +308,10 @@ stack::down() {
   done
 
   # Erlang nodes spawn a child beam.smp that outlives the launcher.
-  pkill -f "micelio-e2e-[12]@127.0.0.1" 2>/dev/null || true
+  pkill -f "code-e2e-[12]@127.0.0.1" 2>/dev/null || true
 
   if [ "${E2E_KEEP_MINIO:-0}" != "1" ]; then
-    docker rm -f micelio-e2e-minio >/dev/null 2>&1 || true
+    docker rm -f code-e2e-minio >/dev/null 2>&1 || true
   fi
 }
 

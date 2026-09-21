@@ -30,7 +30,7 @@ repos/<repo_id>/history/<epoch>.pb index snapshots, kept for provenance
 ```
 
 Everything but the packfiles is protobuf, defined in
-`priv/proto/micelio/wal/v1/wal.proto`. The log outlives any particular version
+`priv/proto/code/wal/v1/wal.proto`. The log outlives any particular version
 of this code — a node running next year's build will read entries written by
 today's — so the encoding is a schema with compatibility rules rather than
 whatever a serializer happened to emit.
@@ -72,7 +72,7 @@ on a machine.
 So packs are never held whole. They are hashed in chunks off disk, uploaded as
 a stream, and downloaded straight into the file Git will read. Only the small
 protobuf objects — the index, entries, policy — go through the buffering
-`get`/`put` calls. `Micelio.WAL` uses `put_file`/`get_file` for anything pack
+`get`/`put` calls. `Code.WAL` uses `put_file`/`get_file` for anything pack
 shaped, and a test asserts that it never reaches for the buffering API, since
 this is the kind of property that quietly regresses.
 
@@ -101,7 +101,7 @@ what makes the entry content-addressable.
 Git runs `pre-receive` after it has received and validated the objects but
 before it applies any reference update, with the new objects held in a
 quarantine directory that is discarded if the hook fails. That is precisely the
-window Micelio needs.
+window Code needs.
 
 ```
 git receive-pack
@@ -248,7 +248,7 @@ accept pushes, because the object store arbitrates.
 The reference design hand-rolls a fair amount of distributed-systems plumbing.
 On the BEAM most of it already exists:
 
-| Reference design | Micelio |
+| Reference design | Code |
 |---|---|
 | UDP gossip packets for replication hints | `:pg` broadcast over distributed Erlang: TCP, ordered per pair, no loss handling needed |
 | A health table and heartbeat protocol | `:net_kernel.monitor_nodes/2` and `net_ticktime` |
@@ -262,7 +262,7 @@ On the BEAM most of it already exists:
 ### Why not Horde, Swarm, syn or libring
 
 The ecosystem's clustering libraries are good, and none of them fit, for one
-reason: they all solve *global process uniqueness*, and Micelio does not want
+reason: they all solve *global process uniqueness*, and Code does not want
 it.
 
 [Horde](https://github.com/elixir-horde/horde), [Swarm](https://github.com/bitwalker/swarm)
@@ -294,7 +294,7 @@ rather than rendezvous. Consistent hashing needs virtual nodes to balance
 acceptably and does not naturally yield an ordered top-N, which is exactly what
 a replica list is. Rendezvous gives that ordering for free, has better balance
 without tuning, and fits in about fifteen lines — see
-`Micelio.Cluster.Rendezvous`.
+`Code.Cluster.Rendezvous`.
 
 ### The known ceiling
 
@@ -374,7 +374,7 @@ Entries within a batch are validated in order against the index as it evolves,
 so the result is identical to having processed them one at a time — including
 rejecting a push that a peer in the same batch just invalidated.
 
-See `Micelio.Ingest.Writer`.
+See `Code.Ingest.Writer`.
 
 ## Where the limits are
 

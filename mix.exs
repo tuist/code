@@ -1,12 +1,12 @@
-defmodule Micelio.MixProject do
+defmodule Code.MixProject do
   use Mix.Project
 
   @version "0.1.0"
-  @source_url "https://github.com/tuist/micelio"
+  @source_url "https://github.com/tuist/code"
 
   def project do
     [
-      app: :micelio,
+      app: :code,
       version: @version,
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -22,7 +22,7 @@ defmodule Micelio.MixProject do
   def application do
     [
       extra_applications: [:logger, :crypto],
-      mod: {Micelio.Application, []}
+      mod: {Code.Application, []}
     ]
   end
 
@@ -47,11 +47,11 @@ defmodule Micelio.MixProject do
       # The write-ahead log is a persisted, cross-version wire format.
       {:protobuf, "~> 0.13"},
 
-      # JWT/JWKS verification. Micelio validates tokens; it never issues them.
+      # JWT/JWKS verification. Code validates tokens; it never issues them.
       {:jose, "~> 1.11"},
 
       # Node discovery only. Membership, broadcast and failure detection are
-      # handled by distributed Erlang itself; see `Micelio.Cluster`.
+      # handled by distributed Erlang itself; see `Code.Cluster`.
       {:libcluster, "~> 3.4"},
 
       # Observability. A replica that cannot explain its own staleness is
@@ -84,7 +84,7 @@ defmodule Micelio.MixProject do
   end
 
   defp releases do
-    [micelio: [include_executables_for: [:unix], applications: [runtime_tools: :permanent]]]
+    [code: [include_executables_for: [:unix], applications: [runtime_tools: :permanent]]]
   end
 
   defp docs do
