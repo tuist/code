@@ -9,7 +9,7 @@
       files: %{
         included: ["lib/", "test/", "config/", "mix.exs"],
         # Generated from priv/proto; regenerate rather than edit.
-        excluded: [~r"/lib/micelio/wal/v1/wal.pb.ex$"]
+        excluded: [~r"/lib/code/wal/v1/wal.pb.ex$"]
       },
       strict: true,
       checks: %{

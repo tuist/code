@@ -1,9 +1,9 @@
 # Vercel detects this file and runs it as an HTTP container. The release image
-# comes from Micelio's published multi-architecture container image.
-FROM ghcr.io/tuist/micelio:latest
+# comes from Code's published multi-architecture container image.
+FROM ghcr.io/tuist/code:latest
 
-ENV MICELIO_AUTH_BACKEND=static
+ENV CODE_AUTH_BACKEND=static
 
-# Vercel assigns PORT at runtime. Micelio otherwise defaults to 4000, which is
+# Vercel assigns PORT at runtime. Code otherwise defaults to 4000, which is
 # right for Docker, Kubernetes, Render, and DigitalOcean App Platform.
-CMD ["/bin/sh", "-c", "MICELIO_GIT_PORT=\"${PORT:-4000}\" exec /app/bin/micelio start"]
+CMD ["/bin/sh", "-c", "CODE_GIT_PORT=\"${PORT:-4000}\" exec /app/bin/code start"]

@@ -1,6 +1,6 @@
 {
   "$schema": "https://unpkg.com/wrangler@4.124.0/config-schema.json",
-  "name": "micelio-site",
+  "name": "code-site",
   "compatibility_date": "2026-08-20",
   "workers_dev": false,
   "assets": {
@@ -10,7 +10,7 @@
   // the Worker. The Worker is the origin for the static assets.
   "routes": [
     {
-      "pattern": "micelio.dev/*",
+      "pattern": "code.dev/*",
       "zone_id": "de20b5392f09fda6ab480245ee934066"
     }
   ]

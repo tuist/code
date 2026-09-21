@@ -1,4 +1,4 @@
-defmodule Micelio.Case do
+defmodule Code.Case do
   @moduledoc """
   A test case with its own object store, data directory and repository
   namespace.
@@ -9,15 +9,15 @@ defmodule Micelio.Case do
 
   Everything here runs `async: true`. That is not free — it required the
   configuration a node reads to be overridable per process (see
-  `Micelio.Config`) rather than only globally — but a suite that cannot run in
+  `Code.Config`) rather than only globally — but a suite that cannot run in
   parallel is a suite that quietly grows shared state, which is precisely the
   class of bug this project cannot afford.
 
   Three things make it safe:
 
     * **Configuration is process-local.** Each test points at its own object
-      store and data directory through `Micelio.Config.put_overrides/1`, and
-      `Micelio.Replica` carries those overrides into the processes it starts.
+      store and data directory through `Code.Config.put_overrides/1`, and
+      `Code.Replica` carries those overrides into the processes it starts.
     * **Repository ids are unique per test.** The replica registry is global,
       so two tests using `acme/app` would share a process. `repo/1` returns an
       id nothing else will use.
@@ -29,29 +29,29 @@ defmodule Micelio.Case do
 
   using do
     quote do
-      import Micelio.Case
-      alias Micelio.Wal.V1
+      import Code.Case
+      alias Code.Wal.V1
     end
   end
 
   setup do
     id = :erlang.unique_integer([:positive])
-    root = Path.join(System.tmp_dir!(), "micelio-test-#{id}")
+    root = Path.join(System.tmp_dir!(), "code-test-#{id}")
     store = Path.join(root, "store")
     data = Path.join(root, "repositories")
     File.mkdir_p!(store)
     File.mkdir_p!(data)
 
-    Micelio.Config.put_overrides(%{
-      object_store: {Micelio.ObjectStore.Filesystem, root: store},
+    Code.Config.put_overrides(%{
+      object_store: {Code.ObjectStore.Filesystem, root: store},
       data_dir: data,
       node_id: "test-#{id}"
     })
 
     # The application supplies the lock in the test environment; this covers
     # running against a bare VM.
-    if is_nil(Process.whereis(Micelio.ObjectStore.Filesystem.Lock)) do
-      start_supervised!(Micelio.ObjectStore.Filesystem.Lock)
+    if is_nil(Process.whereis(Code.ObjectStore.Filesystem.Lock)) do
+      start_supervised!(Code.ObjectStore.Filesystem.Lock)
     end
 
     namespace = "test#{id}"
@@ -79,21 +79,21 @@ defmodule Micelio.Case do
   when running against a bare VM, and is idempotent either way.
   """
   def start_replica_runtime do
-    ensure_started({Registry, keys: :unique, name: Micelio.ReplicaRegistry}, Micelio.ReplicaRegistry)
+    ensure_started({Registry, keys: :unique, name: Code.ReplicaRegistry}, Code.ReplicaRegistry)
 
     ensure_started(
-      {DynamicSupervisor, strategy: :one_for_one, name: Micelio.ReplicaSupervisor},
-      Micelio.ReplicaSupervisor
+      {DynamicSupervisor, strategy: :one_for_one, name: Code.ReplicaSupervisor},
+      Code.ReplicaSupervisor
     )
 
-    ensure_started({Registry, keys: :unique, name: Micelio.WriterRegistry}, Micelio.WriterRegistry)
+    ensure_started({Registry, keys: :unique, name: Code.WriterRegistry}, Code.WriterRegistry)
 
     ensure_started(
-      {DynamicSupervisor, strategy: :one_for_one, name: Micelio.WriterSupervisor},
-      Micelio.WriterSupervisor
+      {DynamicSupervisor, strategy: :one_for_one, name: Code.WriterSupervisor},
+      Code.WriterSupervisor
     )
 
-    ensure_started({Task.Supervisor, name: Micelio.TaskSupervisor}, Micelio.TaskSupervisor)
+    ensure_started({Task.Supervisor, name: Code.TaskSupervisor}, Code.TaskSupervisor)
     :ok
   end
 
@@ -108,9 +108,9 @@ defmodule Micelio.Case do
   whatever else is running concurrently.
   """
   def stop_replicas(namespace) do
-    if Process.whereis(Micelio.ReplicaRegistry) do
-      for repo_id <- Micelio.Replica.resident(), String.starts_with?(repo_id, namespace <> "/") do
-        Micelio.Replica.evict(repo_id)
+    if Process.whereis(Code.ReplicaRegistry) do
+      for repo_id <- Code.Replica.resident(), String.starts_with?(repo_id, namespace <> "/") do
+        Code.Replica.evict(repo_id)
       end
     end
 
@@ -119,7 +119,7 @@ defmodule Micelio.Case do
 
   @doc "Build a scratch git repository with one commit and return its path."
   def fixture_repository(name \\ "source") do
-    path = Path.join(System.tmp_dir!(), "micelio-fixture-#{:erlang.unique_integer([:positive])}-#{name}")
+    path = Path.join(System.tmp_dir!(), "code-fixture-#{:erlang.unique_integer([:positive])}-#{name}")
     File.mkdir_p!(path)
 
     git(["init", "-q", "-b", "main"], path)

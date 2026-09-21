@@ -9,8 +9,8 @@ it locally.
 
 ## Cloudflare Workers
 
-`mise run site:deploy` builds `public/` and uploads it to the `micelio-site`
-Cloudflare Worker. The Worker route serves every path on `micelio.dev` without
+`mise run site:deploy` builds `public/` and uploads it to the `code-site`
+Cloudflare Worker. The Worker route serves every path on `code.dev` without
 replacing the existing apex record.
 
 Pushing a website change to `main` runs
@@ -22,4 +22,4 @@ The workflow requires these GitHub repository secrets:
 | Secret | Value |
 | --- | --- |
 | `CLOUDFLARE_ACCOUNT_ID` | The Tuist Cloudflare account identifier. |
-| `CLOUDFLARE_API_TOKEN` | A restricted [Cloudflare API token](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/) with the **Edit Cloudflare Workers** policy scoped to the Tuist account and the `micelio.dev` zone. |
+| `CLOUDFLARE_API_TOKEN` | A restricted [Cloudflare API token](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/) with the **Edit Cloudflare Workers** policy scoped to the Tuist account and the `code.dev` zone. |

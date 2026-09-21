@@ -22,12 +22,12 @@ capacity planning per-tenant, which is a control plane by another name.
 
 ## Authentication: necessarily external
 
-Micelio validates tokens and never issues them. This is not a simplification;
+Code validates tokens and never issues them. This is not a simplification;
 it is the only arrangement that keeps the node stateless. Minting an identity
 requires a secret somebody holds, and holding it would make a node
 authoritative about something.
 
-So Micelio is an OAuth 2.1 **resource server**. It verifies a signature against
+So Code is an OAuth 2.1 **resource server**. It verifies a signature against
 the issuer's public keys, checks that the token names *this* deployment in its
 `aud`, and turns the result into a subject. Any OIDC issuer works: your own,
 your customers', or the Kubernetes cluster's.
@@ -82,7 +82,7 @@ Two properties fall out of this that a token-claims-only design does not have:
 - **Revocation is immediate.** A binding removed here is gone on the next
   read, not when a token happens to expire.
 - **Grants can be given to identities that cannot be reissued.** A customer's
-  IdP is not going to add a `micelio_grants` claim for you.
+  IdP is not going to add a `code_grants` claim for you.
 
 Both sources compose: a principal may act if *either* the credential it
 presented or the account's policy allows it. The policy is only consulted when
@@ -96,7 +96,7 @@ grant an agent access for the duration of a task.
 ### Caching
 
 Authorization is on the path of every request, so policies are cached per node
-and revalidated with a conditional GET once `MICELIO_POLICY_STALENESS_BUDGET_MS`
+and revalidated with a conditional GET once `CODE_POLICY_STALENESS_BUDGET_MS`
 elapses (five seconds by default). Unlike a repository read, where serving
 stale data would be a correctness failure, this is a bounded and deliberate
 window — and still far tighter than the token lifetime it replaces.
@@ -127,12 +127,12 @@ everything authoritative is in object storage under a distinct prefix.
 so a tenant cloning a very large monorepo consumes connections, page cache and
 disk that other tenants are also using. What exists today:
 
-- `micelio_git_requests_in_flight` makes the load visible and autoscalable.
+- `code_git_requests_in_flight` makes the load visible and autoscalable.
 - Idle eviction bounds how much disk any one tenant's cold repositories hold.
 - Compaction is threshold-driven, so an idle tenant never pays for it.
 
 What does not exist: per-tenant request quotas, per-tenant bandwidth limits,
-and per-tenant CPU confinement. `Micelio.Git.run_supervised/3` accepts a cgroup
+and per-tenant CPU confinement. `Code.Git.run_supervised/3` accepts a cgroup
 to confine a command to, which is the hook a CPU limit would hang off, but
 nothing passes one today.
 
@@ -143,7 +143,7 @@ way. That is not implemented either.
 **Storage isolation at the bucket level: not implemented.** Every tenant shares
 one bucket under separate prefixes. Per-tenant buckets or per-tenant KMS keys
 would need the object store configuration to be resolved per account rather
-than per node. The `Micelio.ObjectStore` behaviour already takes its
+than per node. The `Code.ObjectStore` behaviour already takes its
 configuration as an argument, so this is a small change, but it is a change.
 
 ## If tenants must not share nodes

@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-micelio-site
+  group: deploy-code-site
   cancel-in-progress: true
 
 jobs:

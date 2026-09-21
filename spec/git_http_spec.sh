@@ -20,7 +20,7 @@ Describe 'Git smart HTTP'
       The status should equal 0
       The output should include "401"
       # Without this header git fails outright instead of prompting.
-      The output should include 'Basic realm="micelio"'
+      The output should include 'Basic realm="code"'
       # And this is what lets an MCP client discover where to get a token.
       The output should include "resource_metadata"
     End

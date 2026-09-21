@@ -210,7 +210,7 @@ jobs:
             echo "## Helm chart"
             echo
             echo '```sh'
-            echo "helm install micelio oci://ghcr.io/tuist/charts/micelio --version ${{ needs.detect.outputs.next-version }}"
+            echo "helm install code oci://ghcr.io/tuist/charts/code --version ${{ needs.detect.outputs.next-version }}"
             echo '```'
           } >> release-notes.md
       - name: Publish release

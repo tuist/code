@@ -1,10 +1,10 @@
 spec:
-  name: micelio
+  name: code
   services:
-    - name: micelio
+    - name: code
       git:
         branch: main
-        repo_clone_url: https://github.com/tuist/micelio.git
+        repo_clone_url: https://github.com/tuist/code.git
       dockerfile_path: ./Dockerfile
       http_port: 4000
       health_check:
@@ -12,25 +12,25 @@ spec:
       envs:
         # App Platform asks for variables without values during creation.
         # Credentials remain in the user's account, not this repository.
-        - key: MICELIO_S3_BUCKET
+        - key: CODE_S3_BUCKET
           scope: RUN_TIME
           type: SECRET
-        - key: MICELIO_S3_ENDPOINT
+        - key: CODE_S3_ENDPOINT
           scope: RUN_TIME
           type: SECRET
-        - key: MICELIO_S3_ACCESS_KEY_ID
+        - key: CODE_S3_ACCESS_KEY_ID
           scope: RUN_TIME
           type: SECRET
-        - key: MICELIO_S3_SECRET_ACCESS_KEY
+        - key: CODE_S3_SECRET_ACCESS_KEY
           scope: RUN_TIME
           type: SECRET
-        - key: MICELIO_AUTH_BACKEND
+        - key: CODE_AUTH_BACKEND
           value: static
           scope: RUN_TIME
           type: GENERAL
-        - key: MICELIO_AUTH_TOKENS
+        - key: CODE_AUTH_TOKENS
           scope: RUN_TIME
           type: SECRET
-        - key: MICELIO_ADMIN_TOKEN
+        - key: CODE_ADMIN_TOKEN
           scope: RUN_TIME
           type: SECRET

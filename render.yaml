@@ -1,8 +1,8 @@
 services:
   - type: web
-    name: micelio
+    name: code
     runtime: docker
-    repo: https://github.com/tuist/micelio
+    repo: https://github.com/tuist/code
     branch: main
     autoDeployTrigger: off
     dockerfilePath: ./Dockerfile
@@ -10,17 +10,17 @@ services:
     envVars:
       # Render asks for values marked sync: false while creating the service.
       # They are deliberately never stored in this public repository.
-      - key: MICELIO_S3_BUCKET
+      - key: CODE_S3_BUCKET
         sync: false
-      - key: MICELIO_S3_ENDPOINT
+      - key: CODE_S3_ENDPOINT
         sync: false
-      - key: MICELIO_S3_ACCESS_KEY_ID
+      - key: CODE_S3_ACCESS_KEY_ID
         sync: false
-      - key: MICELIO_S3_SECRET_ACCESS_KEY
+      - key: CODE_S3_SECRET_ACCESS_KEY
         sync: false
-      - key: MICELIO_AUTH_BACKEND
+      - key: CODE_AUTH_BACKEND
         value: static
-      - key: MICELIO_AUTH_TOKENS
+      - key: CODE_AUTH_TOKENS
         sync: false
-      - key: MICELIO_ADMIN_TOKEN
+      - key: CODE_ADMIN_TOKEN
         generateValue: true

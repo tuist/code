@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-# Micelio ships as an OTP release: the builder produces a self-contained tree
+# Code ships as an OTP release: the builder produces a self-contained tree
 # with its own ERTS, so the runtime image needs no Erlang or Elixir installed.
 ARG ELIXIR_VERSION=1.20.3
 ARG OTP_VERSION=29.0.5
@@ -41,7 +41,7 @@ RUN mix release
 
 FROM ${RUNNER_IMAGE}
 
-# git is the actual workhorse: Micelio does not reimplement it.
+# git is the actual workhorse: Code does not reimplement it.
 # curl is used by the pre-receive hook to call back into the node.
 # libncurses and locales are what the ERTS expects to find.
 RUN apt-get update -y \
@@ -63,22 +63,22 @@ ENV HOME=/app
 
 WORKDIR /app
 
-RUN groupadd --system --gid 1000 micelio \
-  && useradd --system --uid 1000 --gid micelio --home /app micelio \
-  && mkdir -p /var/lib/micelio/repositories \
-  && chown -R micelio:micelio /app /var/lib/micelio
+RUN groupadd --system --gid 1000 code \
+  && useradd --system --uid 1000 --gid code --home /app code \
+  && mkdir -p /var/lib/code/repositories \
+  && chown -R code:code /app /var/lib/code
 
-COPY --from=builder --chown=micelio:micelio /app/_build/prod/rel/micelio ./
+COPY --from=builder --chown=code:code /app/_build/prod/rel/code ./
 
-USER micelio
+USER code
 
 # Also set here so `docker run` of this image behaves the same as the release
 # script; see rel/env.sh.eex for why this is not left to the runtime's default.
 ENV ERL_MAX_PORTS=65536 \
-    MICELIO_DATA_DIR=/var/lib/micelio/repositories \
-    MICELIO_GIT_PORT=4000 \
-    MICELIO_HOOK_PORT=4001 \
-    MICELIO_ADMIN_PORT=4002
+    CODE_DATA_DIR=/var/lib/code/repositories \
+    CODE_GIT_PORT=4000 \
+    CODE_HOOK_PORT=4001 \
+    CODE_ADMIN_PORT=4002
 
 # 4000 git + mcp (public), 4002 admin + metrics (internal).
 # 4001 is the hook callback and binds to loopback, so it is deliberately absent.
@@ -86,6 +86,6 @@ EXPOSE 4000 4002
 
 # The release's own health check, so the image is useful without an orchestrator.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${MICELIO_ADMIN_PORT}/health" || exit 1
+  CMD curl -fsS "http://127.0.0.1:${CODE_ADMIN_PORT}/health" || exit 1
 
-CMD ["/app/bin/micelio", "start"]
+CMD ["/app/bin/code", "start"]
