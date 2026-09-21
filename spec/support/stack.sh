@@ -87,7 +87,7 @@ stack::minio_up() {
     -p "${E2E_S3_PORT}:9000" \
     -e MINIO_ROOT_USER="${E2E_S3_KEY}" \
     -e MINIO_ROOT_PASSWORD="${E2E_S3_SECRET}" \
-    minio/minio:RELEASE.2025-04-22T22-12-26Z server /data >/dev/null
+    quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z server /data >/dev/null
 
   stack::wait_for "${E2E_S3_ENDPOINT}/minio/health/live" 60 "minio"
 }
@@ -116,7 +116,7 @@ stack::mc() {
   docker run --rm \
     --add-host=host.docker.internal:host-gateway \
     -e MC_HOST_local="http://${E2E_S3_KEY}:${E2E_S3_SECRET}@host.docker.internal:${E2E_S3_PORT}" \
-    minio/mc:RELEASE.2025-04-16T18-13-26Z \
+    quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z \
     "$@" >/dev/null 2>&1
 }
 
