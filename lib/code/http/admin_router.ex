@@ -167,52 +167,50 @@ defmodule Code.HTTP.AdminRouter do
   # ----------------------------------------------------------------------
 
   get "/policy/*account" do
-    account = Enum.join(conn.path_params["account"], "/")
-
-    case Code.Policy.get(account) do
-      {:ok, policy} -> send_json(conn, 200, Code.Policy.describe(policy))
-      {:error, reason} -> send_json(conn, 500, %{error: inspect(reason)})
-    end
+    with_account(conn, fn account ->
+      case Code.Policy.get(account) do
+        {:ok, policy} -> send_json(conn, 200, Code.Policy.describe(policy))
+        {:error, reason} -> send_json(conn, 500, %{error: inspect(reason)})
+      end
+    end)
   end
 
   put "/policy/*account" do
-    account = Enum.join(conn.path_params["account"], "/")
-    params = conn.body_params
+    with_account(conn, fn account ->
+      params = conn.body_params
 
-    with subject when is_binary(subject) <- params["subject"],
-         repositories when is_list(repositories) <- params["repositories"],
-         permissions when is_list(permissions) <- params["permissions"] do
-      opts =
-        [note: params["note"] || ""]
-        |> then(fn opts ->
-          case params["expires_at_ms"] do
-            nil -> opts
-            at -> Keyword.put(opts, :expires_at_ms, at)
-          end
-        end)
-
-      case Code.Policy.bind(account, subject, repositories, permissions, opts) do
-        {:ok, policy} -> send_json(conn, 200, Code.Policy.describe(policy))
-        {:error, reason} -> send_json(conn, 422, %{error: inspect(reason)})
-      end
-    else
-      _ -> send_json(conn, 422, %{error: "subject, repositories and permissions are required"})
-    end
-  end
-
-  delete "/policy/*account" do
-    account = Enum.join(conn.path_params["account"], "/")
-
-    case conn.query_params["subject"] || conn.body_params["subject"] do
-      nil ->
-        send_json(conn, 422, %{error: "subject is required"})
-
-      subject ->
-        case Code.Policy.unbind(account, subject) do
+      with subject when is_binary(subject) <- params["subject"],
+           repositories when is_list(repositories) <- params["repositories"],
+           true <- Enum.all?(repositories, &is_binary/1),
+           permissions when is_list(permissions) <- params["permissions"],
+           true <- Enum.all?(permissions, &is_binary/1),
+           {:ok, opts} <- binding_options(params) do
+        case Code.Policy.bind(account, subject, repositories, permissions, opts) do
           {:ok, policy} -> send_json(conn, 200, Code.Policy.describe(policy))
           {:error, reason} -> send_json(conn, 422, %{error: inspect(reason)})
         end
-    end
+      else
+        _ ->
+          send_json(conn, 422, %{
+            error: "subject, repositories and permissions are required, as a string and lists of strings"
+          })
+      end
+    end)
+  end
+
+  delete "/policy/*account" do
+    with_account(conn, fn account ->
+      case conn.query_params["subject"] || conn.body_params["subject"] do
+        subject when is_binary(subject) ->
+          case Code.Policy.unbind(account, subject) do
+            {:ok, policy} -> send_json(conn, 200, Code.Policy.describe(policy))
+            {:error, reason} -> send_json(conn, 422, %{error: inspect(reason)})
+          end
+
+        _ ->
+          send_json(conn, 422, %{error: "subject is required"})
+      end
+    end)
   end
 
   post "/reap" do
@@ -230,28 +228,63 @@ defmodule Code.HTTP.AdminRouter do
   defp authenticate(%{path_info: path} = conn, _opts) when path in [["health"], ["ready"], ["metrics"]],
     do: conn
 
+  #
+  # Everything else fails closed. A node with no admin token configured
+  # refuses the admin API outright instead of serving it to whoever can reach
+  # the port: the listener binds every interface by default, and "internal
+  # network only" is a deployment assumption, not an authorization decision.
   defp authenticate(conn, _opts) do
     expected = Code.Config.admin_token()
 
     cond do
-      is_nil(expected) ->
-        conn
+      Code.Auth.blank?(expected) ->
+        reject(conn, "admin API disabled: no admin token is configured")
 
       valid_admin_token?(conn, expected) ->
         conn
 
       true ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(401, JSON.encode!(%{error: "admin token required"}))
-        |> halt()
+        reject(conn, "admin token required")
     end
   end
 
+  defp reject(conn, message) do
+    conn
+    |> put_resp_content_type("application/json")
+    |> put_resp_header("www-authenticate", ~s(Bearer realm="code-admin"))
+    |> send_resp(401, JSON.encode!(%{error: message}))
+    |> halt()
+  end
+
+  # `credential_from_header/1` never yields a blank bearer token, and the
+  # expected token is known to be non-blank, so an empty value cannot match.
   defp valid_admin_token?(conn, expected) do
     case Code.Auth.credential_from_header(List.first(get_req_header(conn, "authorization"))) do
       {:bearer, token} when byte_size(token) == byte_size(expected) -> :crypto.hash_equals(token, expected)
       _ -> false
+    end
+  end
+
+  defp binding_options(params) do
+    note = params["note"] || ""
+
+    case params["expires_at_ms"] do
+      nil when is_binary(note) -> {:ok, [note: note]}
+      at when is_integer(at) and at >= 0 and is_binary(note) -> {:ok, [note: note, expires_at_ms: at]}
+      _ -> :error
+    end
+  end
+
+  # Policy is stored under the account name, so an account that is not a
+  # single valid path segment is not an account. Answering 404 before touching
+  # the store keeps `..` and nested paths out of object keys entirely.
+  defp with_account(conn, fun) do
+    account = Enum.join(conn.path_params["account"], "/")
+
+    if Code.Policy.valid_account?(account) do
+      fun.(account)
+    else
+      send_json(conn, 404, %{error: "not found"})
     end
   end
 

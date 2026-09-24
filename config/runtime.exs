@@ -58,6 +58,9 @@ if config_env() == :prod or System.get_env("CODE_S3_BUCKET") do
     }
 
   auth_backend = get.("CODE_AUTH_BACKEND", "webhook")
+  # Refuses `none` in production and names the valid choices for a typo,
+  # rather than failing later with a CaseClauseError.
+  Code.Config.Runtime.auth_backend!(auth_backend, config_env())
   oidc_kubernetes = get.("CODE_OIDC_KUBERNETES", "false") == "true"
 
   # This is deliberately public configuration for Git Credential Manager, not
@@ -92,11 +95,13 @@ if config_env() == :prod or System.get_env("CODE_S3_BUCKET") do
       "webhook" ->
         {Code.Auth.Webhook,
          endpoint: require_env.("CODE_AUTH_ENDPOINT"),
-         token: require_env.("CODE_AUTH_TOKEN"),
+         token: Code.Config.Runtime.secret!("CODE_AUTH_TOKEN", require_env.("CODE_AUTH_TOKEN")),
          cache_ttl_ms: String.to_integer(get.("CODE_AUTH_CACHE_TTL_MS", "30000"))}
 
       "static" ->
-        {Code.Auth.Static, tokens: Code.Auth.Static.parse_tokens(get.("CODE_AUTH_TOKENS", ""))}
+        # Raises a redacted error naming the entry's position, never its
+        # contents: the value is made of secrets.
+        {Code.Auth.Static, tokens: Code.Auth.Static.parse_tokens!(get.("CODE_AUTH_TOKENS", ""))}
 
       "none" ->
         {Code.Auth.Allow, []}
@@ -112,7 +117,20 @@ if config_env() == :prod or System.get_env("CODE_S3_BUCKET") do
     hook_port: port.("CODE_HOOK_PORT", "4001"),
     admin_port: port.("CODE_ADMIN_PORT", "4002"),
     gossip_port: port.("CODE_GOSSIP_PORT", "4010"),
-    admin_token: require_env.("CODE_ADMIN_TOKEN"),
+    # Blank is refused outright: an empty admin token is not a weaker token,
+    # it is no token, and the admin API can create and delete repositories.
+    admin_token: Code.Config.Runtime.secret!("CODE_ADMIN_TOKEN", require_env.("CODE_ADMIN_TOKEN")),
+    # All interfaces unless set. Kubernetes reaches the probes on the pod IP,
+    # so binding loopback there would fail every health check; outside a
+    # cluster, set this to keep the admin API off public interfaces.
+    admin_ip: Code.Config.Runtime.ip!("CODE_ADMIN_IP", System.get_env("CODE_ADMIN_IP")),
+    # How long listeners wait for in-flight requests on shutdown. Keep it
+    # below the pod's termination grace period, minus any preStop delay.
+    shutdown_timeout_ms:
+      Code.Config.Runtime.non_neg_integer!(
+        "CODE_SHUTDOWN_TIMEOUT_MS",
+        get.("CODE_SHUTDOWN_TIMEOUT_MS", "100000")
+      ),
     peers: get.("CODE_PEERS", "") |> String.split(",", trim: true),
     default_replicas: String.to_integer(get.("CODE_DEFAULT_REPLICAS", "3")),
     # How long a replica may serve a read without re-verifying the WAL index
@@ -122,6 +140,13 @@ if config_env() == :prod or System.get_env("CODE_S3_BUCKET") do
     # Authorization is checked on every request, so unlike a repository read
     # this is not zero by default; see docs/multi-tenancy.md.
     policy_staleness_budget_ms: String.to_integer(get.("CODE_POLICY_STALENESS_BUDGET_MS", "5000")),
+    # How long a cached policy may keep authorizing while object storage
+    # cannot confirm it. Past this, policy grants fail closed.
+    policy_max_stale_ms:
+      Code.Config.Runtime.non_neg_integer!(
+        "CODE_POLICY_MAX_STALE_MS",
+        get.("CODE_POLICY_MAX_STALE_MS", "900000")
+      ),
     compaction_entry_threshold: String.to_integer(get.("CODE_COMPACTION_ENTRY_THRESHOLD", "250")),
     compaction_bytes_threshold: String.to_integer(get.("CODE_COMPACTION_BYTES_THRESHOLD", "268435456")),
     # A node may serve, perform cache maintenance, reserve event-consumer

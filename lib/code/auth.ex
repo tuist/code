@@ -120,13 +120,23 @@ defmodule Code.Auth do
   @spec credential_from_header(String.t() | nil) :: credential()
   def credential_from_header(nil), do: :anonymous
 
-  def credential_from_header("Bearer " <> token), do: {:bearer, String.trim(token)}
-  def credential_from_header("bearer " <> token), do: {:bearer, String.trim(token)}
+  def credential_from_header("Bearer " <> token), do: bearer(token)
+  def credential_from_header("bearer " <> token), do: bearer(token)
 
   def credential_from_header("Basic " <> encoded), do: decode_basic(encoded)
   def credential_from_header("basic " <> encoded), do: decode_basic(encoded)
 
   def credential_from_header(_other), do: :anonymous
+
+  # A blank token is no credential at all. Passing `{:bearer, ""}` on would
+  # let any comparison against an empty secret succeed, and `String.trim/1`
+  # strips Unicode whitespace, so `Bearer <U+2003>` is blank too.
+  defp bearer(token) do
+    case String.trim(token) do
+      "" -> :anonymous
+      token -> {:bearer, token}
+    end
+  end
 
   defp decode_basic(encoded) do
     case Base.decode64(String.trim(encoded)) do
@@ -145,11 +155,17 @@ defmodule Code.Auth do
 
   defp normalize_basic(user, password) do
     cond do
-      String.downcase(user) in @token_usernames and password != "" -> {:bearer, password}
-      password == "" and user != "" -> {:bearer, user}
+      blank?(user) and blank?(password) -> :anonymous
+      String.downcase(user) in @token_usernames and not blank?(password) -> {:bearer, password}
+      blank?(password) and not blank?(user) -> {:bearer, user}
       true -> {:basic, user, password}
     end
   end
+
+  @doc "Whether a secret is missing or consists only of whitespace."
+  @spec blank?(term()) :: boolean()
+  def blank?(value) when is_binary(value), do: String.trim(value) == ""
+  def blank?(_value), do: true
 
   @doc """
   The `WWW-Authenticate` header value for a rejected request.

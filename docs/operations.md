@@ -13,7 +13,7 @@ unchanged to every node. The only per-node value is `CODE_NODE_ID`.
 | `CODE_S3_ENDPOINT` | Object store endpoint |
 | `CODE_S3_ACCESS_KEY_ID` | |
 | `CODE_S3_SECRET_ACCESS_KEY` | |
-| `CODE_ADMIN_TOKEN` | Bearer token for the admin API |
+| `CODE_ADMIN_TOKEN` | Bearer token for the admin API. An empty or whitespace-only value stops the node from booting |
 
 ### Object storage
 
@@ -45,6 +45,10 @@ exist, and Code will not be safe.
 | `CODE_MAINTENANCE_SWEEP_MS` | `300000` | How often resident repositories are considered |
 | `CODE_IDLE_EVICTION_MS` | `3600000` | Drop untouched repositories from disk |
 | `CODE_DATA_DIR` | `/var/lib/code/repositories` | Put this on fast local NVMe |
+| `CODE_POLICY_STALENESS_BUDGET_MS` | `5000` | How long a cached authorization policy, or a cached absence of one, is used before revalidating |
+| `CODE_POLICY_MAX_STALE_MS` | `900000` | How long a cached policy may keep authorizing while object storage cannot confirm it. See [Object storage is unreachable](#failure-modes) |
+| `CODE_ADMIN_IP` | all interfaces | Address the admin listener binds to, such as `127.0.0.1`. Leave unset in Kubernetes, where probes reach the pod IP |
+| `CODE_SHUTDOWN_TIMEOUT_MS` | `100000` | How long listeners wait for in-flight requests on shutdown. Keep it below the orchestrator's grace period. See [Graceful shutdown](#graceful-shutdown) |
 
 **`CODE_STALENESS_BUDGET_MS` deserves a moment.** At `0`, every read
 re-validates against object storage before serving, which is what makes a client
@@ -93,10 +97,21 @@ See [kubernetes.md](kubernetes.md) for the full picture.
 
 | Variable | Notes |
 |---|---|
-| `CODE_AUTH_BACKEND` | `webhook` (default), `oidc`, `static`, `none` |
+| `CODE_AUTH_BACKEND` | `webhook` (default), `oidc`, `static`, `none`. `none` authorizes everything and is refused when `MIX_ENV=prod`, which includes the release image |
 | `CODE_OIDC_ISSUER` | Token issuer, used to discover the JWKS |
 | `CODE_OIDC_AUDIENCE` | **Set this.** Binds tokens to this deployment |
+| `CODE_OIDC_KUBERNETES` | `true` to discover the issuer and keys from the Kubernetes API server. Only then are the pod's service-account token and cluster CA attached, and only to the API server over HTTPS |
 | `CODE_AUTH_ENDPOINT` | For the webhook backend |
+| `CODE_AUTH_TOKEN` | For the webhook backend; must not be blank |
+| `CODE_AUTH_TOKENS` | For the static backend: `token=account:permissions` entries separated by `;`. A malformed entry stops the node from booting with an error naming its position, never its contents |
+
+Signing keys for the `oidc` backend are cached per node. Requests are served
+from the cache without waiting on the issuer; a due refresh runs in the
+background, and each fetch is bounded to five seconds. A response that is not
+a usable key set (not JSON, no `keys`, or no key that parses) is logged and
+ignored, so the previous keys keep working. Tokens are accepted up to 60
+seconds past `exp` to absorb clock skew, and that same window applies
+everywhere a token's expiry is checked.
 
 ### Browser login for Git
 
@@ -241,6 +256,16 @@ replicas are doing real catch-up work on the read path, and latency will follow.
 | `code_http_exception_count{listener}` | Did a request terminate unexpectedly before it could return a response? |
 | `code_factory_operation_duration_seconds{operation,outcome}` | Are durable graph-run or account configuration operations slow or failing? Operation and outcome are bounded, so repository work does not create metric-label cardinality. |
 | `code_factory_operation_count{operation,outcome}` | Which durable graph-run or account configuration operations are succeeding or failing? |
+| `code_auth_rejected_count{reason}` | Are credentials failing, and whose problem is it? `reason` is one of a fixed set: caller-side values such as `invalid_credential`, `expired`, `audience_mismatch`, `issuer_mismatch`, `unknown_key`; operator-side values `misconfigured`, `key_source_unavailable`, `authority_unavailable`; and `other`. Anonymous requests, which `git` always sends first, are not counted |
+| `code_policy_revalidation_failed_count{outcome}` | Is object storage failing authorization reads? `served_stale` means a cached policy was used within `CODE_POLICY_MAX_STALE_MS`; `failed_closed` means it was older, and policy grants were refused |
+
+Rejected credentials are also logged, at `info` for caller-side reasons and
+`warning` for operator-side ones, with `reason`, `auth_backend` and
+`operation=authenticate` fields. Policy revalidation failures log `account`,
+`reason` and `age_ms` with `operation=policy_revalidate`: a `warning` while
+serving a cached policy, an `error` once grants fail closed. Signing-key refresh
+failures log `reason` with `operation=jwks_refresh`, and webhook authority
+failures `reason` with `operation=webhook_authenticate`.
 
 ### What to autoscale on
 
@@ -265,6 +290,14 @@ data.
 
 Bearer `CODE_ADMIN_TOKEN`. Any node answers any question.
 
+Every route except `/health`, `/ready` and `/metrics` requires the token, and
+the API fails closed: a node with no token configured answers `401` to all of
+them rather than serving them openly. A blank or whitespace bearer token never
+matches. The listener binds all interfaces unless `CODE_ADMIN_IP` is set, so
+outside Kubernetes set it, or firewall port 4002, to keep the API off public
+networks. `/policy/<account>` answers `404` for anything that is not a single
+valid account name.
+
 ```sh
 curl :4002/status                            # this node
 curl :4002/cluster                           # membership and resident repositories
@@ -282,6 +315,24 @@ It reports the log's position, each replica's position, and the ages of its
 last verification and last access. That makes "which nodes are behind, and by
 how much" and "is this cache actively used" answerable in one request.
 
+## Graceful shutdown
+
+When a pod is deleted, two things happen at once: Kubernetes starts removing
+it from Service endpoints, and the kubelet runs its preStop hook and then sends
+`SIGTERM`. The chart's preStop hook sleeps for `shutdown.preStopSleepSeconds`
+(10 by default) so the pod keeps serving while endpoints converge, instead of
+refusing requests that were already routed to it.
+
+On `SIGTERM` the listeners stop accepting connections and wait up to
+`CODE_SHUTDOWN_TIMEOUT_MS` (100 seconds by default, `shutdown.shutdownTimeoutMs`
+in the chart) for in-flight clones and pushes to finish, then close whatever is
+left. The chart refuses values where the preStop delay plus that timeout plus
+five seconds exceed `terminationGracePeriodSeconds` (120 by default), because
+the kubelet's `SIGKILL` would otherwise cut connections before Code does.
+Requests longer than the whole window are cut off; a push cut off this way
+has not committed unless its log entry was already written, and the client
+sees a failed push it can retry.
+
 ## Failure modes
 
 **A node dies.** Nothing to do. Rendezvous hashing has already reassigned its
@@ -293,6 +344,14 @@ materialized *only if* `staleness_budget_ms > 0`; at the default of `0` they
 fail, because the node cannot confirm it is current and would rather refuse than
 lie. Writes fail. `/ready` goes red and the node leaves rotation. This is a hard
 dependency by design.
+
+Authorization policies are read from the same store. A policy this node has
+already read keeps authorizing for up to `CODE_POLICY_MAX_STALE_MS` (15 minutes
+by default) after the store last confirmed it, so a brief outage does not
+revoke everybody's access. Past that, policy grants fail closed until the store
+answers again, so a grant revoked during a long outage cannot keep working on a
+node that cannot see the revocation. Grants carried in tokens are unaffected.
+Watch `code_policy_revalidation_failed_count{outcome="failed_closed"}`.
 
 **A git command hangs with no output on macOS.** Not Code. The `osxkeychain`
 credential helper blocks storing a credential for a host and port it has not

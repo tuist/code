@@ -35,6 +35,19 @@ defmodule Code.AuthTest do
       assert Auth.credential_from_header("Basic !!!not base64!!!") == :anonymous
       assert Auth.credential_from_header("Digest xyz") == :anonymous
     end
+
+    test "a blank bearer token is no credential at all" do
+      # `String.trim/1` strips Unicode whitespace, so an em space trims to
+      # nothing. Passing an empty token on would let it match an empty secret.
+      for header <- ["Bearer ", "Bearer    ", "Bearer  ", "bearer \t"] do
+        assert Auth.credential_from_header(header) == :anonymous, inspect(header)
+      end
+    end
+
+    test "blank basic credentials are anonymous" do
+      assert Auth.credential_from_header("Basic " <> Base.encode64(":")) == :anonymous
+      assert Auth.credential_from_header("Basic " <> Base.encode64(" : ")) == :anonymous
+    end
   end
 
   describe "Principal.matches?/2" do
@@ -138,7 +151,7 @@ defmodule Code.AuthTest do
     end
 
     test "parse_tokens/1 reads the environment format" do
-      parsed = Static.parse_tokens("t1=acme:read,write,execute;t2=beta:read")
+      {:ok, parsed} = Static.parse_tokens("t1=acme:read,write,execute;t2=beta:read")
 
       assert parsed["t1"].account == "acme"
       assert parsed["t1"].scopes == [:read, :write, :execute]
@@ -146,7 +159,43 @@ defmodule Code.AuthTest do
     end
 
     test "parse_tokens/1 accepts the execution scope without dynamically creating an atom" do
-      assert %{"worker" => %{scopes: [:execute]}} = Static.parse_tokens("worker=acme:execute")
+      assert {:ok, %{"worker" => %{scopes: [:execute]}}} = Static.parse_tokens("worker=acme:execute")
+    end
+
+    test "parse_tokens/1 accepts an empty configuration" do
+      assert {:ok, %{}} = Static.parse_tokens("")
+    end
+
+    test "parse_tokens/1 rejects malformed entries without repeating the secret" do
+      secret = "hunter2-super-secret"
+
+      for raw <- [
+            "#{secret}",
+            "#{secret}=acme",
+            "=acme:read",
+            "   =acme:read",
+            "#{secret}=:read",
+            "#{secret}=acme:",
+            "#{secret}=acme:read,superuser",
+            "#{secret}=acme:read;#{secret}=beta:read"
+          ] do
+        assert {:error, message} = Static.parse_tokens(raw), inspect(raw)
+        assert message =~ "CODE_AUTH_TOKENS entry"
+        refute message =~ secret
+
+        error = assert_raise ArgumentError, fn -> Static.parse_tokens!(raw) end
+        refute Exception.message(error) =~ secret
+      end
+    end
+
+    test "an empty configured token never authenticates" do
+      tokens = %{"" => %{account: "acme", scopes: [:admin]}, " " => %{account: "acme", scopes: [:admin]}}
+
+      for candidate <- ["", " ", " "] do
+        assert {:error, :invalid_credential} = Static.authenticate({:bearer, candidate}, tokens: tokens)
+      end
+
+      assert {:error, :invalid_credential} = Static.authenticate({:basic, "user", ""}, tokens: tokens)
     end
   end
 end
