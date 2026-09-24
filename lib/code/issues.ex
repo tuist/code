@@ -503,7 +503,9 @@ defmodule Code.Issues do
   end
 
   defp list_issues(repo_path, head) do
-    case Git.list_tree(repo_path, head, "issues", recursive: false) do
+    # The trailing slash lists the directory's children; `issues` alone would
+    # name the directory entry itself, and every issue would be missed.
+    case Git.list_tree(repo_path, head, "issues/", recursive: false) do
       {:ok, entries} ->
         entries
         |> Enum.filter(&(&1.type == "tree"))

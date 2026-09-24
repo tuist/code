@@ -86,6 +86,17 @@ defmodule Code.IssuesTest do
     assert List.last(events).type == "issue_deleted"
   end
 
+  test "lists every current issue in number order, without deleted ones", %{repo: repo, principal: principal} do
+    for title <- ~w(first second third) do
+      assert {:ok, _} = Issues.create(repo, title, "", principal)
+    end
+
+    assert {:ok, _} = Issues.delete(repo, 2, principal)
+
+    assert {:ok, %{issues: issues, count: 2}} = Issues.list(repo)
+    assert Enum.map(issues, &{&1.number, &1.title}) == [{1, "first"}, {3, "third"}]
+  end
+
   test "refuses a comment on a deleted issue without recording one", %{repo: repo, principal: principal} do
     assert {:ok, %{issue: issue}} = Issues.create(repo, "Doomed", "", principal)
     assert {:ok, _} = Issues.delete(repo, issue.number, principal)
