@@ -16,10 +16,12 @@ defmodule Code.Factory do
 
   alias Code.Auth.Principal
   alias Code.Factory.InferenceProfile
+  alias Code.Factory.Shared
   alias Code.ObjectStore
   alias Code.Policy
-  alias Code.Telemetry
   alias Code.WAL
+
+  import Code.Factory.Shared, only: [actor: 1, maybe_put: 3, now: 0, observe: 2, valid_identifier?: 1]
 
   @content_type "application/vnd.code.factory.v1+json"
   @cas_attempts 16
@@ -813,31 +815,6 @@ defmodule Code.Factory do
   defp valid_artifact?(%{name: name}) when is_binary(name) and name != "", do: true
   defp valid_artifact?(_), do: false
 
-  defp observe(operation, fun) do
-    started_at = System.monotonic_time()
-
-    result =
-      Telemetry.span(
-        "factory.#{operation}",
-        %{"code.factory.operation" => Atom.to_string(operation)},
-        fn ->
-          fun.() |> Telemetry.put_span_outcome()
-        end
-      )
-
-    :telemetry.execute(
-      [:code, :factory, :operation],
-      %{duration_us: System.convert_time_unit(System.monotonic_time() - started_at, :native, :microsecond)},
-      %{operation: operation, outcome: operation_outcome(result)}
-    )
-
-    result
-  end
-
-  defp operation_outcome({:ok, _}), do: :ok
-  defp operation_outcome({:error, _}), do: :error
-  defp operation_outcome(_), do: :error
-
   defp error_message(reason) when is_binary(reason), do: reason
   defp error_message(reason), do: "could not transition work run: #{inspect(reason)}"
 
@@ -893,9 +870,6 @@ defmodule Code.Factory do
   defp lease_duration(ms) when is_integer(ms) and ms in 1_000..86_400_000, do: {:ok, ms}
   defp lease_duration(_), do: {:error, "lease_duration_ms must be between one second and one day"}
 
-  defp valid_identifier?(value),
-    do: is_binary(value) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/, value)
-
   defp valid_operation?(value),
     do: is_binary(value) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/, value)
 
@@ -928,15 +902,6 @@ defmodule Code.Factory do
       "occurred_at_ms" => occurred_at_ms
     }
   end
-
-  defp actor(%Principal{} = principal), do: %{"subject" => principal.subject, "account" => principal.account}
-  defp now, do: System.system_time(:millisecond)
-  # URL-safe base64 can begin with `-` or `_`, while work ids intentionally
-  # begin with an alphanumeric character so they are safe in every path form.
-  defp identifier, do: "r" <> Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
-
-  defp put_immutable(key, value),
-    do: ObjectStore.put(key, JSON.encode!(value), if_none_match: "*", content_type: @content_type)
 
   defp put_result(repo_id, run_id, attempt_id, result) do
     case put_immutable(result_key(repo_id, run_id, attempt_id), result) do
@@ -998,26 +963,10 @@ defmodule Code.Factory do
     end
   end
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
-
-  defp read_json(key) do
-    with {:ok, body, _etag} <- ObjectStore.get(key), do: decode(key, body)
-  end
-
-  defp read_json_with_etag(key) do
-    with {:ok, body, etag} <- ObjectStore.get(key),
-         {:ok, value} <- decode(key, body) do
-      {:ok, value, etag}
-    end
-  end
-
-  defp decode(key, body) do
-    case JSON.decode(body) do
-      {:ok, value} when is_map(value) -> {:ok, value}
-      _ -> {:error, "malformed factory object #{key}"}
-    end
-  end
+  defp identifier, do: Shared.identifier("r")
+  defp put_immutable(key, value), do: Shared.put_immutable(key, value, @content_type)
+  defp read_json(key), do: Shared.read_json(key, "factory")
+  defp read_json_with_etag(key), do: Shared.read_json_with_etag(key, "factory")
 
   defp runs_prefix(repo_id), do: "factory/#{repo_id}/runs/"
   defp run_prefix(repo_id, run_id), do: runs_prefix(repo_id) <> run_id <> "/"
