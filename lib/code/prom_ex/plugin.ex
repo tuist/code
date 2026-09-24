@@ -366,6 +366,20 @@ defmodule Code.PromEx.Plugin do
         event_name: [:code, :auth, :denied],
         description: "Authorization denials, by permission.",
         tags: [:permission]
+      ),
+      counter(
+        [:code, :auth, :rejected, :count],
+        event_name: [:code, :auth, :rejected],
+        description:
+          "Credentials that failed authentication, by bounded reason. Anonymous requests are not counted.",
+        tags: [:reason]
+      ),
+      counter(
+        [:code, :policy, :revalidation_failed, :count],
+        event_name: [:code, :policy, :revalidation_failed],
+        description:
+          "Policy revalidations that could not reach object storage, by outcome: served_stale or failed_closed.",
+        tags: [:outcome]
       )
     ])
   end

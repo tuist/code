@@ -20,6 +20,7 @@ defmodule Code.PromExTest do
   # observable contract: update docs/operations.md in the same commit.
   @expected ~w(
     code_auth_denied_count
+    code_auth_rejected_count
     code_git_aborted_count
     code_git_command_count
     code_git_command_duration
@@ -41,6 +42,7 @@ defmodule Code.PromExTest do
     code_mcp_request_duration
     code_object_store_request_count
     code_object_store_request_duration_seconds
+    code_policy_revalidation_failed_count
     code_push_committed_count
     code_push_committed_duration
     code_push_rejected_count

@@ -22,6 +22,9 @@ config :logger, :console,
     :outcome,
     :detail,
     :timeout_ms,
+    :account,
+    :age_ms,
+    :auth_backend,
     :otel_trace_id,
     :otel_span_id
   ]

@@ -35,6 +35,9 @@ defmodule Code.Policy do
   request would double the round trips. Policies are cached per node and
   revalidated with a conditional GET once the staleness budget elapses; a `304`
   is a metadata-only operation, the same fast path replicas use for the log.
+  An account with no policy object is cached as absent for the same budget,
+  so the common case of an account without a policy does not cost a GET on
+  every authorization the token alone does not cover.
 
   The budget defaults to five seconds rather than zero. Unlike a repository
   read — where serving stale data would be a correctness failure — a
@@ -45,9 +48,13 @@ defmodule Code.Policy do
 
   Two different answers, on purpose:
 
-    * A policy that has been read before keeps being served from cache.
-      Revoking everyone's access because the store hiccupped would turn a
-      storage blip into an outage.
+    * A policy that has been read before keeps being served from cache, for
+      at most `CODE_POLICY_MAX_STALE_MS` (fifteen minutes by default) after
+      the store last confirmed it. Revoking everyone's access because the
+      store hiccupped would turn a storage blip into an outage, but an
+      unbounded window would let a grant revoked during a long outage keep
+      working on a node that cannot see the revocation. Past the bound,
+      policy grants fail closed until the store answers again.
     * A policy that has never been read grants nothing. Failing open for an
       unknown policy would mean an unreachable store silently widened access,
       which is the one direction that must never happen.
@@ -104,6 +111,19 @@ defmodule Code.Policy do
 
   @spec key(account()) :: String.t()
   def key(account), do: "accounts/#{account}/policy.pb"
+
+  @doc """
+  Whether `account` is a valid account name: one repository-id segment.
+
+  The name becomes part of an object key, so anything that could escape its
+  prefix (`..`, a slash, an empty string) is not an account.
+  """
+  @spec valid_account?(term()) :: boolean()
+  def valid_account?(account) when is_binary(account) do
+    byte_size(account) <= 255 and not String.contains?(account, "/") and Code.WAL.valid_id?(account)
+  end
+
+  def valid_account?(_account), do: false
 
   @doc """
   The account a repository belongs to: everything before the first slash.
@@ -168,27 +188,36 @@ defmodule Code.Policy do
   """
   @spec get(account()) :: {:ok, t()} | {:error, term()}
   def get(account) do
-    case cached(account) do
-      {:fresh, policy} -> {:ok, policy}
-      {:stale, etag, policy} -> revalidate(account, etag, policy)
-      :miss -> load(account)
+    if valid_account?(account) do
+      case cached(account) do
+        {:fresh, policy} -> {:ok, policy}
+        # A cached absence has no entity tag to revalidate against.
+        {:stale, nil, _policy, _verified_at} -> load(account)
+        {:stale, etag, policy, verified_at} -> revalidate(account, etag, policy, verified_at)
+        :miss -> load(account)
+      end
+    else
+      {:error, :invalid_account}
     end
   end
 
+  # `verified_at` is the last time object storage confirmed this entry, and is
+  # only ever advanced by a successful read. It is both the freshness clock
+  # and the clock that bounds how long a failing store can be papered over.
   defp cached(account) do
     with true <- :ets.whereis(@cache) != :undefined,
-         [{_key, etag, policy, at}] <- :ets.lookup(@cache, cache_key(account)) do
-      if System.monotonic_time(:millisecond) - at < Config.policy_staleness_budget_ms() do
+         [{_key, etag, policy, verified_at}] <- :ets.lookup(@cache, cache_key(account)) do
+      if System.monotonic_time(:millisecond) - verified_at < Config.policy_staleness_budget_ms() do
         {:fresh, policy}
       else
-        {:stale, etag, policy}
+        {:stale, etag, policy, verified_at}
       end
     else
       _ -> :miss
     end
   end
 
-  defp revalidate(account, etag, policy) do
+  defp revalidate(account, etag, policy, verified_at) do
     case ObjectStore.get(key(account), etag: etag) do
       {:ok, :not_modified} ->
         touch(account, etag, policy)
@@ -198,24 +227,63 @@ defmodule Code.Policy do
         decode_and_cache(account, body, new_etag)
 
       {:error, :not_found} ->
-        forget(account)
-        {:ok, empty(account)}
+        remember_absent(account)
 
       {:error, reason} ->
-        # Keep serving what we have. An unreachable object store should not
-        # revoke everybody's access.
-        Logger.warning("code: could not revalidate policy for #{account}: #{inspect(reason)}")
-        {:ok, policy}
+        serve_stale(account, policy, verified_at, reason)
     end
+  end
+
+  # Keep serving what we have, for a while. An unreachable object store should
+  # not revoke everybody's access the moment it hiccups, but nor may it keep a
+  # revoked grant alive forever on a node that cannot see the revocation.
+  defp serve_stale(account, policy, verified_at, reason) do
+    age_ms = System.monotonic_time(:millisecond) - verified_at
+    max_stale_ms = Config.policy_max_stale_ms()
+
+    if age_ms <= max_stale_ms do
+      Logger.warning("could not revalidate policy; serving cached policy",
+        account: account,
+        reason: inspect(reason),
+        age_ms: age_ms,
+        operation: "policy_revalidate"
+      )
+
+      revalidation_failed(:served_stale, age_ms)
+      {:ok, policy}
+    else
+      Logger.error("could not revalidate policy past its maximum stale age; policy grants fail closed",
+        account: account,
+        reason: inspect(reason),
+        age_ms: age_ms,
+        operation: "policy_revalidate"
+      )
+
+      revalidation_failed(:failed_closed, age_ms)
+      {:error, {:policy_unavailable, reason}}
+    end
+  end
+
+  defp revalidation_failed(outcome, age_ms) do
+    :telemetry.execute([:code, :policy, :revalidation_failed], %{age_ms: age_ms}, %{outcome: outcome})
   end
 
   defp load(account) do
     case ObjectStore.get(key(account)) do
       {:ok, body, etag} -> decode_and_cache(account, body, etag)
       {:ok, :not_modified} -> {:error, :unexpected_not_modified}
-      {:error, :not_found} -> {:ok, empty(account)}
+      {:error, :not_found} -> remember_absent(account)
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  # Absence is cached for the same staleness budget as a policy. Most accounts
+  # have no policy object, and every authorization their tokens do not cover
+  # would otherwise cost a GET against the store.
+  defp remember_absent(account) do
+    policy = empty(account)
+    touch(account, nil, policy)
+    {:ok, policy}
   end
 
   defp decode_and_cache(account, body, etag) do
@@ -252,7 +320,9 @@ defmodule Code.Policy do
   than clobbered.
   """
   @spec update(account(), ([V1.Binding.t()] -> [V1.Binding.t()])) :: {:ok, t()} | {:error, term()}
-  def update(account, update), do: update(account, update, @cas_attempts)
+  def update(account, update) do
+    if valid_account?(account), do: update(account, update, @cas_attempts), else: {:error, :invalid_account}
+  end
 
   defp update(_account, _update, 0), do: {:error, :cas_exhausted}
 
@@ -349,8 +419,12 @@ defmodule Code.Policy do
   @doc "Delete an account's policy entirely."
   @spec destroy(account()) :: :ok | {:error, term()}
   def destroy(account) do
-    forget(account)
-    ObjectStore.delete(key(account))
+    if valid_account?(account) do
+      forget(account)
+      ObjectStore.delete(key(account))
+    else
+      {:error, :invalid_account}
+    end
   end
 
   @doc "Drop the cached policy for one account, so the next read is authoritative."

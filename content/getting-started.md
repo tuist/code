@@ -17,6 +17,7 @@ Create a repository, then use it with the Git client you already have:
 
 ```sh
 curl -X POST localhost:4002/repositories \
+  -H 'authorization: Bearer dev-admin-token' \
   -H 'content-type: application/json' \
   -d '{"repository":"acme/app"}'
 

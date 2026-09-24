@@ -166,6 +166,28 @@ defmodule Code.Auth.OIDCTest do
       token = sign(jwk, %{"exp" => System.system_time(:second) - 5})
       assert {:ok, _} = OIDC.authenticate({:bearer, token}, config)
     end
+
+    test "the leeway survives the expiry check in Code.Auth", %{jwk: jwk, config: config} do
+      # `Code.Auth.authenticate/1` re-checks the principal's expiry. When the
+      # principal carried the bare `exp`, that check undid the leeway the
+      # claim check had just granted.
+      Code.Config.put_overrides(%{auth: {OIDC, config}})
+
+      within = sign(jwk, %{"exp" => System.system_time(:second) - 5})
+      assert {:ok, principal} = Code.Auth.authenticate({:bearer, within})
+      assert DateTime.compare(principal.expires_at, DateTime.utc_now()) == :gt
+
+      beyond = sign(jwk, %{"exp" => System.system_time(:second) - 120})
+      assert {:error, :expired} = Code.Auth.authenticate({:bearer, beyond})
+    end
+
+    test "one configured leeway governs both checks", %{jwk: jwk, config: config} do
+      config = Keyword.put(config, :leeway_seconds, 0)
+      Code.Config.put_overrides(%{auth: {OIDC, config}})
+
+      token = sign(jwk, %{"exp" => System.system_time(:second) - 5})
+      assert {:error, :expired} = Code.Auth.authenticate({:bearer, token})
+    end
   end
 
   describe "signature" do

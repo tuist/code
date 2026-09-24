@@ -115,7 +115,9 @@ matter, and both are handled by the chart:
     permission Code ever needs — the read-only
     `system:service-account-issuer-discovery` role — and the chart grants it
     only when this backend is configured. Everything else, clustering
-    included, needs no API access at all.
+    included, needs no API access at all. The token and CA are attached only
+    in this mode, only over HTTPS, and only to the API server and the key-set
+    address it publishes; a configured external issuer never receives them.
 
   * **Do not configure the issuer by hand.** Kubernetes is *reached* at
     `https://kubernetes.default.svc` but *issues* tokens naming

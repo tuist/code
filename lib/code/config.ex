@@ -63,8 +63,34 @@ defmodule Code.Config do
   @spec admin_port() :: :inet.port_number()
   def admin_port, do: get(:admin_port, 4002)
 
+  @doc """
+  Bearer token for the admin API.
+
+  When this is unset or blank the admin API refuses every authenticated
+  route rather than serving them openly; see `Code.HTTP.AdminRouter`.
+  """
   @spec admin_token() :: String.t() | nil
   def admin_token, do: get(:admin_token, nil)
+
+  @doc """
+  Address the admin listener binds to, or `nil` for all interfaces.
+
+  All interfaces is the default because Kubernetes probes a pod on its own IP.
+  Outside a cluster, binding loopback or a private address keeps the admin API
+  off public networks.
+  """
+  @spec admin_ip() :: :inet.ip_address() | nil
+  def admin_ip, do: get(:admin_ip, nil)
+
+  @doc """
+  How long listeners wait for in-flight requests when the node shuts down.
+
+  Should be shorter than the orchestrator's grace period (the chart's
+  `terminationGracePeriodSeconds`, minus its preStop delay), so connections
+  are drained by us rather than cut by a `SIGKILL`.
+  """
+  @spec shutdown_timeout_ms() :: non_neg_integer()
+  def shutdown_timeout_ms, do: get(:shutdown_timeout_ms, 100_000)
 
   @spec default_replicas() :: pos_integer()
   def default_replicas, do: get(:default_replicas, 3)
@@ -91,6 +117,19 @@ defmodule Code.Config do
   """
   @spec policy_staleness_budget_ms() :: non_neg_integer()
   def policy_staleness_budget_ms, do: get(:policy_staleness_budget_ms, 5_000)
+
+  @doc """
+  How long a cached policy may keep authorizing after the last time object
+  storage confirmed it.
+
+  Serving a cached policy through a storage blip keeps an outage from revoking
+  everybody's access, but an unbounded window means a grant revoked during a
+  long outage keeps working on an isolated node indefinitely. Past this age,
+  policy grants fail closed until the store answers again. Credentials that
+  carry their own grants are unaffected.
+  """
+  @spec policy_max_stale_ms() :: non_neg_integer()
+  def policy_max_stale_ms, do: get(:policy_max_stale_ms, :timer.minutes(15))
 
   @spec compaction_entry_threshold() :: pos_integer()
   def compaction_entry_threshold, do: get(:compaction_entry_threshold, 250)

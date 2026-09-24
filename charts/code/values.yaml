@@ -120,6 +120,11 @@ config:
   # replaces. See docs/multi-tenancy.md.
   policyStalenessBudgetMs: 5000
 
+  # How long a cached policy may keep authorizing while object storage cannot
+  # confirm it. Past this, policy grants fail closed until the store answers;
+  # grants carried by tokens are unaffected. 15 minutes.
+  policyMaxStaleMs: 900000
+
   compactionEntryThreshold: 250
   compactionBytesThreshold: 268435456
   # Comma-separated node capabilities. The default single Deployment performs
@@ -228,6 +233,22 @@ resources:
 # because the log already has everything; this is purely about not cutting off
 # a client mid-transfer.
 terminationGracePeriodSeconds: 120
+
+# Graceful shutdown happens in two phases, and both have to fit inside
+# terminationGracePeriodSeconds:
+#
+#   1. preStopSleepSeconds: the pod keeps serving while Kubernetes removes it
+#      from Service endpoints. Without this pause, SIGTERM arrives while
+#      ingress controllers and kube-proxy are still sending it new requests,
+#      which fail with connection refused.
+#   2. shutdownTimeoutMs: after SIGTERM, listeners stop accepting and wait
+#      this long for in-flight clones and pushes before closing them.
+#
+# The chart refuses values where the two do not fit with at least five
+# seconds to spare before the kubelet sends SIGKILL.
+shutdown:
+  preStopSleepSeconds: 10
+  shutdownTimeoutMs: 100000
 
 podDisruptionBudget:
   enabled: true

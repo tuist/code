@@ -6,6 +6,11 @@ defmodule Code.PolicyTest do
   """
 
   use Code.Case, async: true
+  use Mimic
+
+  # The object store is only stubbed to fail on demand, or to prove it was not
+  # called; private mode keeps either from reaching concurrent tests.
+  setup :set_mimic_private
 
   alias Code.Auth
   alias Code.Auth.Principal
@@ -189,6 +194,123 @@ defmodule Code.PolicyTest do
       # account.
       assert :ok = Auth.authorize(principal("alice"), "#{account}/app", :admin)
       assert {:error, :forbidden} = Auth.authorize(principal("alice"), "someone-else/app", :admin)
+    end
+  end
+
+  describe "account names" do
+    test "only a single valid segment is an account" do
+      for bad <- ["", "..", "a/b", "../escape", ".hidden", "-dash", "a b", nil, 42] do
+        refute Policy.valid_account?(bad), inspect(bad)
+      end
+
+      assert Policy.valid_account?("acme")
+      assert Policy.valid_account?("acme-corp.eu_1")
+    end
+
+    test "an invalid account is refused before any object key is derived", %{store: store} do
+      assert {:error, :invalid_account} = Policy.get("../escape")
+      assert {:error, :invalid_account} = Policy.bind("a/b", "alice", ["**"], ["admin"])
+      assert {:error, :invalid_account} = Policy.unbind("..", "alice")
+      assert {:error, :invalid_account} = Policy.destroy("../escape")
+      assert Policy.grants_for("..", "alice") == []
+
+      refute File.exists?(Path.join(store, "accounts"))
+    end
+  end
+
+  describe "an account with no policy object" do
+    test "is cached, so uncovered authorizations do not each cost a read", %{account: account} do
+      assert {:ok, %{version: 0}} = Policy.get(account)
+
+      # Within the staleness budget the absence is answered from cache.
+      reject(&Code.ObjectStore.get/1)
+      reject(&Code.ObjectStore.get/2)
+
+      assert Policy.grants_for(account, "alice") == []
+      assert {:error, :forbidden} = Auth.authorize(principal("alice"), "#{account}/app", :read)
+    end
+
+    test "is re-read once the budget elapses, so a new policy is seen", %{account: account} do
+      Code.Config.put_overrides(Map.put(Code.Config.overrides(), :policy_staleness_budget_ms, 0))
+      assert Policy.grants_for(account, "alice") == []
+
+      # Written as another node would: straight to the store, not through
+      # this node's cache.
+      binding = %Code.Policy.V1.Binding{
+        subject: "alice",
+        repositories: ["#{account}/**"],
+        permissions: ["read"]
+      }
+
+      policy = %{Policy.empty(account) | bindings: [binding], version: 1}
+      {:ok, _} = Code.ObjectStore.put(Policy.key(account), Policy.encode(policy))
+
+      assert [%{permissions: [:read]}] = Policy.grants_for(account, "alice")
+    end
+  end
+
+  describe "an unreachable store" do
+    setup %{account: account} do
+      {:ok, _} = Policy.bind(account, "alice", ["#{account}/**"], ["read"])
+
+      # Revalidate on every read, and fail on demand.
+      Code.Config.put_overrides(Map.put(Code.Config.overrides(), :policy_staleness_budget_ms, 0))
+
+      stub(Code.ObjectStore, :get, fn key, opts ->
+        if Process.get(:store_down),
+          do: {:error, :timeout},
+          else: call_original(Code.ObjectStore, :get, [key, opts])
+      end)
+
+      test = self()
+      handler = "policy-stale-#{account}"
+
+      :telemetry.attach(
+        handler,
+        [:code, :policy, :revalidation_failed],
+        fn _event, measurements, metadata, _config ->
+          if self() == test, do: send(test, {:revalidation_failed, metadata.outcome, measurements.age_ms})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      :ok
+    end
+
+    defp max_stale(ms),
+      do: Code.Config.put_overrides(Map.put(Code.Config.overrides(), :policy_max_stale_ms, ms))
+
+    test "keeps serving a cached policy within the maximum stale age", %{account: account} do
+      max_stale(:timer.minutes(15))
+      Process.put(:store_down, true)
+
+      assert [%{permissions: [:read]}] = Policy.grants_for(account, "alice")
+      assert_received {:revalidation_failed, :served_stale, _age}
+    end
+
+    test "fails closed past the maximum stale age, and recovers with the store", %{account: account} do
+      # A revocation written while this node cannot see the store must not
+      # keep being ignored forever.
+      max_stale(0)
+      Process.sleep(2)
+      Process.put(:store_down, true)
+
+      assert Policy.grants_for(account, "alice") == []
+      assert {:error, {:policy_unavailable, :timeout}} = Policy.get(account)
+      assert {:error, :forbidden} = Auth.authorize(principal("alice"), "#{account}/app", :read)
+      assert_received {:revalidation_failed, :failed_closed, age} when age > 0
+
+      Process.delete(:store_down)
+      assert [%{permissions: [:read]}] = Policy.grants_for(account, "alice")
+    end
+
+    test "does not touch grants the credential carries itself", %{account: account} do
+      max_stale(0)
+      Process.put(:store_down, true)
+
+      carrying = %Principal{subject: "pod", grants: [Principal.grant("#{account}/**", [:read])]}
+      assert :ok = Auth.authorize(carrying, "#{account}/app", :read)
     end
   end
 

@@ -36,7 +36,10 @@ defmodule Code.HTTP.GitBackend do
   So the buffer is capped. Past `@max_buffered` bytes the response is started
   and output streams from then on, which is safe precisely because a client
   that has already made the server produce that much output has plainly stopped
-  waiting for `100 Continue`.
+  waiting for `100 Continue`. The rest of the request body is still read and
+  fed to the process after that point, interleaved with forwarding its
+  output, so a request whose body outlives the cap is served in full rather
+  than cut off where the buffer filled.
 
   A client that disconnects mid-clone, or a handler that crashes, takes the
   `git` process with it via `Code.Git.terminate/1`. Leaked `upload-pack`
@@ -71,7 +74,7 @@ defmodule Code.HTTP.GitBackend do
 
     result =
       case pump_request(conn, port, {[], 0}) do
-        {:ok, conn, {buffered, _bytes}} ->
+        {status, conn, {buffered, _bytes}} when status in [:done, :full] ->
           buffered = Enum.reverse(buffered)
 
           conn =
@@ -80,9 +83,10 @@ defmodule Code.HTTP.GitBackend do
             |> put_no_cache()
             |> send_chunked(200)
 
-          case flush_buffered(conn, buffered) do
-            {:ok, conn, bytes} -> drain(conn, port, bytes)
-            {:error, conn, reason} -> {:error, conn, reason}
+          with {:ok, conn, bytes} <- flush_buffered(conn, buffered),
+               {:ok, conn, bytes} <-
+                 if(status == :full, do: stream_request(conn, port, bytes), else: {:ok, conn, bytes}) do
+            drain(conn, port, bytes)
           end
 
         {:error, conn, reason} ->
@@ -144,27 +148,92 @@ defmodule Code.HTTP.GitBackend do
   # Read the request body in chunks, writing each to the process and collecting
   # whatever it has produced so far. Reading the body is also what makes the
   # server emit `100 Continue`, which is why it happens before any response.
+  #
+  # Returns `:done` once the body is consumed, or `:full` when the output cap
+  # was reached first, in which case the caller starts the response and
+  # carries on with `stream_request/3`.
   defp pump_request(conn, port, acc) do
     case read_body(conn, length: @read_chunk, read_length: @read_chunk) do
       {:more, chunk, conn} ->
-        Port.command(port, chunk)
+        case feed(port, chunk) do
+          :ok ->
+            case collect_available(port, acc) do
+              {:cont, acc} -> pump_request(conn, port, acc)
+              {:full, acc} -> {:full, conn, acc}
+            end
 
-        case collect_available(port, acc) do
-          {:cont, acc} -> pump_request(conn, port, acc)
-          {:full, acc} -> {:ok, conn, acc}
+          :closed ->
+            # The process has exited; what it wrote is in the mailbox and its
+            # exit status follows it. The rest of the body has no reader.
+            {:done, conn, acc}
         end
 
       {:ok, chunk, conn} ->
-        if chunk != "", do: Port.command(port, chunk)
+        _ = feed(port, chunk)
         # `--stateless-rpc` frames a request with a flush packet, which the
         # client has now sent, so the process can proceed without seeing EOF —
         # which a port cannot signal anyway.
         {_state, acc} = collect_available(port, acc)
-        {:ok, conn, acc}
+        {:done, conn, acc}
 
       {:error, reason} ->
         {:error, conn, {:request_body, reason}}
     end
+  end
+
+  # The response has started because the output cap was reached, but the
+  # client is still sending. Keep feeding the body to the process — abandoning
+  # it would leave `git` waiting for input that never comes, and the client
+  # waiting for a response that never ends — while forwarding output as it
+  # appears so neither side accumulates.
+  #
+  # Both directions have backpressure: `Port.command/2` suspends this process
+  # while the port's queue is busy, and `chunk/2` blocks on the client socket.
+  # Neither can grow without bound, which is the property the output cap
+  # exists to preserve.
+  defp stream_request(conn, port, bytes) do
+    case read_body(conn, length: @read_chunk, read_length: @read_chunk) do
+      {:more, chunk, conn} ->
+        with :ok <- feed(port, chunk),
+             {:ok, conn, bytes} <- forward_available(conn, port, bytes) do
+          stream_request(conn, port, bytes)
+        else
+          :closed -> {:ok, conn, bytes}
+          {:error, conn, reason} -> {:error, conn, reason}
+        end
+
+      {:ok, chunk, conn} ->
+        _ = feed(port, chunk)
+        {:ok, conn, bytes}
+
+      {:error, reason} ->
+        {:error, conn, {:request_body, reason}}
+    end
+  end
+
+  # Only data is taken here. An exit status stays in the mailbox for `drain/3`,
+  # which has to see it after every byte that preceded it.
+  defp forward_available(conn, port, bytes) do
+    receive do
+      {^port, {:data, data}} ->
+        case chunk(conn, data) do
+          {:ok, conn} -> forward_available(conn, port, bytes + byte_size(data))
+          {:error, reason} -> {:error, conn, {:client_gone, reason}}
+        end
+    after
+      0 -> {:ok, conn, bytes}
+    end
+  end
+
+  # Writing to a port whose process has exited raises; that is not an error
+  # here, only the end of anyone listening.
+  defp feed(_port, ""), do: :ok
+
+  defp feed(port, chunk) do
+    Port.command(port, chunk)
+    :ok
+  rescue
+    ArgumentError -> :closed
   end
 
   # Non-blocking: take whatever the process has already written so its pipe

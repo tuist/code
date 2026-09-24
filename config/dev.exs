@@ -9,6 +9,9 @@ config :code,
   # what a single-developer machine wants. A token *with* an account is scoped
   # to it and nothing else — see Code.Auth.Static.
   auth: {Code.Auth.Static, tokens: %{"dev-token" => %{subject: "dev", scopes: [:admin]}}},
+  # The admin API refuses every request when no token is configured, so
+  # development gets a fixed, obviously non-secret one.
+  admin_token: "dev-admin-token",
   git_port: 4000,
   hook_port: 4001,
   admin_port: 4002,

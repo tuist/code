@@ -13,7 +13,8 @@ defmodule Code.Auth.Static do
 
   @impl true
   def authenticate({:bearer, token}, config) do
-    tokens = Keyword.get(config, :tokens, %{})
+    tokens =
+      config |> Keyword.get(:tokens, %{}) |> Enum.reject(fn {token, _attrs} -> Code.Auth.blank?(token) end)
 
     case find_token(tokens, token) do
       nil -> {:error, :invalid_credential}
@@ -25,11 +26,17 @@ defmodule Code.Auth.Static do
   def authenticate(:anonymous, _config), do: {:error, :unauthenticated}
 
   # Compare every candidate so the work done does not depend on which token
-  # matched, or on how early a mismatch occurred.
+  # matched, or on how early a mismatch occurred. A blank candidate matches
+  # nothing, and blank configured tokens were dropped above, so an empty
+  # secret can never be the thing that authenticates a request.
   defp find_token(tokens, candidate) do
-    Enum.reduce(tokens, nil, fn {token, attrs}, acc ->
-      if secure_compare(token, candidate), do: {token, attrs}, else: acc
-    end)
+    if Code.Auth.blank?(candidate) do
+      nil
+    else
+      Enum.reduce(tokens, nil, fn {token, attrs}, acc ->
+        if secure_compare(token, candidate), do: {token, attrs}, else: acc
+      end)
+    end
   end
 
   defp secure_compare(a, b) when byte_size(a) == byte_size(b), do: :crypto.hash_equals(a, b)
@@ -73,27 +80,75 @@ defmodule Code.Auth.Static do
   @doc """
   Parse `CODE_AUTH_TOKENS` into the configuration shape.
 
-  Format is `token=account:permissions` entries separated by commas, e.g.
+  Format is `token=account:permissions` entries separated by semicolons, e.g.
   `sekret=acme:read,write;other=beta:read`.
-  """
-  @spec parse_tokens(String.t()) :: map()
-  def parse_tokens(""), do: %{}
 
-  def parse_tokens(raw) do
+  Errors name the entry by position and never repeat its contents. The value
+  is made of secrets, and a configuration error is exactly the kind of thing
+  that ends up in a crash report, a log aggregator or a CI transcript.
+  """
+  @spec parse_tokens(String.t()) :: {:ok, map()} | {:error, String.t()}
+  def parse_tokens(raw) when is_binary(raw) do
     raw
     |> String.split(";", trim: true)
-    |> Map.new(fn entry ->
-      [token, rest] = String.split(entry, "=", parts: 2)
-      [account, permissions] = String.split(rest, ":", parts: 2)
+    |> Enum.reject(&(String.trim(&1) == ""))
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, %{}}, fn {entry, position}, {:ok, tokens} ->
+      case parse_entry(entry) do
+        {:ok, token, attrs} ->
+          if Map.has_key?(tokens, token) do
+            {:halt, {:error, "CODE_AUTH_TOKENS entry #{position} repeats an earlier token"}}
+          else
+            {:cont, {:ok, Map.put(tokens, token, attrs)}}
+          end
 
-      {String.trim(token),
-       %{
-         account: String.trim(account),
-         scopes:
-           permissions
-           |> String.split(",", trim: true)
-           |> Enum.map(&(String.trim(&1) |> Principal.permission!()))
-       }}
+        {:error, problem} ->
+          {:halt,
+           {:error, "CODE_AUTH_TOKENS entry #{position} #{problem}; expected token=account:permissions"}}
+      end
     end)
+  end
+
+  @doc """
+  Like `parse_tokens/1`, but raises a redacted `ArgumentError`.
+
+  Used from runtime configuration, where raising is how a node refuses to
+  boot with configuration it cannot honour.
+  """
+  @spec parse_tokens!(String.t()) :: map()
+  def parse_tokens!(raw) do
+    case parse_tokens(raw) do
+      {:ok, tokens} -> tokens
+      {:error, message} -> raise ArgumentError, message
+    end
+  end
+
+  defp parse_entry(entry) do
+    with [token, rest] <- String.split(entry, "=", parts: 2),
+         token = String.trim(token),
+         false <- token == "",
+         [account, permissions] <- String.split(rest, ":", parts: 2),
+         account = String.trim(account),
+         false <- account == "",
+         {:ok, scopes} <- parse_permissions(permissions) do
+      {:ok, token, %{account: account, scopes: scopes}}
+    else
+      true -> {:error, "has an empty token or account"}
+      {:error, problem} -> {:error, problem}
+      _ -> {:error, "is malformed"}
+    end
+  end
+
+  defp parse_permissions(permissions) do
+    scopes =
+      permissions
+      |> String.split(",", trim: true)
+      |> Enum.map(&(&1 |> String.trim() |> Principal.permission()))
+
+    cond do
+      scopes == [] -> {:error, "grants no permissions"}
+      Enum.any?(scopes, &is_nil/1) -> {:error, "names an unknown permission"}
+      true -> {:ok, scopes}
+    end
   end
 end

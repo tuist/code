@@ -16,6 +16,8 @@ defmodule Code.HTTP.AuthPlug do
 
   import Plug.Conn
 
+  require Logger
+
   alias Code.Auth
 
   @behaviour Plug
@@ -41,9 +43,71 @@ defmodule Code.HTTP.AuthPlug do
         })
 
       {:error, reason} ->
+        report_rejection(credential, reason)
         assign(conn, :auth_error, reason)
     end
   end
+
+  # Anonymous requests are not failures: `git` always tries without
+  # credentials first and only sends them after a challenge. Everything else
+  # is counted by a bounded reason, and logged, so a misconfigured issuer or
+  # an unreachable authority is visible before users report it.
+  defp report_rejection(:anonymous, :unauthenticated), do: :ok
+
+  defp report_rejection(_credential, reason) do
+    {class, label} = classify(reason)
+    {backend, _config} = Code.Config.auth()
+
+    :telemetry.execute([:code, :auth, :rejected], %{}, %{reason: label})
+
+    metadata = [reason: label, auth_backend: inspect(backend), operation: "authenticate"]
+
+    case class do
+      :server -> Logger.warning("authentication could not be completed", metadata)
+      :client -> Logger.info("credential rejected", metadata)
+    end
+  end
+
+  @doc false
+  # Maps a backend's rejection to a label from a fixed set. The label is a
+  # metric tag, so it must never carry the claim values, key ids or statuses
+  # some reasons wrap. `:server` reasons are the operator's to fix; `:client`
+  # ones are the caller's.
+  @spec classify(term()) :: {:client | :server, String.t()}
+  def classify(:invalid_credential), do: {:client, "invalid_credential"}
+  def classify(:invalid_signature), do: {:client, "invalid_signature"}
+  def classify(:expired), do: {:client, "expired"}
+  def classify(:not_yet_valid), do: {:client, "not_yet_valid"}
+  def classify(:missing_expiry), do: {:client, "missing_expiry"}
+  def classify(:unauthenticated), do: {:client, "unauthenticated"}
+  def classify({:unsupported_algorithm, _}), do: {:client, "unsupported_algorithm"}
+  def classify({:issuer_mismatch, _}), do: {:client, "issuer_mismatch"}
+  def classify({:audience_mismatch, _}), do: {:client, "audience_mismatch"}
+  def classify({:unknown_key, _}), do: {:client, "unknown_key"}
+  def classify(:no_issuer_configured), do: {:server, "misconfigured"}
+  def classify(:no_audience_configured), do: {:server, "misconfigured"}
+  def classify(:authority_unreachable), do: {:server, "authority_unavailable"}
+  def classify({:authority_status, _}), do: {:server, "authority_unavailable"}
+  def classify(:invalid_authority_response), do: {:server, "authority_unavailable"}
+  def classify(:jwks_unavailable), do: {:server, "key_source_unavailable"}
+  def classify(:jwks_timeout), do: {:server, "key_source_unavailable"}
+  def classify({:jwks_status, _}), do: {:server, "key_source_unavailable"}
+  def classify({:discovery_status, _}), do: {:server, "key_source_unavailable"}
+  def classify({:request_failed, _}), do: {:server, "key_source_unavailable"}
+  def classify(%{__exception__: true}), do: {:server, "key_source_unavailable"}
+
+  def classify(reason)
+      when reason in [
+             :empty_jwks,
+             :invalid_jwks,
+             :invalid_discovery_document,
+             :no_jwks_uri_in_discovery,
+             :no_jwks_configured,
+             :insecure_kubernetes_endpoint
+           ],
+      do: {:server, "key_source_unavailable"}
+
+  def classify(_other), do: {:server, "other"}
 
   @doc """
   Ensure the request is authenticated and permitted, or halt.

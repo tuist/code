@@ -35,9 +35,18 @@ defmodule Code.HTTP.GitRouter do
   @impl true
   def call(conn, _opts) do
     case route(conn.method, conn.path_info) do
-      {:advertise, repo_id, service} -> advertise(conn, repo_id, service)
-      {:service, repo_id, service} -> service(conn, repo_id, service)
-      :not_found -> send_resp(conn, 404, "code: not a git endpoint\n")
+      {kind, repo_id, service} when kind in [:advertise, :service] ->
+        # Validated before authorization, so a malformed id is answered as the
+        # repository it cannot be (404) rather than reaching policy lookup,
+        # which would read an object key derived from it.
+        cond do
+          not Code.WAL.valid_id?(repo_id) -> send_resp(conn, 404, "code: repository not found\n")
+          kind == :advertise -> advertise(conn, repo_id, service)
+          true -> service(conn, repo_id, service)
+        end
+
+      :not_found ->
+        send_resp(conn, 404, "code: not a git endpoint\n")
     end
   end
 
