@@ -19,9 +19,12 @@ configure_git_auth() {
     'printf "%s\\n" "$*" >>"$CODE_TEST_GIT_LOG"' >"$bin/git"
   chmod +x "$bin/git"
 
+  # Like the real curl with `--data-binary @-`, the stub reads the request
+  # body before answering. Exiting without reading it races the script's
+  # `jq | curl` pipeline, and under pipefail a lost race is a broken pipe.
   printf '%s\n' '#!/usr/bin/env bash' \
     'if [ "$1" = "--fail" ] && [ "$2" = "--silent" ]; then' \
-    '  for argument in "$@"; do [ "$argument" = "POST" ] && { cat "$CODE_TEST_REGISTRATION"; exit 0; }; done' \
+    '  for argument in "$@"; do [ "$argument" = "POST" ] && { cat >/dev/null; cat "$CODE_TEST_REGISTRATION"; exit 0; }; done' \
     'fi' \
     'cat "$CODE_TEST_METADATA"' >"$bin/curl"
   chmod +x "$bin/curl"
@@ -109,4 +112,5 @@ username=oauth2'
     The status should not equal 0
     The stderr should include 'requires --dynamic-registration'
   End
+
 End
