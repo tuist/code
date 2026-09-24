@@ -72,13 +72,19 @@ defmodule Code.Ingest.Writer do
   # How many pushes may be waiting on one repository's writer.
   #
   # Group commit means a healthy writer drains whatever has arrived in a single
-  # round trip, so this is never reached in normal operation. It is reached
-  # when the object store stalls: the writer blocks in one batch for minutes
-  # while every subsequent push queues behind it, and without a limit the queue
-  # is bounded only by how fast clients can push. Refusing is better than
-  # queueing indefinitely — a client told to retry will, and a client whose
-  # request is silently held for four minutes has already given up.
-  @max_queued 256
+  # round trip, so the limit (`Code.Config.writer_max_queued/0`, 256 by
+  # default) is never reached in normal operation. It is reached when the
+  # object store stalls: the writer blocks in one batch for minutes while every
+  # subsequent push queues behind it, and without a limit the queue is bounded
+  # only by how fast clients can push. Refusing is better than queueing
+  # indefinitely — a client told to retry will, and a client whose request is
+  # silently held for four minutes has already given up.
+  #
+  # The limit is enforced by callers, before they send anything, against an
+  # atomic counter the writer publishes in its registry entry. Checking it
+  # inside the writer does not work: during a stall the writer is blocked in
+  # the batch it is committing, so it never gets to look at the calls piling up
+  # in its mailbox.
 
   @type prepared :: WAL.prepared()
 
@@ -88,6 +94,10 @@ defmodule Code.Ingest.Writer do
   Routed to the repository's preferred writer when one is reachable, and
   handled locally otherwise. Returns the epoch and sequence number the entry
   was assigned.
+
+  Returns `{:error, :writer_overloaded}` when too many pushes are already
+  waiting, and `{:error, :writer_timeout}` when no answer arrived in time. The
+  second is not a rejection: the entry may still commit.
   """
   @spec commit(String.t(), prepared(), keyword()) :: {:ok, map()} | {:error, term()}
   def commit(repo_id, prepared, opts \\ []) do
@@ -104,15 +114,27 @@ defmodule Code.Ingest.Writer do
     :erpc.call(target, __MODULE__, :local_commit, [repo_id, prepared, timeout], timeout + 5_000)
   rescue
     error ->
-      Logger.debug("writer on #{target} unavailable (#{inspect(error)}); committing locally")
+      fall_back(repo_id, :exception, error)
       local_commit(repo_id, prepared, timeout)
   catch
     :exit, reason ->
       # The preferred writer is gone or unreachable. Committing here is not a
       # fallback that risks anything: the compare-and-swap is what actually
       # orders pushes, and it does not care which node performs it.
-      Logger.debug("writer on #{target} unreachable (#{inspect(reason)}); committing locally")
+      fall_back(repo_id, :exit, reason)
       local_commit(repo_id, prepared, timeout)
+  end
+
+  # Expected during a rolling deploy, so info rather than warning, but counted:
+  # a sustained rate outside a rollout means routing is not taking effect.
+  defp fall_back(repo_id, kind, reason) do
+    :telemetry.execute([:code, :writer, :fallback], %{count: 1}, %{reason: kind})
+
+    Logger.info("preferred writer unavailable; committing locally",
+      repo_id: repo_id,
+      reason: kind,
+      detail: inspect(reason, limit: 5, printable_limit: 200)
+    )
   end
 
   @doc false
@@ -120,7 +142,8 @@ defmodule Code.Ingest.Writer do
   def local_commit(repo_id, prepared, timeout), do: local_commit(repo_id, prepared, timeout, 1)
 
   defp local_commit(repo_id, prepared, timeout, attempt) do
-    with {:ok, pid} <- ensure_started(repo_id) do
+    with {:ok, pid, admission} <- lookup_or_start(repo_id),
+         :ok <- admit(repo_id, admission) do
       try do
         GenServer.call(pid, {:commit, prepared}, timeout)
       catch
@@ -134,15 +157,49 @@ defmodule Code.Ingest.Writer do
           else
             {:error, :writer_unavailable}
           end
+
+        # Not retried, and not reported as a rejection: the request is still in
+        # the writer's queue and may yet commit. The caller learns the outcome
+        # is unknown, which is the truth. Packs and entries are content
+        # addressed, so a client retrying the push is safe either way.
+        :exit, {:timeout, _details} ->
+          :telemetry.execute([:code, :writer, :timeout], %{count: 1}, %{})
+
+          Logger.warning("timed out waiting for the repository writer",
+            repo_id: repo_id,
+            timeout_ms: timeout
+          )
+
+          {:error, :writer_timeout}
       end
+    end
+  end
+
+  # Admission happens here, in the caller, so it works while the writer is
+  # blocked. The counter is incremented before the call is sent and decremented
+  # by the writer once it has replied, which also accounts for callers that
+  # time out or die: their requests are still in the mailbox and still get a
+  # reply. A writer that crashes takes its counter with it, and its successor
+  # starts from zero.
+  defp admit(repo_id, {counter, limit}) do
+    if :atomics.add_get(counter, 1, 1) > limit do
+      :atomics.sub(counter, 1, 1)
+      :telemetry.execute([:code, :push, :rejected], %{}, %{repo_id: repo_id, reason: :overloaded})
+      {:error, :writer_overloaded}
+    else
+      :ok
     end
   end
 
   @spec ensure_started(String.t()) :: {:ok, pid()} | {:error, term()}
   def ensure_started(repo_id) do
+    with {:ok, pid, _admission} <- lookup_or_start(repo_id), do: {:ok, pid}
+  end
+
+  defp lookup_or_start(repo_id) do
     case Registry.lookup(@registry, repo_id) do
-      [{pid, _}] when is_pid(pid) ->
-        if Process.alive?(pid), do: {:ok, pid}, else: start(repo_id)
+      [{pid, admission}] when is_pid(pid) ->
+        if Process.alive?(pid), do: {:ok, pid, admission}, else: start(repo_id)
 
       _ ->
         start(repo_id)
@@ -151,9 +208,16 @@ defmodule Code.Ingest.Writer do
 
   defp start(repo_id) do
     case DynamicSupervisor.start_child(@supervisor, {__MODULE__, {repo_id, Code.Config.overrides()}}) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
+      {:ok, _pid} -> registered(repo_id)
+      {:error, {:already_started, _pid}} -> registered(repo_id)
       error -> error
+    end
+  end
+
+  defp registered(repo_id) do
+    case Registry.lookup(@registry, repo_id) do
+      [{pid, admission}] -> {:ok, pid, admission}
+      [] -> {:error, :writer_unavailable}
     end
   end
 
@@ -170,7 +234,15 @@ defmodule Code.Ingest.Writer do
 
   @doc false
   def start_link({repo_id, overrides}) do
-    GenServer.start_link(__MODULE__, {repo_id, overrides}, name: {:via, Registry, {@registry, repo_id}})
+    # The admission counter lives in the registry value, so a caller can find
+    # and check it without sending the writer a message. This runs in the
+    # supervisor, so a test's limit arrives through the overrides it passed.
+    limit = Map.get(overrides, :writer_max_queued) || Code.Config.writer_max_queued()
+    admission = {:atomics.new(1, signed: true), limit}
+
+    GenServer.start_link(__MODULE__, {repo_id, overrides, admission},
+      name: {:via, Registry, {@registry, repo_id, admission}}
+    )
   end
 
   @doc "How many entries the last batch contained. Diagnostic."
@@ -185,23 +257,19 @@ defmodule Code.Ingest.Writer do
   # ----------------------------------------------------------------------
 
   @impl true
-  def init({repo_id, overrides}) do
+  def init({repo_id, overrides, {counter, _limit}}) do
     if map_size(overrides) > 0, do: Code.Config.put_overrides(overrides)
-    {:ok, %{repo_id: repo_id, pending: [], queued: 0, last_batch_size: 0}}
+    {:ok, %{repo_id: repo_id, counter: counter, pending: [], queued: 0, last_batch_size: 0}}
   end
 
   @impl true
   def handle_call({:commit, prepared}, from, state) do
-    if state.queued >= @max_queued do
-      :telemetry.execute([:code, :push, :rejected], %{}, %{repo_id: state.repo_id, reason: :overloaded})
-      {:reply, {:error, :writer_overloaded}, state}
-    else
-      # Queue and return without replying. The reply comes after the batch this
-      # request lands in has been committed.
-      state = %{state | pending: [{from, prepared} | state.pending], queued: state.queued + 1}
-      if state.queued == 1, do: send(self(), :flush)
-      {:noreply, state}
-    end
+    # Queue and return without replying. The reply comes after the batch this
+    # request lands in has been committed. Admission was already decided by
+    # the caller; see `admit/2`.
+    state = %{state | pending: [{from, prepared} | state.pending], queued: state.queued + 1}
+    if state.queued == 1, do: send(self(), :flush)
+    {:noreply, state}
   end
 
   def handle_call(:last_batch_size, _from, state), do: {:reply, state.last_batch_size, state}
@@ -224,6 +292,10 @@ defmodule Code.Ingest.Writer do
       {:error, reason} ->
         Enum.each(froms, &GenServer.reply(&1, {:error, reason}))
     end
+
+    # Every request in the batch has been answered, so none of them counts
+    # against admission any longer.
+    :atomics.sub(state.counter, 1, length(batch))
 
     # No re-arming needed. Requests that arrived during the commit are still
     # sitting in the mailbox as calls, and the first one handled will find an

@@ -152,6 +152,10 @@ defmodule Code.Config do
   @spec maintenance_sweep_ms() :: pos_integer()
   def maintenance_sweep_ms, do: get(:maintenance_sweep_ms, :timer.minutes(5))
 
+  @doc "How many pushes may wait on one repository's writer; see `Code.Ingest.Writer`."
+  @spec writer_max_queued() :: pos_integer()
+  def writer_max_queued, do: get(:writer_max_queued, 256)
+
   @doc "Evict a repository from local disk after this long without traffic."
   @spec idle_eviction_ms() :: pos_integer()
   def idle_eviction_ms, do: get(:idle_eviction_ms, :timer.hours(1))
