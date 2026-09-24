@@ -67,7 +67,7 @@ defmodule Code.HTTP.WorkRunsRouter do
   end
 
   post "/:run/nodes/:node/expire" do
-    with_run(conn, run, :admin, fn repo_id, _principal -> Factory.expire(repo_id, run, node) end)
+    with_run(conn, run, :admin, fn repo_id, principal -> Factory.expire(repo_id, run, node, principal) end)
   end
 
   post "/:run/cancel" do

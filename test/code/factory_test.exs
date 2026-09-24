@@ -407,7 +407,12 @@ defmodule Code.FactoryTest do
   } do
     assert {:ok, run} = Factory.create(repo, one_node_graph(), %{base_commit: base_commit()}, principal)
     assert {:ok, claimed} = Factory.claim(repo, run.id, "pod-a", principal)
-    assert {:ok, %{status: "cancelled"}} = Factory.cancel(repo, run.id, principal)
+    assert {:ok, %{status: "cancelled", nodes: [node]}} = Factory.cancel(repo, run.id, principal)
+
+    # The run is over, so the node no longer claims to be running, but it
+    # still names the attempt whose late result is retained below.
+    assert node["status"] == "abandoned"
+    assert node["attempt_id"] == claimed.attempt["id"]
 
     assert {:ok, rejected} =
              Factory.complete(
@@ -463,7 +468,10 @@ defmodule Code.FactoryTest do
 
     assert {:ok, claimed} = Factory.claim(repo, run.id, "pod-a", principal)
     Process.sleep(1_050)
-    assert {:ok, %{status: "active"}} = Factory.expire(repo, run.id, "work")
+    assert {:ok, %{status: "active"}} = Factory.expire(repo, run.id, "work", principal)
+    assert {:ok, %{events: [expired]}} = Factory.events(repo, run.id, 2)
+    assert expired["type"] == "attempt_expired"
+    assert expired["actor"] == %{"subject" => principal.subject, "account" => principal.account}
 
     assert {:ok, late} =
              Factory.complete(repo, run.id, "work", claimed.attempt["id"], "succeeded", [], principal)
@@ -506,6 +514,40 @@ defmodule Code.FactoryTest do
     assert failed.nodes |> Enum.find(&(&1["id"] == "second")) |> Map.fetch!("status") == "skipped"
   end
 
+  test "marks a still-running sibling abandoned when the run fails, and rejects its late result", %{
+    repo: repo,
+    principal: principal
+  } do
+    graph = %{
+      "nodes" => [
+        %{"id" => "first", "title" => "First"},
+        %{"id" => "second", "title" => "Second"},
+        %{"id" => "third", "title" => "Third", "depends_on" => ["first"]}
+      ]
+    }
+
+    assert {:ok, run} = Factory.create(repo, graph, %{base_commit: base_commit()}, principal)
+    assert {:ok, first} = Factory.claim(repo, run.id, "pod-a", principal)
+    assert {:ok, second} = Factory.claim(repo, run.id, "pod-b", principal)
+
+    assert {:ok, failed} =
+             Factory.complete(repo, run.id, "first", first.attempt["id"], "failed", [], principal)
+
+    assert failed.status == "failed"
+
+    assert Map.new(failed.nodes, &{&1["id"], &1["status"]}) == %{
+             "first" => "failed",
+             "second" => "abandoned",
+             "third" => "skipped"
+           }
+
+    assert {:ok, late} =
+             Factory.complete(repo, run.id, "second", second.attempt["id"], "succeeded", [], principal)
+
+    refute late.accepted
+    assert {:ok, %{result: %{"outcome" => "succeeded"}}} = Factory.attempt(repo, run.id, second.attempt["id"])
+  end
+
   test "replays an accepted result without appending a second event", %{repo: repo, principal: principal} do
     assert {:ok, run} = Factory.create(repo, one_node_graph(), %{base_commit: base_commit()}, principal)
     assert {:ok, claimed} = Factory.claim(repo, run.id, "pod-a", principal)
@@ -514,11 +556,16 @@ defmodule Code.FactoryTest do
              Factory.complete(repo, run.id, "work", claimed.attempt["id"], "succeeded", [], principal)
 
     assert accepted.accepted
+    Process.sleep(5)
 
     assert {:ok, replay} =
              Factory.complete(repo, run.id, "work", claimed.attempt["id"], "succeeded", [], principal)
 
     assert replay.accepted
+    # A replay answers with the stored record, not a freshly stamped copy.
+    assert replay.result == accepted.result
+    assert {:ok, %{result: stored}} = Factory.attempt(repo, run.id, claimed.attempt["id"])
+    assert replay.result == stored
     assert {:ok, %{events: events}} = Factory.events(repo, run.id)
     assert Enum.map(events, & &1["type"]) == ["work_run_created", "node_claimed", "attempt_succeeded"]
   end

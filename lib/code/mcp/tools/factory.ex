@@ -217,7 +217,7 @@ defmodule Code.MCP.Tools.Factory do
     repo_id = args["repository"]
 
     with :ok <- Support.authorize(principal, repo_id, :admin),
-         do: Factory.expire(repo_id, args["run"], args["node"])
+         do: Factory.expire(repo_id, args["run"], args["node"], principal)
   end
 
   def call("get_work_attempt", args, principal, _opts) do

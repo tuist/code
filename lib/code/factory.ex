@@ -221,7 +221,7 @@ defmodule Code.Factory do
     with :ok <- run_id(run_id) do
       transition(repo_id, run_id, fn _manifest, state ->
         with :ok <- active(state) do
-          {:ok, Map.put(state, "status", "cancelled"), {"work_run_cancelled", actor(principal), %{}, %{}}}
+          {:ok, terminate(state, "cancelled"), {"work_run_cancelled", actor(principal), %{}, %{}}}
         end
       end)
     end
@@ -278,13 +278,20 @@ defmodule Code.Factory do
     end
   end
 
-  @doc "Requeue one stale running node. Expiry is advisory and never invalidates accepted evidence."
-  @spec expire(String.t(), String.t(), String.t()) :: result()
-  def expire(repo_id, run_id, node_id) do
-    observe(:expire, fn -> do_expire(repo_id, run_id, node_id) end)
+  @doc """
+  Requeue one stale running node. Expiry is advisory and never invalidates
+  accepted evidence. The event records the principal that expired the lease,
+  whether an operator or an automated reconciler.
+  """
+  @spec expire(String.t(), String.t(), String.t(), Principal.t()) :: result()
+  def expire(repo_id, run_id, node_id, %Principal{} = principal) do
+    observe(:expire, fn -> do_expire(repo_id, run_id, node_id, principal) end)
   end
 
-  defp do_expire(repo_id, run_id, node_id) do
+  def expire(_repo_id, _run_id, _node_id, _principal),
+    do: {:error, ServiceError.invalid("lease expiry requires an authenticated principal")}
+
+  defp do_expire(repo_id, run_id, node_id, principal) do
     with :ok <- run_id(run_id),
          :ok <- node_id(node_id) do
       transition(repo_id, run_id, fn _manifest, state ->
@@ -304,8 +311,7 @@ defmodule Code.Factory do
             |> Map.delete("claimed_by")
 
           {:ok, put_node(state, node_id, updated_node),
-           {"attempt_expired", %{"subject" => "code/factory"}, %{"node" => node_id, "attempt" => attempt_id},
-            %{}}}
+           {"attempt_expired", actor(principal), %{"node" => node_id, "attempt" => attempt_id}, %{}}}
         end
       end)
     end
@@ -378,9 +384,11 @@ defmodule Code.Factory do
         "recorded_by" => actor(completion.principal)
       }
 
+      # On a replay the stored result wins, so the caller sees the original
+      # `recorded_at_ms` and `recorded_by` rather than this request's values.
       case put_result(completion.repo_id, completion.run_id, completion.attempt_id, result) do
-        :ok ->
-          finalize_attempt(state, manifest, node, completion, result, disposition)
+        {:ok, stored} ->
+          finalize_attempt(state, manifest, node, completion, stored, disposition)
 
         {:error, reason} ->
           {:error, error_message(reason)}
@@ -680,27 +688,34 @@ defmodule Code.Factory do
         Map.put(state, "status", "succeeded")
 
       Enum.any?(statuses, &(&1 == "failed")) ->
-        state
-        |> Map.put("status", "failed")
-        |> skip_unstarted_nodes()
+        terminate(state, "failed")
 
       true ->
         state
     end
   end
 
-  defp skip_unstarted_nodes(state) do
+  # A terminal run leaves no node looking as if it could still progress.
+  # Unstarted nodes become `skipped`. A node whose attempt is still out
+  # becomes `abandoned`: it keeps its attempt id, executor and claimant, so
+  # that attempt's late result is still recognized, retained as evidence, and
+  # rejected rather than reported as belonging to nobody.
+  defp terminate(state, status) do
     nodes =
       Map.new(state["nodes"], fn {id, node} ->
-        skipped =
-          if node["status"] in ["pending", "ready", "waiting"],
-            do: Map.put(node, "status", "skipped"),
-            else: node
+        node =
+          case node["status"] do
+            unstarted when unstarted in ["pending", "ready", "waiting"] -> Map.put(node, "status", "skipped")
+            "running" -> Map.put(node, "status", "abandoned")
+            _finished -> node
+          end
 
-        {id, skipped}
+        {id, node}
       end)
 
-    Map.put(state, "nodes", nodes)
+    state
+    |> Map.put("status", status)
+    |> Map.put("nodes", nodes)
   end
 
   defp claimed_attempt(completion) do
@@ -725,7 +740,7 @@ defmodule Code.Factory do
       attempt_id in attempt_ids(node, "rejected_result_attempt_ids") ->
         {:ok, :rejected}
 
-      node["status"] == "running" and node["attempt_id"] == attempt_id ->
+      node["status"] in ["running", "abandoned"] and node["attempt_id"] == attempt_id ->
         {:ok, :current}
 
       attempt_id in attempt_ids(node, "expired_attempt_ids") ->
@@ -921,12 +936,12 @@ defmodule Code.Factory do
   defp put_result(repo_id, run_id, attempt_id, result) do
     case put_immutable(result_key(repo_id, run_id, attempt_id), result) do
       {:ok, _etag} ->
-        :ok
+        {:ok, result}
 
       {:error, :precondition_failed} ->
         with {:ok, existing} <- read_json(result_key(repo_id, run_id, attempt_id)),
              true <- same_result?(existing, result) do
-          :ok
+          {:ok, existing}
         else
           false -> {:error, ServiceError.conflict("attempt #{attempt_id} already has a different result")}
           {:error, reason} -> {:error, storage_error("could not read prior attempt result", reason)}

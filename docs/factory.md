@@ -194,10 +194,15 @@ Leases are advisory. Each immutable claim records its expiry time, and an
 authorized reconciler can requeue a running node after that deadline. It never
 deletes the old claim or result. A worker that reports after requeue has its
 immutable result retained as rejected evidence, rather than silently losing it.
+The `attempt_expired` event records the verified principal that requested the
+expiry, whether an operator or an automated reconciler.
 
-If a node fails, the work run becomes failed, and nodes that have not started
-are marked `skipped`. A still-running sibling may report evidence, but cannot
-change the terminal outcome.
+If a node fails, the work run becomes failed. When a run becomes failed or is
+cancelled, no node is left looking as if it could still progress: nodes that
+have not started are marked `skipped`, and a node whose attempt is still out is
+marked `abandoned`. An abandoned node keeps its attempt id, executor, and
+claimant, so the attempt may still report evidence, which is retained as
+rejected and cannot change the terminal outcome.
 
 ## Observation and control
 
@@ -220,7 +225,9 @@ run is retained as immutable rejected evidence and never becomes the node's
 accepted result.
 
 Completion is replay-safe: resubmitting the same attempt result returns its
-original accepted or rejected disposition without adding another event.
+original accepted or rejected disposition, and the stored result record
+(including its original `recorded_at_ms` and `recorded_by`), without adding
+another event.
 
 The [Model Context Protocol](https://modelcontextprotocol.io/) exposes the same
 contract through `create_work_run`, `list_work_runs`, `get_work_run`,

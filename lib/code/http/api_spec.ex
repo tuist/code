@@ -457,7 +457,7 @@ defmodule Code.HTTP.ApiSpec do
         depends_on: %Schema{type: :array, items: %Schema{type: :string}},
         status: %Schema{
           type: :string,
-          enum: ["pending", "ready", "waiting", "running", "succeeded", "failed", "skipped"]
+          enum: ["pending", "ready", "waiting", "running", "succeeded", "failed", "skipped", "abandoned"]
         },
         attempts: %Schema{type: :integer, minimum: 0},
         attempt_id: %Schema{type: :string},
