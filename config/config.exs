@@ -17,6 +17,13 @@ config :logger, :console,
     :duration_us,
     :packs,
     :bytes,
+    :subcommand,
+    :stderr,
+    :pack,
+    :entries,
+    :failed,
+    :deleted,
+    :missing,
     :otel_trace_id,
     :otel_span_id
   ]

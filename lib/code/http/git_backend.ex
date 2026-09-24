@@ -218,7 +218,13 @@ defmodule Code.HTTP.GitBackend do
     repo_id = Keyword.get(opts, :repo_id)
     command = String.replace_prefix(service, "git-", "")
 
-    case Git.run(repo_path, [command, "--stateless-rpc", "--advertise-refs", repo_path], env: env) do
+    # Standard error is kept out of the body: the body is pkt-line framed
+    # protocol data, and a single warning line interleaved into it corrupts
+    # the framing for the client. It is logged instead.
+    case Git.run(repo_path, [command, "--stateless-rpc", "--advertise-refs", repo_path],
+           env: env,
+           stderr: :separate
+         ) do
       {:ok, advertisement} ->
         body =
           if protocol_v2?(env) do
