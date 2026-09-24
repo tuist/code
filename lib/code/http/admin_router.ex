@@ -98,8 +98,31 @@ defmodule Code.HTTP.AdminRouter do
     repo_id = Enum.join(conn.path_params["repo"], "/")
 
     case Control.delete_repository(repo_id) do
-      :ok -> send_json(conn, 204, nil)
-      {:error, reason} -> send_json(conn, 500, %{error: inspect(reason)})
+      :ok ->
+        send_json(conn, 204, nil)
+
+      {:error, :not_found} ->
+        send_json(conn, 404, %{error: "repository not found"})
+
+      {:error, {:invalid_repo_id, _}} ->
+        send_json(conn, 404, %{error: "repository not found"})
+
+      # The tombstone is down, so the repository is gone for every reader and
+      # writer; some objects are left, and repeating the request resumes.
+      {:error, {:partial_cleanup, remaining}} ->
+        conn
+        |> put_resp_header("retry-after", "5")
+        |> send_json(503, %{
+          error: "repository deleted, but #{remaining} object(s) remain; retry to finish cleanup"
+        })
+
+      {:error, :cas_exhausted} ->
+        conn
+        |> put_resp_header("retry-after", "1")
+        |> send_json(503, %{error: "the repository changed concurrently; retry"})
+
+      {:error, reason} ->
+        send_json(conn, 500, %{error: inspect(reason)})
     end
   end
 

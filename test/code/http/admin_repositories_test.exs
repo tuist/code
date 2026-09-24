@@ -49,6 +49,21 @@ defmodule Code.HTTP.AdminRepositoriesTest do
     assert {:ok, %{replicas: 2}, _} = WAL.fetch(repo)
   end
 
+  test "deletes a repository, and answers 404 for a missing, invalid or parent id", %{repo: repo} do
+    assert request(:post, "/repositories", %{repository: repo}).status == 201
+    [account, _] = String.split(repo, "/", parts: 2)
+
+    # The account prefix is not a repository; deleting it must not reach the
+    # repository underneath.
+    assert request(:delete, "/repositories/#{account}", %{}).status == 404
+    assert {:ok, _, _} = WAL.fetch(repo)
+
+    assert request(:delete, "/repositories/#{repo}", %{}).status == 204
+    assert {:error, :not_found} = WAL.fetch(repo)
+    assert request(:delete, "/repositories/#{repo}", %{}).status == 404
+    assert request(:delete, "/repositories/#{account}/..", %{}).status == 404
+  end
+
   defp request(method, path, payload) do
     method
     |> conn(path, JSON.encode!(payload))

@@ -373,7 +373,17 @@ curl -XPOST :4002/repositories -d '{"repository":"acme/app"}'
 curl -XPOST :4002/compact/acme/app           # run on the preferred maintenance node
 curl -XPOST :4002/evict/acme/app             # drop the local cache
 curl -XPUT  :4002/replicas/acme/app -d '{"replicas":30}'
+curl -XDELETE :4002/repositories/acme/app    # irreversible; see below
 ```
+
+Replica counts must be integers from 1 to 256; anything else is a `422`, and a
+missing repository is a `404`. `DELETE /repositories/<id>` answers `204` when
+everything is gone, `404` for an id that is not a repository (including an
+account prefix such as `acme`, which never deletes the repositories under it),
+and `503` with `Retry-After` when the repository is tombstoned but some objects
+remain. Repeating the request finishes the cleanup. A `503` with `Retry-After`
+also means a conditional write lost its retries to concurrent writers; the
+request was valid and can be repeated as is.
 
 `POST /compact/<id>` can be sent to any node. It is forwarded to the node that
 rendezvous hashing prefers among those with the `maintain` role, which is not
@@ -482,7 +492,9 @@ Object storage only grows. Nothing in Code deletes an object except
 exactly the objects it owns — never a nested repository's, which share its
 prefix (see `docs/architecture.md`, *Deleting a repository*). If some deletions
 fail it reports `partial_cleanup` with the number left, keeps refusing writes,
-and resumes when called again.
+and resumes when called again. While a deletion is in progress or stopped
+there, `GET /repositories` and MCP `list_repositories` leave the repository
+out.
 That is a deliberate consequence of the provenance guarantee — every state a
 repository has been in stays reconstructible — but it is a cost, and it is
 worth understanding before it surprises you.
