@@ -43,6 +43,9 @@ defmodule Code.Application do
         {Task.Supervisor, name: Code.TaskSupervisor},
         object_store_children(),
         {Registry, keys: :unique, name: Code.ReplicaRegistry},
+        # Work running against a local repository outside its replica process,
+        # so eviction and pack pruning can wait for it. See Code.Replica.Lease.
+        {Registry, keys: :duplicate, name: Code.LeaseRegistry},
         {DynamicSupervisor, strategy: :one_for_one, name: Code.ReplicaSupervisor},
         # One writer per repository, batching its index updates.
         {Registry, keys: :unique, name: Code.WriterRegistry},
@@ -93,7 +96,7 @@ defmodule Code.Application do
           []
         end
 
-      (ports ++ [{"admin and metrics", Config.admin_port(), "CODE_ADMIN_PORT", []}])
+      (ports ++ [{"admin and metrics", Config.admin_port(), "CODE_ADMIN_PORT", admin_ip()}])
       |> Enum.each(fn {purpose, port, variable, options} ->
         # Deliberately without `reuseaddr`: it would let this bind succeed
         # alongside the very listener we are trying to detect, which is the
@@ -192,20 +195,41 @@ defmodule Code.Application do
 
       # Operations: health, readiness, metrics, repository administration.
       public_listeners ++
-        [listener(Code.HTTP.Admin, plug: Code.HTTP.AdminRouter, port: Config.admin_port())]
+        [listener(Code.HTTP.Admin, [plug: Code.HTTP.AdminRouter, port: Config.admin_port()] ++ admin_ip())]
     else
       []
+    end
+  end
+
+  # Unset means all interfaces, which Kubernetes needs to probe the pod IP.
+  defp admin_ip do
+    case Config.admin_ip() do
+      nil -> []
+      ip -> [ip: ip]
     end
   end
 
   # Bandit owns its listener's registered name, so the supervisor id is the only
   # thing we set. Live connections are counted from Bandit's telemetry instead
   # of by inspecting the listener; see `Code.Telemetry.InFlight`.
-  defp listener(name, opts) do
+  #
+  # Every listener drains for `Config.shutdown_timeout_ms/0` on shutdown.
+  # Thousand Island's own default is 15 seconds, so without this a rolling
+  # update cut off every clone longer than that however generous the pod's
+  # grace period was.
+  @doc false
+  @spec listener(atom(), keyword()) :: Supervisor.child_spec()
+  def listener(name, opts) do
+    thousand_island_options =
+      opts
+      |> Keyword.get(:thousand_island_options, [])
+      |> Keyword.put(:shutdown_timeout, Config.shutdown_timeout_ms())
+
     opts =
       opts
       |> Keyword.put(:scheme, :http)
       |> Keyword.put(:startup_log, false)
+      |> Keyword.put(:thousand_island_options, thousand_island_options)
 
     Supervisor.child_spec({Bandit, opts}, id: name)
   end

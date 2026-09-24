@@ -79,6 +79,54 @@ defmodule Code.MaintenanceTest do
     assert {:ok, %{epoch: 2, seq: 1}} = Maintenance.run(repo, :compact, scheduler: scheduler)
   end
 
+  describe "observability" do
+    setup %{repo: repo} do
+      handler = {__MODULE__, :maintenance_job, self()}
+      parent = self()
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:code, :maintenance, :job],
+          fn _event, measurements, meta, _config ->
+            # Other tests run maintenance concurrently; only this repository's
+            # jobs are this test's.
+            if meta.repo_id == repo, do: send(parent, {:maintenance_job, measurements, meta})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      :ok
+    end
+
+    test "every job reports a bounded outcome and its latency", %{repo: repo} do
+      start_replica_runtime()
+      assert {:ok, _} = Code.Control.create_repository(repo)
+      scheduler = start_maintenance_scheduler()
+
+      assert :not_due = Maintenance.run(repo, :lookup, mode: :if_due, scheduler: scheduler)
+
+      assert_receive {:maintenance_job, %{duration_us: duration}, meta}
+      assert is_integer(duration) and duration >= 0
+      assert %{kind: :lookup, mode: :if_due, outcome: :not_due} = meta
+    end
+
+    test "a failing job is counted even though nobody asked for its result", %{repo: repo} do
+      # Never created, so the job fails. A sweep-scheduled job has no waiter,
+      # which is why the job itself must report this.
+      Maintenance.observe(repo, :compact, :if_due, {:error, :not_found}, 5)
+
+      assert_receive {:maintenance_job, %{duration_us: 5}, %{kind: :compact, outcome: :error}}
+    end
+
+    test "a crash is reported with its own outcome", %{repo: repo} do
+      Maintenance.observe(repo, :compact, :if_due, {:crashed, :killed}, 5)
+
+      assert_receive {:maintenance_job, _measurements, %{outcome: :crashed}}
+    end
+  end
+
   defp start_maintenance_scheduler do
     overrides = Map.put(Config.overrides(), :roles, [:maintain])
     Config.put_overrides(overrides)

@@ -38,4 +38,26 @@ defmodule Code.HTTP.GitRouterTest do
     assert conn.resp_body ==
              "code: expected application/x-git-receive-pack-request, got text/plain\n"
   end
+
+  test "an invalid repository id is not found, before authentication or policy", %{namespace: namespace} do
+    # Validated ahead of authorization, so a malformed id never reaches the
+    # policy lookup (which derives an object key from its account) and is
+    # never answered with a challenge that implies it might exist.
+    for path <- [
+          "/.hidden/app.git/info/refs?service=git-upload-pack",
+          "/#{namespace}/-dash.git/info/refs?service=git-upload-pack",
+          "/#{namespace}/a..b.git/info/refs?service=git-upload-pack"
+        ] do
+      conn = conn(:get, path) |> Router.call(Router.init([]))
+      assert conn.status == 404, path
+      assert conn.resp_body == "code: repository not found\n"
+    end
+
+    conn =
+      conn(:post, "/.hidden/app.git/git-upload-pack", "")
+      |> put_req_header("content-type", "application/x-git-upload-pack-request")
+      |> Router.call(Router.init([]))
+
+    assert conn.status == 404
+  end
 end

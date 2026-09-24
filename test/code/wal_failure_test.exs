@@ -146,6 +146,78 @@ defmodule Code.WALFailureTest do
     end
   end
 
+  describe "a transport error on the compare-and-swap" do
+    # The failure shape the S3 client actually produces when a response is
+    # lost: the request reached the store, the store applied it, and the
+    # client saw the connection time out. Nothing about it says "rejected".
+    defp lose_response_after_applying(committed) do
+      stub(ObjectStore, :put, fn key, body, opts ->
+        cas? = String.ends_with?(key, "index.pb") and Keyword.has_key?(opts, :if_match)
+
+        if cas? and :counters.get(committed, 1) == 0 do
+          :counters.add(committed, 1, 1)
+          {:ok, _} = Mimic.call_original(ObjectStore, :put, [key, body, opts])
+          {:error, %Req.TransportError{reason: :timeout}}
+        else
+          Mimic.call_original(ObjectStore, :put, [key, body, opts])
+        end
+      end)
+    end
+
+    test "a single append that landed is reported as committed", %{repo: repo} do
+      {:ok, _} = WAL.create(repo)
+      lose_response_after_applying(:counters.new(1, []))
+
+      assert {:ok, %{seq: 1}} = WAL.append(repo, fn _index -> {:ok, push_entry()} end)
+
+      {:ok, index, _etag} = WAL.fetch(repo)
+      assert index.seq == 1
+      assert length(index.entries) == 1
+    end
+
+    test "a group commit that landed is reported as committed, once", %{repo: repo} do
+      {:ok, _} = WAL.create(repo)
+
+      entries = [
+        push_entry(),
+        Entry.new(
+          type: :ENTRY_TYPE_PUSH,
+          commands: [Entry.command("refs/heads/other", Entry.zero_oid(), String.duplicate("b", 40))]
+        )
+      ]
+
+      prepared =
+        Enum.map(entries, fn entry ->
+          {:ok, item} = WAL.prepare(repo, entry, fn _index -> :ok end)
+          item
+        end)
+
+      lose_response_after_applying(:counters.new(1, []))
+
+      assert {:ok, [{:ok, %{seq: 1}}, {:ok, %{seq: 2}}]} = WAL.append_batch(repo, prepared)
+
+      {:ok, index, _etag} = WAL.fetch(repo)
+      assert index.seq == 2
+      assert Enum.uniq_by(index.entries, & &1.digest) == index.entries
+    end
+
+    test "one that did not land is still an error", %{repo: repo} do
+      {:ok, _} = WAL.create(repo)
+      {:ok, item} = WAL.prepare(repo, push_entry(), fn _index -> :ok end)
+
+      stub(ObjectStore, :put, fn key, body, opts ->
+        if String.ends_with?(key, "index.pb") and Keyword.has_key?(opts, :if_match) do
+          {:error, %Req.TransportError{reason: :econnrefused}}
+        else
+          Mimic.call_original(ObjectStore, :put, [key, body, opts])
+        end
+      end)
+
+      assert {:error, %Req.TransportError{}} = WAL.append_batch(repo, [item])
+      assert {:ok, %{seq: 0}, _etag} = WAL.fetch(repo)
+    end
+  end
+
   describe "storage failures" do
     test "a failed index write is reported, not swallowed", %{repo: repo} do
       {:ok, _} = WAL.create(repo)

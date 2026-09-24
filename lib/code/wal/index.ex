@@ -48,8 +48,47 @@ defmodule Code.WAL.Index do
       created_at_ms: now,
       updated_at_ms: now,
       updated_by: Keyword.get(opts, :node_id, ""),
-      default_branch: branch
+      default_branch: branch,
+      incarnation: Keyword.get_lazy(opts, :incarnation, &new_incarnation/0)
     }
+  end
+
+  defp new_incarnation, do: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
+
+  @doc """
+  Mark the repository as being deleted.
+
+  The tombstone is written through the same compare-and-swap as every other
+  change, so a writer holding the ETag of the live index loses its write and,
+  on re-reading, finds the repository gone rather than committing into it.
+  The entry pointers are kept: they are the exact list of objects the cleanup
+  has to remove.
+  """
+  @spec tombstone(t(), String.t()) :: t()
+  def tombstone(%V1.Index{} = index, node_id) do
+    now = System.system_time(:millisecond)
+    %{index | deleted_at_ms: now, updated_at_ms: now, updated_by: node_id}
+  end
+
+  @doc "Whether deletion of the repository has begun."
+  @spec deleted?(t()) :: boolean()
+  def deleted?(%V1.Index{deleted_at_ms: at}), do: is_integer(at) and at > 0
+
+  @doc """
+  Every object id a ref points at in this index, including the compaction
+  base.
+
+  Each of these is closed within `required_packs/1`: the base packs are a
+  repack verified to contain everything reachable from the base refs, and an
+  entry is only accepted once the objects it did not carry have been shown to
+  be reachable from an earlier version of this set. That is what lets a
+  writer prove, from the index alone, that objects it left out of its pack are
+  still provided.
+  """
+  @spec tips(t()) :: MapSet.t(String.t())
+  def tips(%V1.Index{} = index) do
+    base = if index.base, do: Map.values(index.base.refs), else: []
+    MapSet.new(Map.values(index.refs) ++ base)
   end
 
   @doc """
@@ -113,14 +152,21 @@ defmodule Code.WAL.Index do
   the new base instead of continuing to replay entries that no longer exist in
   the active index.
   """
-  @spec rebase(t(), [Entry.pack()], map(), map(), String.t()) :: t()
-  def rebase(%V1.Index{} = index, packs, refs, symrefs, node_id) do
+  @spec rebase(t(), [Entry.pack()], map(), map(), String.t(), String.t()) :: t()
+  def rebase(%V1.Index{} = index, packs, refs, symrefs, node_id, history_key \\ "") do
     now = System.system_time(:millisecond)
 
     %{
       index
       | epoch: index.epoch + 1,
-        base: %V1.Base{packs: packs, refs: refs, symrefs: symrefs, seq: index.seq, at_ms: now},
+        base: %V1.Base{
+          packs: packs,
+          refs: refs,
+          symrefs: symrefs,
+          seq: index.seq,
+          at_ms: now,
+          history_key: history_key
+        },
         entries: [],
         refs: refs,
         updated_at_ms: now,

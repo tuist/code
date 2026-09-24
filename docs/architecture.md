@@ -26,8 +26,15 @@ repos/<repo_id>/index.pb           the only mutable object, under CAS
 repos/<repo_id>/wal/<digest>.pb    entries, immutable, content-addressed
 repos/<repo_id>/packs/<name>.pack  packfiles, immutable
 repos/<repo_id>/packs/<name>.idx
-repos/<repo_id>/history/<epoch>.pb index snapshots, kept for provenance
+repos/<repo_id>/history/<epoch>-<digest>.pb  index snapshots, kept for provenance
 ```
+
+A snapshot is keyed by the digest of its own bytes as well as its epoch, and
+the base a compaction installs records the key of the snapshot it replaced.
+Two compactions racing from the same epoch but different sequence numbers
+therefore write two different snapshots, and the one the winning base names is
+exactly the index it replaced, never a stale one that happened to be written
+first. A losing compaction's snapshot is an unreferenced leftover.
 
 Everything but the packfiles is protobuf, defined in
 `priv/proto/code/wal/v1/wal.proto`. The log outlives any particular version
@@ -43,9 +50,11 @@ One object per repository, and the only one that is ever mutated. It holds:
 - `base` — the packs and refs a compaction produced,
 - `entries` — pointers to entries applied since that base,
 - `refs` — the repository's **complete current ref state**,
-- `replicas` — how many nodes should hold it.
+- `replicas` — how many nodes should hold it,
+- `incarnation` — a random identifier assigned when the repository is created,
+- `deleted_at_ms` — set once deletion has begun (see *Deleting a repository*).
 
-The last two deserve explanation, because they are what make both halves of the
+`refs` and `replicas` deserve explanation, because they are what make both halves of the
 system cheap.
 
 **`refs` at the top level** means a replica converges by setting refs to exactly
@@ -78,7 +87,15 @@ this is the kind of property that quietly regresses.
 
 A download is written under a temporary name and renamed only after its digest
 matches what the log recorded, so a truncated transfer can never be mistaken
-for a verified pack.
+for a verified pack. Installing it into a local repository is atomic in the
+same way: the pack is copied into a staging directory Git never reads, given a
+verified `.idx` there, and renamed into place pack first and index last. Git
+only considers a pack that has an index, and so does a replica deciding what it
+still has to download, so an install interrupted at any point is simply
+repeated. The `.idx` uploaded beside a pack is reused when it checks out
+against the pack (its own checksum, the pack checksum it records, its object
+count) and rebuilt with `git index-pack` otherwise; it carries no digest in the
+log, so it is a hint rather than something to trust.
 
 The remaining ceiling is S3's: a single `PUT` cannot exceed **5 GiB**, and
 multipart upload is not implemented. A repository whose pack exceeds that fails
@@ -125,12 +142,16 @@ for something the log does not have. The converse is not true, and it is worth
 being precise about rather than glossing:
 
 **A push can be reported as rejected and still be committed.** Two windows
-produce it. If the store commits the index write and the response is lost, the
-node cannot tell that from losing the race — so the entry's content address is
-checked on retry, and an entry already installed is reported as the success it
-was. If the hook returns success but `receive-pack` then fails to install refs
-locally, the log has the push and this node does not; every other replica makes
-it visible, and this one converges on its next read.
+produce it. If the store commits the index write and the response is lost —
+answered as a precondition failure on the retry, or as a transport or server
+error on the write itself — the node cannot tell that from losing the race or
+from a failed write, so it re-reads the index and looks the entry up by its
+content address; an entry already installed is reported as the success it was.
+What remains is a write whose outcome is still unknown when the index is
+re-read, which is reported as the error it appeared to be. If the hook returns
+success but `receive-pack` then fails to install refs locally, the log has the
+push and this node does not; every other replica makes it visible, and this one
+converges on its next read.
 
 So the honest statement of the contract is *log-first*: the log decides, and a
 hook failure means "this node did not commit it", not "it never happened". No
@@ -147,6 +168,34 @@ the fast-forward check is re-evaluated against *their* result.
 That is the whole ordering protocol. There is no quorum, no leader, and no
 agreement between nodes, which is why any node can accept any push.
 
+### Why a push's objects are always provided
+
+A pushed pack carries only what the client did not expect the server to have;
+the agent API likewise packs only what is not reachable from the current refs.
+Both are correct only if the index the entry finally lands in still provides
+the omitted objects, and the node's own object database is no evidence of that:
+it is a cache, and may hold loose objects or packs the log no longer names.
+
+So every write records the index version its omission was relative to — its
+*basis* — and is proved against it before it is proposed:
+
+- the agent API packs everything reachable from the new values and not from
+  the basis's refs, which is closed by construction;
+- a Git push is checked with `rev-list`: every object reachable from the new
+  values and not from the basis's tips must be in the push's quarantine, with
+  the repository's own objects deliberately not counted.
+
+Every tip of an index is closed within that index's packs: base refs because
+compaction verifies its repack against them, and entry refs because every entry
+passed this proof. The writer then re-checks the basis against whichever index
+wins the compare-and-swap. In the same epoch packs only accumulate, so the
+proof still holds. Across a compaction it holds only if every basis tip is
+still a tip of the winning index; otherwise the entry is refused as
+`basis_compacted` and redone against the new index — automatically for the
+agent API and, a bounded number of times, for a push, whose client is told to
+retry after that. A basis from a different `incarnation` belongs to a deleted
+repository and is refused outright.
+
 ## How a replica converges
 
 ```elixir
@@ -158,24 +207,54 @@ end
 
 Then:
 
-1. download the packs the index names that we do not already hold,
-2. install them (`git index-pack` verifies them),
+1. download the packs the index names that we do not already hold (a pack
+   without its `.idx` is not held),
+2. install them atomically, as described under *Packs*,
 3. set refs to exactly `index.refs`,
-4. drop any pack the index no longer names, if the epoch changed.
+4. drop any local pack the index does not require, unless something is using
+   the repository right now.
 
 Every step is idempotent, and there is only one of them — no separate "repair",
 "clone from peer" or "resync" mode to get wrong. Materializing a repository from
-nothing and catching one up by one push are the same code path.
+nothing and catching one up by one push are the same code path. A `304` is
+trusted only while the repository is still on disk; if the directory has gone,
+the replica rebuilds it from the log rather than serving nothing.
+
+Step 4 covers every way a pack stops being needed — a new epoch's base, a
+compaction on this node that lost its compare-and-swap, an agent write the log
+refused. The only packs legitimately missing from the index are ones being
+written at that moment: a push in quarantine, an agent write between packing
+and its compare-and-swap, a compaction between repack and publication. Those,
+and every streamed `upload-pack` or `receive-pack`, hold a node-local *lease*
+on the repository's directory, and pruning waits for a sync with none
+outstanding. The reaper defers eviction for the same reason. Leases protect
+this node's files from this node's own housekeeping and say nothing about the
+log; deferring costs disk for a while, never correctness.
+
+Each repository's cache is its own directory directly under the data
+directory, never nested: `acme/app` is stored as `acme~app` (`~` cannot appear
+in an id). Mirroring the id's slashes on disk put `acme/app/tools` inside
+`acme/app`, so evicting the parent deleted the child's files from under it.
 
 Ref updates are applied without checking previous values. That is not laxness:
 the log already decided the order when a CAS was won, and a replica's job is to
-converge on that decision, not to re-adjudicate it.
+converge on that decision, not to re-adjudicate it. The one local ref update
+that does check is the agent API applying its own just-committed write: by then
+a sync may already have applied a later push, and moving the ref back would be
+wrong, so the update is refused and the next read converges instead.
 
 ## Compaction
 
 A log that only grows makes materialization slower forever. Compaction collapses
 history into a new base: one `git repack`, a full ref snapshot, and an epoch
 bump. A replica seeing a higher epoch adopts the base rather than replaying.
+
+The ref snapshot published is the index's own `refs` and `base.symrefs`, never
+the local repository's refs, which are a cache and can lag or even move
+backwards. The local refs are reset to the snapshot before the repack, and the
+repack is then checked — alone, in a scratch object directory — to contain
+every object those refs reach before it is uploaded. A repack that does not is
+refused (`repack_incomplete`) rather than published.
 
 Only the preferred maintenance-capable node runs it, because repacking is
 CPU-bound and produces a deterministic artefact. Paying for it once and letting
@@ -191,6 +270,33 @@ through the same conditional write as everything else, so the loser is told
 
 It is threshold-driven rather than scheduled. A repository nobody pushes to
 should never pay for maintenance.
+
+## Deleting a repository
+
+Repository ids nest — `acme/app` and `acme/app/tools` are both valid, and the
+second's objects live under the first's prefix — so deletion is never a prefix
+sweep. It happens in three steps:
+
+1. **Tombstone.** The index is rewritten, under the usual compare-and-swap,
+   with `deleted_at_ms` set. From then on the repository reads as not found,
+   every writer is refused, and a writer holding the live index's ETag loses
+   its write and finds the tombstone on re-reading. Creating a repository of
+   the same name is refused until the deletion completes.
+2. **Delete exactly what it owns.** The keys the tombstoned index names, plus
+   anything under its own `wal/`, `packs/` and `history/` whose name has the
+   exact shape Code writes there, plus its work-run records under
+   `factory/<id>/runs/` matched the same way. A nested repository's objects
+   always sit at least one directory deeper and never match.
+3. **Remove the tombstone**, only once every deletion succeeded. Otherwise the
+   deletion reports how many objects remain, the tombstone stays, and calling
+   it again resumes.
+
+A repository created again under the same name gets a new `incarnation`, so an
+operation prepared against the old one — a push whose objects were checked
+against its refs — cannot land in the new one. Only an existing repository can
+be deleted; an id naming none, such as an account that prefixes many, is not
+found. An upload racing the deletion can still leave an unreferenced object
+behind under the old prefix; nothing ever references it.
 
 ## Maintenance capabilities
 

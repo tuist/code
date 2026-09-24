@@ -119,6 +119,50 @@ defmodule Code.ObjectStore.Filesystem do
   end
 
   @impl true
+  def list_prefixes(prefix, config) do
+    root = root(config)
+    dir = Path.join(root, prefix)
+
+    case File.ls(dir) do
+      {:ok, names} ->
+        {keys, prefixes} =
+          names
+          |> Enum.sort()
+          |> Enum.reduce({[], []}, fn name, {keys, prefixes} ->
+            path = Path.join(dir, name)
+
+            case File.stat(path) do
+              {:ok, %{type: :directory}} -> {keys, [prefix <> name <> "/" | prefixes]}
+              {:ok, %{type: :regular, size: size}} -> {[%{key: prefix <> name, size: size} | keys], prefixes}
+              _ -> {keys, prefixes}
+            end
+          end)
+
+        {:ok, %{keys: Enum.reverse(keys), prefixes: Enum.reverse(prefixes)}}
+
+      # An absent directory is an empty prefix, exactly as S3 reports it.
+      {:error, :enoent} ->
+        {:ok, %{keys: [], prefixes: []}}
+
+      {:error, :enotdir} ->
+        {:ok, %{keys: [], prefixes: []}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # The root is created on first write, so a fresh development store has none
+  # yet; being able to create it is what "reachable" means here.
+  @impl true
+  def probe(config) do
+    case File.mkdir_p(root(config)) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @impl true
   def stat(key, config) do
     path = path_for(key, config)
 

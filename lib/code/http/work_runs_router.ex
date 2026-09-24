@@ -7,13 +7,25 @@ defmodule Code.HTTP.WorkRunsRouter do
 
   alias Code.Factory
   alias Code.HTTP.AuthPlug
+  alias Code.HTTP.QueryParams
+  alias Code.HTTP.ServiceResponse
 
   plug(:match)
   plug(Plug.Parsers, parsers: [:json], json_decoder: JSON, pass: ["application/json"])
   plug(:dispatch)
 
   get "/" do
-    with_authorized(conn, :read, fn repo_id, _principal -> Factory.list(repo_id) end)
+    case QueryParams.integer(conn, "limit") do
+      {:ok, limit} ->
+        cursor = QueryParams.string(conn, "cursor")
+
+        with_authorized(conn, :read, fn repo_id, _principal ->
+          Factory.list(repo_id, limit: limit, cursor: cursor)
+        end)
+
+      {:error, message} ->
+        error(conn, 422, "code: #{message}")
+    end
   end
 
   post "/" do
@@ -28,12 +40,13 @@ defmodule Code.HTTP.WorkRunsRouter do
   end
 
   get "/:run/events" do
-    case after_revision(conn) do
-      {:ok, after_revision} ->
-        with_run(conn, run, :read, fn repo_id, _principal -> Factory.events(repo_id, run, after_revision) end)
-
-      {:error, message} ->
-        error(conn, 422, "code: #{message}")
+    with {:ok, after_revision} <- QueryParams.integer(conn, "after"),
+         {:ok, limit} <- QueryParams.integer(conn, "limit") do
+      with_run(conn, run, :read, fn repo_id, _principal ->
+        Factory.events(repo_id, run, after_revision || 0, limit: limit)
+      end)
+    else
+      {:error, message} -> error(conn, 422, "code: #{message}")
     end
   end
 
@@ -43,7 +56,9 @@ defmodule Code.HTTP.WorkRunsRouter do
 
   post "/:run/claim" do
     with_run(conn, run, :execute, fn repo_id, principal ->
-      Factory.claim(repo_id, run, conn.body_params["executor"], principal)
+      Factory.claim(repo_id, run, conn.body_params["executor"], principal,
+        idempotency_key: idempotency_key(conn)
+      )
     end)
   end
 
@@ -66,7 +81,7 @@ defmodule Code.HTTP.WorkRunsRouter do
   end
 
   post "/:run/nodes/:node/expire" do
-    with_run(conn, run, :admin, fn repo_id, _principal -> Factory.expire(repo_id, run, node) end)
+    with_run(conn, run, :admin, fn repo_id, principal -> Factory.expire(repo_id, run, node, principal) end)
   end
 
   post "/:run/cancel" do
@@ -110,44 +125,15 @@ defmodule Code.HTTP.WorkRunsRouter do
     end
   end
 
-  defp after_revision(conn) do
-    conn = fetch_query_params(conn)
-
-    case conn.query_params["after"] do
-      nil ->
-        {:ok, 0}
-
-      raw ->
-        case Integer.parse(raw) do
-          {value, ""} when value >= 0 -> {:ok, value}
-          _ -> {:error, "after must be a non-negative integer"}
-        end
+  # The conventional `Idempotency-Key` header, or the same value in the body.
+  defp idempotency_key(conn) do
+    case get_req_header(conn, "idempotency-key") do
+      [key | _] -> key
+      [] -> conn.body_params["idempotency_key"]
     end
   end
 
-  defp respond(conn, {:ok, payload}, status), do: json(conn, status, payload)
+  defp respond(conn, result, status), do: ServiceResponse.send_result(conn, result, status)
 
-  defp respond(conn, {:error, message}, _status) do
-    status =
-      cond do
-        String.contains?(message, "not found") ->
-          404
-
-        String.contains?(message, "changed concurrently") or String.contains?(message, "no longer owns") ->
-          409
-
-        true ->
-          422
-      end
-
-    error(conn, status, "code: #{message}")
-  end
-
-  defp error(conn, status, message), do: json(conn, status, %{error: message})
-
-  defp json(conn, status, payload) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, JSON.encode!(payload))
-  end
+  defp error(conn, status, message), do: ServiceResponse.error(conn, status, message)
 end

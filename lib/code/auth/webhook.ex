@@ -127,14 +127,25 @@ defmodule Code.Auth.Webhook do
 
     case Req.post(endpoint, headers: headers, json: %{credential: token, node: Code.Config.node_id()}) do
       {:ok, %{status: 200, body: body}} ->
-        principal = build(body)
+        case build(body) do
+          {:ok, principal} ->
+            if :ets.whereis(@table) != :undefined do
+              evict_expired(config)
+              :ets.insert(@table, {key, principal, System.monotonic_time(:millisecond)})
+            end
 
-        if :ets.whereis(@table) != :undefined do
-          evict_expired(config)
-          :ets.insert(@table, {key, principal, System.monotonic_time(:millisecond)})
+            {:ok, principal}
+
+          {:error, reason} ->
+            # The body is the authority's, and may echo the credential, so
+            # only the shape of the problem is logged.
+            Logger.warning("authorization authority returned an unusable response",
+              reason: inspect(reason),
+              operation: "webhook_authenticate"
+            )
+
+            {:error, :invalid_authority_response}
         end
-
-        {:ok, principal}
 
       {:ok, %{status: status}} when status in [401, 403] ->
         {:error, :invalid_credential}
@@ -143,47 +154,111 @@ defmodule Code.Auth.Webhook do
         {:error, {:authority_status, status}}
 
       {:error, reason} ->
-        Logger.warning("code: authorization authority unreachable: #{inspect(reason)}")
+        Logger.warning("authorization authority unreachable",
+          reason: inspect(reason),
+          operation: "webhook_authenticate"
+        )
+
         {:error, :authority_unreachable}
     end
   end
 
+  # The authority is trusted to decide, not to be well-formed. Anything that
+  # does not fit the documented shape is refused as a whole rather than
+  # partially applied or allowed to crash the request.
   defp build(body) when is_map(body) do
-    %Principal{
-      subject: body["subject"] || "unknown",
-      account: body["account"],
-      grants: body |> Map.get("grants", []) |> Enum.map(&normalize/1),
-      claims: Map.get(body, "claims", %{}),
-      expires_at: parse_expiry(body["expires_at"]),
-      source: :webhook
-    }
+    with {:ok, subject} <- optional_string(body, "subject", "unknown"),
+         {:ok, account} <- optional_string(body, "account", nil),
+         {:ok, grants} <- grants(Map.get(body, "grants", [])),
+         {:ok, claims} <- claims(Map.get(body, "claims", %{})),
+         {:ok, expires_at} <- parse_expiry(body["expires_at"]) do
+      {:ok,
+       %Principal{
+         subject: subject,
+         account: account,
+         grants: grants,
+         claims: claims,
+         expires_at: expires_at,
+         source: :webhook
+       }}
+    end
   end
 
-  defp normalize(%{"pattern" => pattern, "permissions" => permissions}) do
-    Principal.grant(pattern, Enum.map(permissions, &String.to_existing_atom/1))
+  defp build(_body), do: {:error, :body_not_an_object}
+
+  defp optional_string(body, key, default) do
+    case Map.get(body, key) do
+      nil -> {:ok, default}
+      value when is_binary(value) -> {:ok, value}
+      _ -> {:error, {:invalid_field, key}}
+    end
+  end
+
+  defp claims(claims) when is_map(claims), do: {:ok, claims}
+  defp claims(_claims), do: {:error, {:invalid_field, "claims"}}
+
+  defp grants(grants) when is_list(grants) do
+    Enum.reduce_while(grants, {:ok, []}, fn grant, {:ok, acc} ->
+      case normalize(grant) do
+        {:ok, grant} -> {:cont, {:ok, [grant | acc]}}
+        :error -> {:halt, {:error, {:invalid_field, "grants"}}}
+      end
+    end)
+    |> case do
+      {:ok, grants} -> {:ok, Enum.reverse(grants)}
+      error -> error
+    end
+  end
+
+  defp grants(_grants), do: {:error, {:invalid_field, "grants"}}
+
+  defp normalize(%{"pattern" => pattern, "permissions" => permissions})
+       when is_binary(pattern) and is_list(permissions) do
+    with {:ok, permissions} <- permissions(permissions), do: {:ok, Principal.grant(pattern, permissions)}
   end
 
   defp normalize(grant) when is_binary(grant) do
     case String.split(grant, ":", parts: 2) do
       [pattern, permissions] ->
-        Principal.grant(
-          pattern,
-          permissions |> String.split(",", trim: true) |> Enum.map(&String.to_existing_atom/1)
-        )
+        with {:ok, permissions} <- permissions(String.split(permissions, ",", trim: true)) do
+          {:ok, Principal.grant(pattern, permissions)}
+        end
 
       [pattern] ->
-        Principal.grant(pattern, [:read])
+        {:ok, Principal.grant(pattern, [:read])}
     end
   end
 
-  defp parse_expiry(nil), do: nil
+  defp normalize(_grant), do: :error
+
+  # Only the four permissions Code knows. `String.to_existing_atom/1` would
+  # accept any atom the VM happens to have loaded — `:ok`, `:erlang` — and
+  # raise on everything else.
+  defp permissions(permissions) do
+    parsed =
+      Enum.map(permissions, fn
+        permission when is_binary(permission) -> Principal.permission(String.trim(permission))
+        _other -> nil
+      end)
+
+    if nil in parsed, do: :error, else: {:ok, parsed}
+  end
+
+  defp parse_expiry(nil), do: {:ok, nil}
 
   defp parse_expiry(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
-      {:ok, at, _} -> at
-      _ -> nil
+      {:ok, at, _} -> {:ok, at}
+      _ -> {:error, {:invalid_field, "expires_at"}}
     end
   end
 
-  defp parse_expiry(value) when is_integer(value), do: DateTime.from_unix!(value)
+  defp parse_expiry(value) when is_integer(value) do
+    case DateTime.from_unix(value) do
+      {:ok, at} -> {:ok, at}
+      {:error, _} -> {:error, {:invalid_field, "expires_at"}}
+    end
+  end
+
+  defp parse_expiry(_value), do: {:error, {:invalid_field, "expires_at"}}
 end

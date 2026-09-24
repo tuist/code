@@ -72,10 +72,10 @@ COPY --from=builder --chown=code:code /app/_build/prod/rel/code ./
 
 USER code
 
-# Also set here so `docker run` of this image behaves the same as the release
-# script; see rel/env.sh.eex for why this is not left to the runtime's default.
-ENV ERL_MAX_PORTS=65536 \
-    CODE_DATA_DIR=/var/lib/code/repositories \
+# The port-table ceiling is deliberately not set here. rel/env.sh.eex derives
+# ERL_MAX_PORTS from CODE_MAX_PORTS (default 65536) every time the release
+# starts; baking ERL_MAX_PORTS into the image made CODE_MAX_PORTS ineffective.
+ENV CODE_DATA_DIR=/var/lib/code/repositories \
     CODE_GIT_PORT=4000 \
     CODE_HOOK_PORT=4001 \
     CODE_ADMIN_PORT=4002

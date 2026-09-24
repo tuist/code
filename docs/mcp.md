@@ -36,7 +36,8 @@ independently. A version this server does not implement comes back as
 ```json
 {"jsonrpc":"2.0","id":1,"error":{"code":-32022,
  "message":"Unsupported protocol version",
- "data":{"supported":["2026-07-28","2025-11-25"],"requested":"1900-01-01"}}}
+ "data":{"supported":["2026-07-28","2025-11-25","2025-06-18","2025-03-26","2024-11-05"],
+         "requested":"1900-01-01"}}}
 ```
 
 so a client can retry with something mutually supported rather than guess.
@@ -53,7 +54,9 @@ round-robin Service is enough, with no affinity rules and no sidecar router.
 
 ### Older clients still work
 
-Revisions up to `2025-11-25` open with `initialize`, and that path is kept.
+Revisions up to `2025-11-25` open with `initialize`, and that path is kept for
+the four the server lists: `2025-11-25`, `2025-06-18`, `2025-03-26` and
+`2024-11-05`.
 Legacy clients have no fall-forward mechanism, so dropping it would simply
 break them. Since this server holds no session state either way, the two eras
 differ only in how a version gets declared.
@@ -83,7 +86,7 @@ cause a hundred materializations.
 | `search` | `git grep` server-side, at a revision |
 | `log` | Commit history, optionally for one path |
 | `diff` | Unified diff between two revisions |
-| `history` | The write-ahead log itself: who pushed what, when |
+| `history` | The write-ahead log itself: each entry's sequence number, type, time, size and pack count. It does not say who made an entry |
 | `clone_url` | For when the agent genuinely does want a working tree |
 
 Everything takes an optional `ref` and defaults to the repository's default
@@ -131,7 +134,7 @@ the commit is durable and ordered.
 | Tool | |
 |---|---|
 | `create_issue` | Open an issue with the verified caller as its author |
-| `list_issues` | Current issues in a repository |
+| `list_issues` | Current issues in a repository, optionally paged with `limit` and `cursor` |
 | `get_issue`, `update_issue`, `delete_issue` | Read, change, or tombstone an issue |
 | `add_issue_comment` | Add a verified-author comment |
 | `get_issue_comment`, `update_issue_comment`, `delete_issue_comment` | Read, change, or tombstone a comment |
@@ -145,9 +148,9 @@ authorization details.
 
 | Tool | |
 |---|---|
-| `create_work_run`, `list_work_runs`, `get_work_run` | Create and inspect a durable graph of work |
-| `work_run_events` | Immutable, revision-cursored work-run events |
-| `claim_work_node`, `complete_work_attempt` | Pull one ready node and conditionally accept its evidence |
+| `create_work_run`, `list_work_runs`, `get_work_run` | Create and inspect a durable graph of work; `list_work_runs` pages with `limit` and `cursor` |
+| `work_run_events` | Immutable, revision-cursored work-run events, optionally bounded with `limit` |
+| `claim_work_node`, `complete_work_attempt` | Pull one ready node (replay-safe with an `idempotency_key`) and conditionally accept its evidence |
 | `approve_work_node`, `cancel_work_run`, `expire_work_node` | Control an approval, terminal state, or stale lease |
 | `get_work_attempt` | Claim and result evidence for one attempt |
 | `configure_secret_backend`, `list_secret_backends`, `get_secret_backend` | Manage non-secret account bindings to the deployment-managed Infisical service |
@@ -166,6 +169,19 @@ An ordinary failure — a branch moved, a file is missing — comes back as a to
 result with `isError: true`, not a JSON-RPC error. The model needs to see it and
 react; aborting the conversation over a missing file would be wrong.
 
+Issue, work-run, and account-configuration tools also return a typed error in
+`structuredContent`:
+
+```json
+{"error": {"kind": "unavailable", "message": "work run changed concurrently; retry later", "retryable": true}}
+```
+
+`kind` is `invalid`, `not_found`, `conflict`, or `unavailable`, with the same
+meaning as the HTTP statuses in [issues.md](issues.md#errors). Only
+`unavailable` is `retryable`: the same call may succeed later. A `conflict`
+needs the agent to re-read state before trying again. Repository and Git tools
+return the text message only.
+
 JSON-RPC errors are reserved for protocol problems: unknown methods, malformed
 requests, unsupported protocol versions.
 
@@ -175,7 +191,9 @@ Grants are patterns, and a repository the caller may not read is reported as
 **not found** rather than forbidden. Distinguishing the two would let an agent
 enumerate which repositories exist, which on a multi-tenant host leaks the shape
 of every customer's estate. `list_repositories` filters to what the principal can
-actually read, for the same reason.
+actually read, for the same reason, using the same decision as every other
+tool: grants carried by the token and bindings in the account's policy object
+both count.
 
 Discovery follows OAuth 2.1: a `401` carries
 

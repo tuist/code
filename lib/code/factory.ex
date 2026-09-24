@@ -15,20 +15,22 @@ defmodule Code.Factory do
   """
 
   alias Code.Auth.Principal
+  alias Code.Factory.Graph
   alias Code.Factory.InferenceProfile
+  alias Code.Factory.Shared
   alias Code.ObjectStore
+  alias Code.Page
   alias Code.Policy
-  alias Code.Telemetry
+  alias Code.ServiceError
   alias Code.WAL
+
+  import Code.Factory.Shared, only: [actor: 1, maybe_put: 3, now: 0, observe: 2, valid_identifier?: 1]
 
   @content_type "application/vnd.code.factory.v1+json"
   @cas_attempts 16
   @default_lease_duration_ms 30 * 60 * 1_000
 
-  @type result :: {:ok, map()} | {:error, String.t()}
-  @type node_id :: String.t()
-  @type dependency_graph :: %{optional(node_id()) => [node_id()]}
-  @type visited_nodes :: %{optional(node_id()) => true}
+  @type result :: {:ok, map()} | {:error, ServiceError.t()}
 
   @doc "Create an immutable work specification and its initial graph state."
   @spec create(String.t(), map(), map(), Principal.t()) :: result()
@@ -38,13 +40,13 @@ defmodule Code.Factory do
 
   defp do_create(repo_id, graph, attrs, %Principal{} = principal) when is_map(graph) and is_map(attrs) do
     with :ok <- repository(repo_id),
-         {:ok, nodes} <- normalize_graph(graph),
+         {:ok, nodes} <- Graph.normalize(graph),
          {:ok, nodes} <- pin_inference_profiles(Policy.account_of(repo_id), nodes),
          {:ok, base_commit} <- base_commit(attrs["base_commit"] || attrs[:base_commit]),
          :ok <- current_public_commit(repo_id, base_commit),
          {:ok, issue} <- issue(attrs["issue"] || attrs[:issue]),
          {:ok, lease_duration_ms} <- lease_duration(attrs["lease_duration_ms"] || attrs[:lease_duration_ms]) do
-      id = identifier()
+      id = run_identifier()
       now = now()
 
       manifest = %{
@@ -66,7 +68,7 @@ defmodule Code.Factory do
         "run_id" => id,
         "revision" => 1,
         "status" => "active",
-        "nodes" => initial_nodes(nodes),
+        "nodes" => Graph.initial_nodes(nodes),
         "event_ids" => [event["id"]],
         "updated_at_ms" => now
       }
@@ -76,8 +78,8 @@ defmodule Code.Factory do
            {:ok, _} <- put_immutable(state_key(repo_id, id), state) do
         {:ok, present(manifest, state)}
       else
-        {:error, :precondition_failed} -> {:error, "work run id collision"}
-        {:error, reason} -> {:error, "could not create work run: #{inspect(reason)}"}
+        {:error, :precondition_failed} -> {:error, ServiceError.conflict("work run id collision")}
+        {:error, reason} -> {:error, storage_error("could not create work run", reason)}
       end
     end
   end
@@ -98,49 +100,98 @@ defmodule Code.Factory do
          {:ok, state, _etag} <- read_json_with_etag(state_key(repo_id, run_id)) do
       {:ok, present(manifest, state)}
     else
-      {:error, :not_found} -> {:error, "work run #{run_id} not found"}
-      {:error, reason} -> {:error, "could not read work run: #{inspect(reason)}"}
+      {:error, :not_found} -> {:error, run_not_found(run_id)}
+      {:error, reason} -> {:error, storage_error("could not read work run", reason)}
     end
   end
 
-  @doc "List work-run projections in a repository, newest first."
-  @spec list(String.t()) :: result()
-  def list(repo_id) do
-    observe(:list, fn -> do_list(repo_id) end)
+  @doc """
+  List work-run projections in a repository.
+
+  Without `:limit` or `:cursor` every run is returned, newest first, as it
+  always has been. With either option the result is a page of at most
+  `:limit` runs in run-id order, after the run id given as `:cursor`, and only
+  that page's runs are read from storage. Run ids are time-ordered with the
+  newest first, so pages also run newest first; runs created before ids were
+  time-ordered follow every newer run, in id order. `next_cursor` is the id to
+  pass for the next page, or `nil` on the last one.
+  """
+  @spec list(String.t(), keyword()) :: result()
+  def list(repo_id, opts \\ []) do
+    observe(:list, fn -> do_list(repo_id, opts) end)
   end
 
-  defp do_list(repo_id) do
+  defp do_list(repo_id, opts) do
     with :ok <- repository(repo_id),
+         {:ok, page} <- Page.options(opts, &valid_identifier?/1),
          {:ok, entries} <- ObjectStore.list(runs_prefix(repo_id)) do
-      runs =
+      ids =
         entries
         |> Enum.filter(&String.ends_with?(&1.key, "/state.json"))
         |> Enum.map(&run_id_from_state_key/1)
-        |> Enum.map(&do_get(repo_id, &1))
-        |> Enum.flat_map(fn
-          {:ok, run} -> [run]
-          _ -> []
-        end)
-        |> Enum.sort_by(& &1.created_at_ms, :desc)
 
-      {:ok, %{repository: repo_id, runs: runs, count: length(runs)}}
+      {runs, next_cursor} = list_page(repo_id, ids, page)
+      {:ok, %{repository: repo_id, runs: runs, count: length(runs), next_cursor: next_cursor}}
     else
-      {:error, reason} -> {:error, "could not list work runs: #{inspect(reason)}"}
+      {:error, reason} -> {:error, storage_error("could not list work runs", reason)}
     end
   end
 
-  @doc "Claim one ready non-approval node. A lost race is retried from storage."
-  @spec claim(String.t(), String.t(), String.t(), Principal.t()) :: result()
-  def claim(repo_id, run_id, executor, principal) do
-    observe(:claim, fn -> do_claim(repo_id, run_id, executor, principal) end)
+  defp list_page(repo_id, ids, :all) do
+    runs = ids |> read_runs(repo_id) |> Enum.sort_by(& &1.created_at_ms, :desc)
+    {runs, nil}
   end
 
-  defp do_claim(repo_id, run_id, executor, %Principal{} = principal)
+  # Paging happens on the listed ids, before any run is read, so a page costs
+  # `limit` reads however many runs the repository has.
+  defp list_page(repo_id, ids, %{limit: limit, cursor: cursor}) do
+    {page, rest} =
+      ids
+      |> Enum.sort()
+      |> Enum.drop_while(&(not is_nil(cursor) and &1 <= cursor))
+      |> Enum.split(limit)
+
+    {read_runs(page, repo_id), if(rest == [], do: nil, else: List.last(page))}
+  end
+
+  defp read_runs(ids, repo_id) do
+    Enum.flat_map(ids, fn id ->
+      case do_get(repo_id, id) do
+        {:ok, run} -> [run]
+        _ -> []
+      end
+    end)
+  end
+
+  @doc """
+  Claim one ready non-approval node. A lost race is retried from storage.
+
+  ## Options
+
+    * `:idempotency_key` - a caller-chosen key for this claim request. The key
+      is recorded in the run's authoritative state together with the attempt
+      it produced, so repeating the request with the same key (after a lost
+      response, a timeout, or a crashed worker) returns that same attempt
+      instead of claiming a second node. A key is scoped to its run and to
+      the principal that first used it; reusing it from another principal, or
+      with a different executor, is a conflict.
+  """
+  @spec claim(String.t(), String.t(), String.t(), Principal.t(), keyword()) :: result()
+  def claim(repo_id, run_id, executor, principal, opts \\ []) do
+    observe(:claim, fn ->
+      do_claim(repo_id, run_id, executor, principal, Keyword.get(opts, :idempotency_key))
+    end)
+  end
+
+  defp do_claim(repo_id, run_id, executor, %Principal{} = principal, key)
        when is_binary(executor) and executor != "" do
-    transition(repo_id, run_id, &claim_update(repo_id, run_id, executor, principal, &1, &2))
+    with :ok <- idempotency_key(key) do
+      transition(repo_id, run_id, &claim_update(repo_id, run_id, executor, principal, key, &1, &2))
+    end
   end
 
-  defp do_claim(_repo_id, _run_id, _executor, _principal), do: {:error, "executor must be a non-empty string"}
+  defp do_claim(_repo_id, _run_id, _executor, _principal, _key),
+    do: {:error, "executor must be a non-empty string"}
 
   @doc "Record an attempt result and conditionally make it the node's accepted result."
   @spec complete(String.t(), String.t(), String.t(), String.t(), String.t(), [map()], Principal.t()) ::
@@ -184,7 +235,7 @@ defmodule Code.Factory do
   end
 
   def approve(_repo_id, _run_id, _node_id, _principal),
-    do: {:error, "approval requires an authenticated principal"}
+    do: {:error, ServiceError.invalid("approval requires an authenticated principal")}
 
   defp do_approve(repo_id, run_id, node_id, %Principal{} = principal) do
     with :ok <- run_id(run_id),
@@ -211,31 +262,45 @@ defmodule Code.Factory do
     observe(:cancel, fn -> do_cancel(repo_id, run_id, principal) end)
   end
 
-  def cancel(_repo_id, _run_id, _principal), do: {:error, "cancellation requires an authenticated principal"}
+  def cancel(_repo_id, _run_id, _principal),
+    do: {:error, ServiceError.invalid("cancellation requires an authenticated principal")}
 
   defp do_cancel(repo_id, run_id, %Principal{} = principal) do
     with :ok <- run_id(run_id) do
       transition(repo_id, run_id, fn _manifest, state ->
         with :ok <- active(state) do
-          {:ok, Map.put(state, "status", "cancelled"), {"work_run_cancelled", actor(principal), %{}, %{}}}
+          {:ok, terminate(state, "cancelled"), {"work_run_cancelled", actor(principal), %{}, %{}}}
         end
       end)
     end
   end
 
-  @doc "Return the immutable event history after a durable state revision cursor."
-  @spec events(String.t(), String.t(), non_neg_integer()) :: result()
-  def events(repo_id, run_id, after_revision \\ 0) do
-    observe(:events, fn -> do_events(repo_id, run_id, after_revision) end)
+  @doc """
+  Return the immutable event history after a durable state revision cursor.
+
+  `next_cursor` is the revision to pass as `after_revision` next time. With
+  `limit: n` at most `n` events are read and returned, and `next_cursor`
+  stops at the last of them; `has_more` says whether later events exist.
+  """
+  @spec events(String.t(), String.t(), non_neg_integer(), keyword()) :: result()
+  def events(repo_id, run_id, after_revision \\ 0, opts \\ []) do
+    observe(:events, fn -> do_events(repo_id, run_id, after_revision, Keyword.get(opts, :limit)) end)
   end
 
-  defp do_events(repo_id, run_id, after_revision) when is_integer(after_revision) and after_revision >= 0 do
+  defp do_events(repo_id, run_id, after_revision, limit)
+       when is_integer(after_revision) and after_revision >= 0 do
     with :ok <- repository(repo_id),
          :ok <- run_id(run_id),
+         :ok <- Page.validate_limit(limit),
          {:ok, _manifest} <- read_json(manifest_key(repo_id, run_id)),
          {:ok, state, _etag} <- read_json_with_etag(state_key(repo_id, run_id)) do
+      # `event_ids` holds one id per revision, in order, so the ids after a
+      # cursor are a slice: only the events being returned are read.
+      last = if limit, do: min(after_revision + limit, state["revision"]), else: state["revision"]
+
       events =
         state["event_ids"]
+        |> Enum.slice(after_revision, max(last - after_revision, 0))
         |> Enum.map(&read_json(event_key(repo_id, run_id, &1)))
         |> Enum.flat_map(fn
           {:ok, event} -> [event]
@@ -244,14 +309,22 @@ defmodule Code.Factory do
         |> Enum.filter(&(&1["revision"] > after_revision))
         |> Enum.sort_by(& &1["revision"])
 
-      {:ok, %{run_id: run_id, events: events, count: length(events), next_cursor: state["revision"]}}
+      {:ok,
+       %{
+         run_id: run_id,
+         events: events,
+         count: length(events),
+         next_cursor: max(last, after_revision),
+         has_more: last < state["revision"]
+       }}
     else
-      {:error, :not_found} -> {:error, "work run #{run_id} not found"}
-      {:error, reason} -> {:error, "could not read work events: #{inspect(reason)}"}
+      {:error, :not_found} -> {:error, run_not_found(run_id)}
+      {:error, reason} -> {:error, storage_error("could not read work events", reason)}
     end
   end
 
-  defp do_events(_repo_id, _run_id, _after_revision), do: {:error, "after must be a non-negative integer"}
+  defp do_events(_repo_id, _run_id, _after_revision, _limit),
+    do: {:error, "after must be a non-negative integer"}
 
   @doc "Read a claimed or completed attempt without trusting a pod-local log."
   @spec attempt(String.t(), String.t(), String.t()) :: result()
@@ -269,18 +342,25 @@ defmodule Code.Factory do
       case {claim, result} do
         {{:ok, claim}, {:ok, result}} -> {:ok, %{attempt: claim, result: result}}
         {{:ok, claim}, {:error, :not_found}} -> {:ok, %{attempt: claim}}
-        _ -> {:error, "attempt #{attempt_id} not found"}
+        _ -> {:error, ServiceError.not_found("attempt #{attempt_id} not found")}
       end
     end
   end
 
-  @doc "Requeue one stale running node. Expiry is advisory and never invalidates accepted evidence."
-  @spec expire(String.t(), String.t(), String.t()) :: result()
-  def expire(repo_id, run_id, node_id) do
-    observe(:expire, fn -> do_expire(repo_id, run_id, node_id) end)
+  @doc """
+  Requeue one stale running node. Expiry is advisory and never invalidates
+  accepted evidence. The event records the principal that expired the lease,
+  whether an operator or an automated reconciler.
+  """
+  @spec expire(String.t(), String.t(), String.t(), Principal.t()) :: result()
+  def expire(repo_id, run_id, node_id, %Principal{} = principal) do
+    observe(:expire, fn -> do_expire(repo_id, run_id, node_id, principal) end)
   end
 
-  defp do_expire(repo_id, run_id, node_id) do
+  def expire(_repo_id, _run_id, _node_id, _principal),
+    do: {:error, ServiceError.invalid("lease expiry requires an authenticated principal")}
+
+  defp do_expire(repo_id, run_id, node_id, principal) do
     with :ok <- run_id(run_id),
          :ok <- node_id(node_id) do
       transition(repo_id, run_id, fn _manifest, state ->
@@ -300,8 +380,7 @@ defmodule Code.Factory do
             |> Map.delete("claimed_by")
 
           {:ok, put_node(state, node_id, updated_node),
-           {"attempt_expired", %{"subject" => "code/factory"}, %{"node" => node_id, "attempt" => attempt_id},
-            %{}}}
+           {"attempt_expired", actor(principal), %{"node" => node_id, "attempt" => attempt_id}, %{}}}
         end
       end)
     end
@@ -309,7 +388,51 @@ defmodule Code.Factory do
 
   # ----------------------------------------------------------------------
 
-  defp claim_update(repo_id, run_id, executor, principal, manifest, state) do
+  # A keyed claim first looks for the attempt its key already produced. The
+  # lookup happens before the run's status is checked: a claim that succeeded
+  # before the run ended is still the answer to that request.
+  defp claim_update(repo_id, run_id, executor, principal, key, manifest, state) do
+    case get_in(state, ["claim_keys", key]) do
+      nil -> new_claim(repo_id, run_id, executor, principal, key, manifest, state)
+      recorded -> replay_claim(repo_id, run_id, executor, principal, recorded, manifest)
+    end
+  end
+
+  defp replay_claim(repo_id, run_id, executor, principal, recorded, manifest) do
+    with :ok <- same_claimant(recorded, executor, principal),
+         {:ok, claim} <- read_json(claim_key(repo_id, run_id, recorded["attempt_id"])),
+         {:ok, work} <- work(repo_id, manifest, graph_node(manifest, claim["node"])) do
+      {:already,
+       %{
+         attempt: claim,
+         attempt_id: claim["id"],
+         lease_duration_ms: manifest["lease_duration_ms"],
+         work: work,
+         replayed: true
+       }}
+    else
+      {:error, :not_found} ->
+        {:error, ServiceError.unavailable("claimed attempt #{recorded["attempt_id"]} is missing")}
+
+      error ->
+        error
+    end
+  end
+
+  defp same_claimant(recorded, executor, principal) do
+    cond do
+      recorded["claimed_by"] != actor(principal) ->
+        {:error, ServiceError.conflict("idempotency key was already used by a different principal")}
+
+      recorded["executor"] != executor ->
+        {:error, ServiceError.conflict("idempotency key was already used with a different executor")}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp new_claim(repo_id, run_id, executor, principal, key, manifest, state) do
     with :ok <- active(state),
          {:ok, node_id, node} <- ready_node(state),
          definition = graph_node(manifest, node_id),
@@ -318,17 +441,19 @@ defmodule Code.Factory do
       number = node["attempts"] + 1
       claimed_at_ms = now()
 
-      claim = %{
-        "version" => 1,
-        "id" => attempt_id,
-        "run_id" => run_id,
-        "node" => node_id,
-        "number" => number,
-        "executor" => executor,
-        "claimed_by" => actor(principal),
-        "claimed_at_ms" => claimed_at_ms,
-        "lease_expires_at_ms" => claimed_at_ms + manifest["lease_duration_ms"]
-      }
+      claim =
+        %{
+          "version" => 1,
+          "id" => attempt_id,
+          "run_id" => run_id,
+          "node" => node_id,
+          "number" => number,
+          "executor" => executor,
+          "claimed_by" => actor(principal),
+          "claimed_at_ms" => claimed_at_ms,
+          "lease_expires_at_ms" => claimed_at_ms + manifest["lease_duration_ms"]
+        }
+        |> maybe_put("idempotency_key", key)
 
       case put_immutable(claim_key(repo_id, run_id, attempt_id), claim) do
         {:ok, _etag} ->
@@ -340,7 +465,10 @@ defmodule Code.Factory do
             |> Map.put("executor", executor)
             |> Map.put("claimed_by", actor(principal))
 
-          updated = put_node(state, node_id, updated_node)
+          updated =
+            state
+            |> put_node(node_id, updated_node)
+            |> record_claim_key(key, attempt_id, executor, principal)
 
           {:ok, updated,
            {"node_claimed", actor(principal),
@@ -374,9 +502,11 @@ defmodule Code.Factory do
         "recorded_by" => actor(completion.principal)
       }
 
+      # On a replay the stored result wins, so the caller sees the original
+      # `recorded_at_ms` and `recorded_by` rather than this request's values.
       case put_result(completion.repo_id, completion.run_id, completion.attempt_id, result) do
-        :ok ->
-          finalize_attempt(state, manifest, node, completion, result, disposition)
+        {:ok, stored} ->
+          finalize_attempt(state, manifest, node, completion, stored, disposition)
 
         {:error, reason} ->
           {:error, error_message(reason)}
@@ -385,7 +515,10 @@ defmodule Code.Factory do
   end
 
   defp transition(repo_id, run_id, update, attempts \\ @cas_attempts)
-  defp transition(_repo_id, _run_id, _update, 0), do: {:error, "work run changed concurrently"}
+  # Losing every attempt means sustained contention on this run, not a
+  # conflict with the caller's request: the same request can succeed later.
+  defp transition(_repo_id, _run_id, _update, 0),
+    do: {:error, ServiceError.unavailable("work run changed concurrently; retry later")}
 
   defp transition(repo_id, run_id, update, attempts) do
     with :ok <- repository(repo_id),
@@ -412,7 +545,7 @@ defmodule Code.Factory do
             {:ok, Map.merge(present(manifest, updated), extra)}
           else
             {:error, :precondition_failed} -> transition(repo_id, run_id, update, attempts - 1)
-            {:error, reason} -> {:error, "could not update work run: #{inspect(reason)}"}
+            {:error, reason} -> {:error, storage_error("could not update work run", reason)}
           end
 
         {:already, extra} ->
@@ -422,121 +555,9 @@ defmodule Code.Factory do
           {:error, error_message(reason)}
       end
     else
-      {:error, :not_found} -> {:error, "work run #{run_id} not found"}
-      {:error, reason} -> {:error, "could not read work run: #{inspect(reason)}"}
+      {:error, :not_found} -> {:error, run_not_found(run_id)}
+      {:error, reason} -> {:error, storage_error("could not read work run", reason)}
     end
-  end
-
-  defp normalize_graph(%{"nodes" => nodes}), do: normalize_nodes(nodes)
-  defp normalize_graph(%{nodes: nodes}), do: normalize_nodes(nodes)
-  defp normalize_graph(_), do: {:error, "work graph must contain a nodes array"}
-
-  defp normalize_nodes(nodes) when is_list(nodes) and nodes != [] do
-    with {:ok, nodes} <- Enum.reduce_while(nodes, {:ok, []}, &normalize_node/2),
-         :ok <- unique_node_ids(nodes),
-         :ok <- known_dependencies(nodes),
-         :ok <- acyclic(nodes) do
-      {:ok, nodes}
-    end
-  end
-
-  defp normalize_nodes(_), do: {:error, "work graph nodes must be a non-empty array"}
-
-  defp normalize_node(raw, {:ok, acc}) when is_map(raw) do
-    id = raw["id"] || raw[:id]
-    kind = raw["kind"] || raw[:kind] || "agent"
-    title = raw["title"] || raw[:title] || id
-    depends_on = raw["depends_on"] || raw[:depends_on] || []
-    execution = raw["execution"] || raw[:execution]
-
-    with :ok <- node_id_valid?(id),
-         :ok <- node_kind_valid?(kind),
-         :ok <- node_title_valid?(title),
-         :ok <- dependencies_valid?(id, depends_on),
-         {:ok, execution} <- normalize_node_execution(id, execution) do
-      node =
-        %{"id" => id, "kind" => kind, "title" => title, "depends_on" => depends_on}
-        |> maybe_put("execution", execution)
-
-      {:cont, {:ok, acc ++ [node]}}
-    else
-      {:error, reason} -> {:halt, {:error, reason}}
-    end
-  end
-
-  defp normalize_node(_raw, _acc), do: {:halt, {:error, "every work node must be an object"}}
-
-  defp node_id_valid?(id),
-    do: if(valid_identifier?(id), do: :ok, else: {:error, "every work node needs a simple id"})
-
-  defp node_kind_valid?(kind) when kind in ["agent", "command", "evaluate", "approval"], do: :ok
-  defp node_kind_valid?(kind), do: {:error, "unknown work node kind #{inspect(kind)}"}
-
-  defp node_title_valid?(title) when is_binary(title) and title != "", do: :ok
-  defp node_title_valid?(_title), do: {:error, "every work node needs a title"}
-
-  defp dependencies_valid?(id, dependencies) when is_list(dependencies) do
-    if Enum.all?(dependencies, &valid_identifier?/1),
-      do: :ok,
-      else: {:error, "node #{id} has invalid dependencies"}
-  end
-
-  defp dependencies_valid?(id, _dependencies), do: {:error, "node #{id} has invalid dependencies"}
-
-  defp normalize_node_execution(id, execution) do
-    case normalize_execution(execution) do
-      {:ok, normalized} -> {:ok, normalized}
-      {:error, reason} -> {:error, "node #{id} #{reason}"}
-    end
-  end
-
-  # The factory carries a portable operation contract, not an agent session,
-  # provider credential, or model selection. A worker maps `operation` to a
-  # locally configured Condukt operation and creates the session inside its
-  # sandbox. The same contract therefore works with a mocked worker in tests.
-  defp normalize_execution(nil), do: {:ok, nil}
-
-  defp normalize_execution(raw) when is_map(raw) do
-    type = raw["type"] || raw[:type]
-    operation = raw["operation"] || raw[:operation]
-    input = raw["input"] || raw[:input] || %{}
-    output_schema = raw["output_schema"] || raw[:output_schema]
-    inference_profile = raw["inference_profile"] || raw[:inference_profile]
-
-    with :ok <- execution_type_valid?(type),
-         :ok <- execution_operation_valid?(operation),
-         :ok <- execution_input_valid?(input),
-         :ok <- optional_output_schema_valid?(output_schema),
-         :ok <- optional_inference_profile_valid?(inference_profile) do
-      {:ok,
-       %{"type" => type, "operation" => operation, "input" => input}
-       |> maybe_put("output_schema", output_schema)
-       |> maybe_put("inference_profile", inference_profile)}
-    end
-  end
-
-  defp normalize_execution(_), do: {:error, "has an execution that is not an object"}
-
-  defp execution_type_valid?("condukt_operation"), do: :ok
-  defp execution_type_valid?(_type), do: {:error, "has an unknown execution type"}
-
-  defp execution_operation_valid?(operation) do
-    if valid_operation?(operation), do: :ok, else: {:error, "needs a Condukt operation name"}
-  end
-
-  defp execution_input_valid?(input) when is_map(input), do: :ok
-  defp execution_input_valid?(_input), do: {:error, "has a Condukt operation input that is not an object"}
-
-  defp optional_output_schema_valid?(nil), do: :ok
-  defp optional_output_schema_valid?(value) when is_map(value), do: :ok
-
-  defp optional_output_schema_valid?(_value),
-    do: {:error, "has a Condukt operation output schema that is not an object"}
-
-  defp optional_inference_profile_valid?(nil), do: :ok
-
-  defp optional_inference_profile_valid?(value) do
-    if valid_identifier?(value), do: :ok, else: {:error, "has an invalid inference profile name"}
   end
 
   # A run stores only the selected profile and its immutable version. The
@@ -565,84 +586,13 @@ defmodule Code.Factory do
     end)
   end
 
-  defp unique_node_ids(nodes) do
-    if length(nodes) == length(Enum.uniq_by(nodes, & &1["id"])),
-      do: :ok,
-      else: {:error, "work node ids must be unique"}
-  end
-
-  defp known_dependencies(nodes) do
-    ids = MapSet.new(nodes, & &1["id"])
-
-    if Enum.all?(nodes, fn node -> Enum.all?(node["depends_on"], &MapSet.member?(ids, &1)) end),
-      do: :ok,
-      else: {:error, "every work-node dependency must exist"}
-  end
-
-  @spec acyclic([map()]) :: :ok | {:error, String.t()}
-  defp acyclic(nodes) do
-    graph = dependency_graph(nodes)
-
-    case Enum.reduce_while(Map.keys(graph), %{}, fn id, done ->
-           case visit(id, graph, done, %{}) do
-             {:ok, done} -> {:cont, done}
-             :cycle -> {:halt, :cycle}
-           end
-         end) do
-      :cycle -> {:error, "work graph must not contain a cycle"}
-      _ -> :ok
-    end
-  end
-
-  @spec dependency_graph([map()]) :: dependency_graph()
-  defp dependency_graph(nodes), do: Map.new(nodes, &{&1["id"], &1["depends_on"]})
-
-  @spec visit(node_id(), dependency_graph(), visited_nodes(), visited_nodes()) ::
-          {:ok, visited_nodes()} | :cycle
-  defp visit(id, graph, done, visiting) do
-    cond do
-      Map.has_key?(done, id) ->
-        {:ok, done}
-
-      Map.has_key?(visiting, id) ->
-        :cycle
-
-      true ->
-        visiting = Map.put(visiting, id, true)
-
-        Enum.reduce_while(Map.fetch!(graph, id), {:ok, done}, fn dependency, {:ok, done} ->
-          case visit(dependency, graph, done, visiting) do
-            {:ok, next} -> {:cont, {:ok, next}}
-            :cycle -> {:halt, :cycle}
-          end
-        end)
-        |> case do
-          {:ok, done} -> {:ok, Map.put(done, id, true)}
-          :cycle -> :cycle
-        end
-    end
-  end
-
-  defp initial_nodes(nodes) do
-    Map.new(nodes, fn node ->
-      status =
-        if node["depends_on"] == [] do
-          if node["kind"] == "approval", do: "waiting", else: "ready"
-        else
-          "pending"
-        end
-
-      {node["id"], Map.merge(node, %{"status" => status, "attempts" => 0})}
-    end)
-  end
-
   defp ready_node(state) do
     case state["nodes"]
          |> Map.values()
          |> Enum.filter(&(&1["status"] == "ready"))
          |> Enum.sort_by(& &1["id"]) do
       [node | _] -> {:ok, node["id"], node}
-      [] -> {:error, "no work node is ready"}
+      [] -> {:error, ServiceError.conflict("no work node is ready")}
     end
   end
 
@@ -673,27 +623,34 @@ defmodule Code.Factory do
         Map.put(state, "status", "succeeded")
 
       Enum.any?(statuses, &(&1 == "failed")) ->
-        state
-        |> Map.put("status", "failed")
-        |> skip_unstarted_nodes()
+        terminate(state, "failed")
 
       true ->
         state
     end
   end
 
-  defp skip_unstarted_nodes(state) do
+  # A terminal run leaves no node looking as if it could still progress.
+  # Unstarted nodes become `skipped`. A node whose attempt is still out
+  # becomes `abandoned`: it keeps its attempt id, executor and claimant, so
+  # that attempt's late result is still recognized, retained as evidence, and
+  # rejected rather than reported as belonging to nobody.
+  defp terminate(state, status) do
     nodes =
       Map.new(state["nodes"], fn {id, node} ->
-        skipped =
-          if node["status"] in ["pending", "ready", "waiting"],
-            do: Map.put(node, "status", "skipped"),
-            else: node
+        node =
+          case node["status"] do
+            unstarted when unstarted in ["pending", "ready", "waiting"] -> Map.put(node, "status", "skipped")
+            "running" -> Map.put(node, "status", "abandoned")
+            _finished -> node
+          end
 
-        {id, skipped}
+        {id, node}
       end)
 
-    Map.put(state, "nodes", nodes)
+    state
+    |> Map.put("status", status)
+    |> Map.put("nodes", nodes)
   end
 
   defp claimed_attempt(completion) do
@@ -704,9 +661,9 @@ defmodule Code.Factory do
          true <- claim["claimed_by"] == actor(completion.principal) do
       :ok
     else
-      false -> {:error, "attempt belongs to a different executor identity"}
-      {:error, :not_found} -> {:error, "attempt #{completion.attempt_id} not found"}
-      {:error, reason} -> {:error, "could not read work attempt: #{inspect(reason)}"}
+      false -> {:error, ServiceError.conflict("attempt belongs to a different executor identity")}
+      {:error, :not_found} -> {:error, ServiceError.not_found("attempt #{completion.attempt_id} not found")}
+      {:error, reason} -> {:error, storage_error("could not read work attempt", reason)}
     end
   end
 
@@ -718,14 +675,14 @@ defmodule Code.Factory do
       attempt_id in attempt_ids(node, "rejected_result_attempt_ids") ->
         {:ok, :rejected}
 
-      node["status"] == "running" and node["attempt_id"] == attempt_id ->
+      node["status"] in ["running", "abandoned"] and node["attempt_id"] == attempt_id ->
         {:ok, :current}
 
       attempt_id in attempt_ids(node, "expired_attempt_ids") ->
         {:ok, :expired}
 
       true ->
-        {:error, "attempt #{attempt_id} no longer owns node #{node["id"]}"}
+        {:error, ServiceError.conflict("attempt #{attempt_id} no longer owns node #{node["id"]}")}
     end
   end
 
@@ -785,23 +742,34 @@ defmodule Code.Factory do
 
   defp node(state, node_id) do
     case get_in(state, ["nodes", node_id]) do
-      nil -> {:error, "work node #{node_id} not found"}
+      nil -> {:error, ServiceError.not_found("work node #{node_id} not found")}
       node -> {:ok, node}
     end
   end
 
   defp put_node(state, node_id, node), do: put_in(state, ["nodes", node_id], node)
+
+  # Recorded in `state.json`, the run's only authoritative mutable object, in
+  # the same conditional write that makes the claim canonical. A claim object
+  # alone proves nothing: a losing writer may have left it behind.
+  defp record_claim_key(state, nil, _attempt_id, _executor, _principal), do: state
+
+  defp record_claim_key(state, key, attempt_id, executor, principal) do
+    entry = %{"attempt_id" => attempt_id, "executor" => executor, "claimed_by" => actor(principal)}
+    Map.update(state, "claim_keys", %{key => entry}, &Map.put(&1, key, entry))
+  end
+
   defp attempt_ids(node, key), do: Map.get(node, key, [])
 
   defp append_attempt(node, key, attempt_id),
     do: Map.update(node, key, [attempt_id], &Enum.uniq(&1 ++ [attempt_id]))
 
   defp active(%{"status" => "active"}), do: :ok
-  defp active(state), do: {:error, "work run is #{state["status"]}"}
+  defp active(state), do: {:error, ServiceError.conflict("work run is #{state["status"]}")}
   defp running(%{"status" => "running"}), do: :ok
-  defp running(_), do: {:error, "work node is not running"}
+  defp running(_), do: {:error, ServiceError.conflict("work node is not running")}
   defp approval_waiting(%{"kind" => "approval", "status" => "waiting"}), do: :ok
-  defp approval_waiting(_), do: {:error, "work node is not awaiting approval"}
+  defp approval_waiting(_), do: {:error, ServiceError.conflict("work node is not awaiting approval")}
 
   defp artifacts(artifacts) do
     if Enum.all?(artifacts, &valid_artifact?/1),
@@ -813,36 +781,23 @@ defmodule Code.Factory do
   defp valid_artifact?(%{name: name}) when is_binary(name) and name != "", do: true
   defp valid_artifact?(_), do: false
 
-  defp observe(operation, fun) do
-    started_at = System.monotonic_time()
-
-    result =
-      Telemetry.span(
-        "factory.#{operation}",
-        %{"code.factory.operation" => Atom.to_string(operation)},
-        fn ->
-          fun.() |> Telemetry.put_span_outcome()
-        end
-      )
-
-    :telemetry.execute(
-      [:code, :factory, :operation],
-      %{duration_us: System.convert_time_unit(System.monotonic_time() - started_at, :native, :microsecond)},
-      %{operation: operation, outcome: operation_outcome(result)}
-    )
-
-    result
-  end
-
-  defp operation_outcome({:ok, _}), do: :ok
-  defp operation_outcome({:error, _}), do: :error
-  defp operation_outcome(_), do: :error
-
   defp error_message(reason) when is_binary(reason), do: reason
-  defp error_message(reason), do: "could not transition work run: #{inspect(reason)}"
+  defp error_message(%ServiceError{} = error), do: error
+  defp error_message(reason), do: storage_error("could not transition work run", reason)
+
+  defp run_not_found(run_id), do: ServiceError.not_found("work run #{run_id} not found")
+
+  # A typed error from a nested service keeps its meaning; any other failure
+  # reading or writing storage is temporary.
+  defp storage_error(_context, %ServiceError{} = error), do: error
+  # A bare message comes from input validation earlier in the same `with`.
+  defp storage_error(_context, message) when is_binary(message), do: message
+  defp storage_error(context, reason), do: ServiceError.unavailable("#{context}: #{inspect(reason)}")
 
   defp expired(lease_expires_at_ms) when is_integer(lease_expires_at_ms) do
-    if now() >= lease_expires_at_ms, do: :ok, else: {:error, "work attempt lease has not expired"}
+    if now() >= lease_expires_at_ms,
+      do: :ok,
+      else: {:error, ServiceError.conflict("work attempt lease has not expired")}
   end
 
   defp expired(_), do: {:error, "work attempt claim has no lease deadline"}
@@ -880,8 +835,8 @@ defmodule Code.Factory do
       :ok
     else
       false -> {:error, "base_commit is not the current head of a public reference"}
-      {:error, :not_found} -> {:error, "repository #{repo_id} not found"}
-      {:error, reason} -> {:error, "could not validate base_commit: #{inspect(reason)}"}
+      {:error, :not_found} -> {:error, ServiceError.not_found("repository #{repo_id} not found")}
+      {:error, reason} -> {:error, storage_error("could not validate base_commit", reason)}
     end
   end
 
@@ -889,15 +844,17 @@ defmodule Code.Factory do
   defp issue(number) when is_integer(number) and number > 0, do: {:ok, number}
   defp issue(_), do: {:error, "issue must be a positive integer"}
 
+  defp idempotency_key(nil), do: :ok
+
+  defp idempotency_key(key) do
+    if is_binary(key) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/, key),
+      do: :ok,
+      else: {:error, "idempotency_key must be 1 to 128 characters of [A-Za-z0-9._:-], starting alphanumeric"}
+  end
+
   defp lease_duration(nil), do: {:ok, @default_lease_duration_ms}
   defp lease_duration(ms) when is_integer(ms) and ms in 1_000..86_400_000, do: {:ok, ms}
   defp lease_duration(_), do: {:error, "lease_duration_ms must be between one second and one day"}
-
-  defp valid_identifier?(value),
-    do: is_binary(value) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/, value)
-
-  defp valid_operation?(value),
-    do: is_binary(value) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/, value)
 
   defp present(manifest, state) do
     %{
@@ -929,31 +886,22 @@ defmodule Code.Factory do
     }
   end
 
-  defp actor(%Principal{} = principal), do: %{"subject" => principal.subject, "account" => principal.account}
-  defp now, do: System.system_time(:millisecond)
-  # URL-safe base64 can begin with `-` or `_`, while work ids intentionally
-  # begin with an alphanumeric character so they are safe in every path form.
-  defp identifier, do: "r" <> Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
-
-  defp put_immutable(key, value),
-    do: ObjectStore.put(key, JSON.encode!(value), if_none_match: "*", content_type: @content_type)
-
   defp put_result(repo_id, run_id, attempt_id, result) do
     case put_immutable(result_key(repo_id, run_id, attempt_id), result) do
       {:ok, _etag} ->
-        :ok
+        {:ok, result}
 
       {:error, :precondition_failed} ->
         with {:ok, existing} <- read_json(result_key(repo_id, run_id, attempt_id)),
              true <- same_result?(existing, result) do
-          :ok
+          {:ok, existing}
         else
-          false -> {:error, "attempt #{attempt_id} already has a different result"}
-          {:error, reason} -> {:error, "could not read prior attempt result: #{inspect(reason)}"}
+          false -> {:error, ServiceError.conflict("attempt #{attempt_id} already has a different result")}
+          {:error, reason} -> {:error, storage_error("could not read prior attempt result", reason)}
         end
 
       {:error, reason} ->
-        {:error, "could not record attempt result: #{inspect(reason)}"}
+        {:error, storage_error("could not record attempt result", reason)}
     end
   end
 
@@ -998,26 +946,21 @@ defmodule Code.Factory do
     end
   end
 
-  defp maybe_put(map, _key, nil), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+  defp identifier, do: Shared.identifier("r")
 
-  defp read_json(key) do
-    with {:ok, body, _etag} <- ObjectStore.get(key), do: decode(key, body)
+  # Run ids sort newest first: `q`, then the creation time subtracted from a
+  # fixed ceiling as 13 zero-padded digits, then a random suffix. Listing a
+  # page can therefore order by id without reading every run. The `q` prefix
+  # sorts before the random `r` ids runs used to get, which stay valid.
+  defp run_identifier do
+    inverted = 9_999_999_999_999 - now()
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(9), padding: false)
+    "q" <> String.pad_leading(Integer.to_string(inverted), 13, "0") <> "-" <> suffix
   end
 
-  defp read_json_with_etag(key) do
-    with {:ok, body, etag} <- ObjectStore.get(key),
-         {:ok, value} <- decode(key, body) do
-      {:ok, value, etag}
-    end
-  end
-
-  defp decode(key, body) do
-    case JSON.decode(body) do
-      {:ok, value} when is_map(value) -> {:ok, value}
-      _ -> {:error, "malformed factory object #{key}"}
-    end
-  end
+  defp put_immutable(key, value), do: Shared.put_immutable(key, value, @content_type)
+  defp read_json(key), do: Shared.read_json(key, "factory")
+  defp read_json_with_etag(key), do: Shared.read_json_with_etag(key, "factory")
 
   defp runs_prefix(repo_id), do: "factory/#{repo_id}/runs/"
   defp run_prefix(repo_id, run_id), do: runs_prefix(repo_id) <> run_id <> "/"

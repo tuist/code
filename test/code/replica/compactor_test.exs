@@ -142,6 +142,110 @@ defmodule Code.Replica.CompactorTest do
     end
   end
 
+  test "publishes the log's refs, not whatever the local repository holds", %{
+    principal: principal,
+    repo: repo
+  } do
+    first = commit(repo, principal, "one").commit
+    second = commit(repo, principal, "two").commit
+    {:ok, view} = Replica.ensure_fresh(repo)
+    {:ok, index, _} = WAL.fetch(repo)
+    assert Index.ref(index, "refs/heads/main") == second
+
+    # A delayed local update-ref from an earlier write lands after the
+    # replica converged, moving the local branch backwards. The index has not
+    # changed, so nothing about the compaction's snapshot is stale.
+    :ok = Git.update_refs(view.path, [Entry.command("refs/heads/main", second, first)])
+    {:ok, _} = Git.run(view.path, ["reflog", "expire", "--expire=now", "--all"])
+
+    assert {:ok, _} = Compactor.compact(repo)
+
+    {:ok, compacted, _} = WAL.fetch(repo)
+    assert Index.ref(compacted, "refs/heads/main") == second, "compaction reverted a committed push"
+    assert compacted.base.refs == index.refs
+
+    # And the new base really holds what it names: a replica built from it
+    # alone reaches the newest commit.
+    Replica.evict(repo)
+    {:ok, view} = Replica.ensure_fresh(repo)
+    assert {:ok, [%{oid: ^second} | _]} = Git.log(view.path, "refs/heads/main")
+  end
+
+  describe "a write whose objects were computed before a compaction" do
+    test "is refused when the compaction dropped what it relied on", %{principal: principal, repo: repo} do
+      side = commit(repo, principal, "one").commit
+      commit(repo, principal, "two")
+
+      {:ok, before, _} = WAL.fetch(repo)
+
+      {:ok, _} =
+        WAL.append(repo, fn _ ->
+          {:ok,
+           Entry.new(
+             type: :ENTRY_TYPE_PUSH,
+             commands: [Entry.command("refs/heads/side", Entry.zero_oid(), side)]
+           )}
+        end)
+
+      {:ok, relied_on, _} = WAL.fetch(repo)
+
+      # The ref it relied on is deleted and the log compacted: the new base is
+      # a repack of what is left, which need not contain that ref's objects.
+      {:ok, _} =
+        WAL.append(repo, fn _ ->
+          {:ok,
+           Entry.new(
+             type: :ENTRY_TYPE_PUSH,
+             commands: [Entry.command("refs/heads/side", side, Entry.zero_oid())]
+           )}
+        end)
+
+      {:ok, _} = Compactor.compact(repo)
+      {:ok, compacted, _} = WAL.fetch(repo)
+
+      entry =
+        Entry.new(
+          type: :ENTRY_TYPE_PUSH,
+          commands: [Entry.command("refs/heads/feature", Entry.zero_oid(), String.duplicate("d", 40))]
+        )
+
+      {:ok, relying} =
+        WAL.prepare(repo, entry, fn _ -> :ok end, basis: WAL.basis(relied_on, Map.values(relied_on.refs)))
+
+      {:ok, unaffected} =
+        WAL.prepare(repo, %{entry | at_ms: entry.at_ms + 1}, fn _ -> :ok end,
+          basis: WAL.basis(before, Map.values(before.refs))
+        )
+
+      assert compacted.epoch > relied_on.epoch
+      assert {:ok, [{:error, :basis_compacted}, {:ok, _}]} = WAL.append_batch(repo, [relying, unaffected])
+    end
+
+    test "is accepted in the same epoch whatever happened to the refs", %{principal: principal, repo: repo} do
+      side = commit(repo, principal, "one").commit
+      {:ok, basis, _} = WAL.fetch(repo)
+
+      {:ok, _} =
+        WAL.append(repo, fn _ ->
+          {:ok,
+           Entry.new(
+             type: :ENTRY_TYPE_PUSH,
+             commands: [Entry.command("refs/heads/main", side, Entry.zero_oid())]
+           )}
+        end)
+
+      entry =
+        Entry.new(type: :ENTRY_TYPE_PUSH, commands: [Entry.command("refs/heads/x", Entry.zero_oid(), side)])
+
+      {:ok, prepared} =
+        WAL.prepare(repo, entry, fn _ -> :ok end, basis: WAL.basis(basis, Map.values(basis.refs)))
+
+      # Packs only accumulate within an epoch, so everything the basis
+      # provided is still provided.
+      assert {:ok, [{:ok, _}]} = WAL.append_batch(repo, [prepared])
+    end
+  end
+
   test "refuses to compact from a stale replica", %{repo: repo} do
     # A repack of a repository that is behind would publish a base missing the
     # newest pushes, so this has to fail rather than proceed.

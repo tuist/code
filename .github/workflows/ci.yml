@@ -7,7 +7,9 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Only pull requests cancel superseded runs. On main every commit's run has
+  # to finish, because the release workflow waits for a successful one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   MISE_VERSION: "2026.4.18"
@@ -19,7 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
           install_args: "erlang elixir"
@@ -41,7 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
           install_args: "erlang elixir"
@@ -60,7 +62,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
           install_args: "erlang elixir"
@@ -79,7 +81,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
           install_args: "erlang elixir shellspec"
@@ -109,7 +111,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
           install_args: "erlang elixir protoc"
@@ -327,7 +329,7 @@ jobs:
             [ "$remaining" = "0" ] || { echo "::error::$pod still holds a copy"; exit 1; }
           done
 
-          kubectl -n code run rebuild --rm -i --restart=Never --image=alpine/git:latest --command -- sh -c '
+          kubectl -n code run rebuild --rm -i --restart=Never --image=alpine/git:2.54.0@sha256:ae0f6f4bce38d2b8c40becc0d6241a08d9f57186ea03029de2189a2b5e722d94 --command -- sh -c '
             export HOME=/tmp
             git clone -q http://x-access-token:ci-token@code:4000/acme/ci.git /tmp/r
             grep -q hello /tmp/r/README.md
@@ -335,7 +337,7 @@ jobs:
 
       - name: Serving through the Service, which round-robins across pods
         run: |
-          kubectl -n code run gitclient --rm -i --restart=Never --image=alpine/git:latest --command -- sh -c '
+          kubectl -n code run gitclient --rm -i --restart=Never --image=alpine/git:2.54.0@sha256:ae0f6f4bce38d2b8c40becc0d6241a08d9f57186ea03029de2189a2b5e722d94 --command -- sh -c '
             set -e
             export HOME=/tmp
             for i in 1 2 3 4; do

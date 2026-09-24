@@ -15,6 +15,11 @@ defmodule Code.Replica.Reaper do
   Repositories this node should no longer hold at all — because the cluster
   grew or shrank and rendezvous hashing moved them elsewhere — are evicted on
   the same pass, without any rebalancing job to run.
+
+  Neither kind is evicted while it is in use: a streamed clone or a push in
+  quarantine holds a `Code.Replica.Lease` on the repository's directory, and
+  the sweep leaves it for the next pass rather than deleting files from under
+  it.
   """
 
   use GenServer
@@ -56,9 +61,14 @@ defmodule Code.Replica.Reaper do
   defp do_sweep do
     idle_after = Config.idle_eviction_ms()
 
-    for repo_id <- Replica.resident(), evictable?(repo_id, idle_after) do
-      Logger.info("reaping #{repo_id}")
-      Replica.evict(repo_id)
+    # Whether idle or misplaced, a repository with a clone streaming from it or
+    # a push in flight against it is left for a later sweep: those run outside
+    # the replica process, and deleting their files would break them midway.
+    # The replica checks that itself, ordered with its other work.
+    for repo_id <- Replica.resident(),
+        evictable?(repo_id, idle_after),
+        Replica.evict(repo_id, :if_unused) == :ok do
+      Logger.info("reaped replica", repo_id: repo_id)
       repo_id
     end
   end

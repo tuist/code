@@ -99,7 +99,23 @@ Authorization is on the path of every request, so policies are cached per node
 and revalidated with a conditional GET once `CODE_POLICY_STALENESS_BUDGET_MS`
 elapses (five seconds by default). Unlike a repository read, where serving
 stale data would be a correctness failure, this is a bounded and deliberate
-window — and still far tighter than the token lifetime it replaces.
+window — and still far tighter than the token lifetime it replaces. An account
+with no policy object is cached as absent for the same window, so accounts
+without a policy do not cost a read on every request their tokens do not
+cover.
+
+When object storage cannot be reached, a policy the node has already read
+keeps authorizing for at most `CODE_POLICY_MAX_STALE_MS` (fifteen minutes by
+default) after the store last confirmed it. Past that, policy grants fail
+closed until the store answers, so a revocation made during a long outage is
+never ignored indefinitely by a node that cannot see it. A policy the node has
+never read grants nothing while the store is unreachable.
+
+The policy store and the admin `/policy/<account>` routes validate account
+names: an account is a single repository-id segment, and anything else (`..`,
+a nested path, a leading dot or dash) is refused, or answered as not found,
+before any policy key is derived from it. Git smart-HTTP requests validate the
+full repository id before authorization for the same reason.
 
 ## What isolation you actually get
 
@@ -118,7 +134,9 @@ it is a gap: nothing stops a tenant whose grants are broad from claiming a name
 that should belong to someone else, and nothing records who claimed it.
 
 **Credential isolation: yes.** Tokens are audience-bound to this deployment and
-verified against the issuer configured for the account.
+verified against the single issuer configured for the deployment. Per-account
+issuers are **not implemented**; see [one issuer per
+deployment](#one-issuer-per-deployment-today).
 
 **Durability isolation: yes.** One tenant cannot affect another's data;
 everything authoritative is in object storage under a distinct prefix.

@@ -24,6 +24,24 @@ defmodule Code.Control do
   alias Code.WAL
   alias Code.WAL.Index
 
+  @max_replicas 256
+  @replica_cas_attempts 8
+
+  @doc """
+  The largest replica count a repository may ask for.
+
+  The count is a placement hint encoded into the index as an unsigned
+  integer, so it is validated before anything touches the log: a string, a
+  float, zero or a negative number would either fail to encode or produce a
+  placement that holds the repository nowhere.
+  """
+  @spec max_replicas() :: pos_integer()
+  def max_replicas, do: @max_replicas
+
+  @doc "Whether `count` is a replica count `create_repository/2` and `set_replica_count/2` accept."
+  @spec valid_replica_count?(term()) :: boolean()
+  def valid_replica_count?(count), do: is_integer(count) and count in 1..@max_replicas
+
   @doc """
   Create a repository.
 
@@ -32,6 +50,19 @@ defmodule Code.Control do
   """
   @spec create_repository(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def create_repository(repo_id, opts \\ []) do
+    with :ok <- validate_replicas_option(opts) do
+      do_create_repository(repo_id, opts)
+    end
+  end
+
+  defp validate_replicas_option(opts) do
+    case Keyword.fetch(opts, :replicas) do
+      :error -> :ok
+      {:ok, count} -> if valid_replica_count?(count), do: :ok, else: {:error, :invalid_replica_count}
+    end
+  end
+
+  defp do_create_repository(repo_id, opts) do
     case WAL.create(repo_id, opts) do
       {:ok, index} ->
         Logger.info("created repository", repo_id: repo_id)
@@ -46,19 +77,65 @@ defmodule Code.Control do
     end
   end
 
-  @doc "Delete a repository and everything belonging to it. Irreversible."
-  @spec delete_repository(String.t()) :: :ok | {:error, term()}
-  def delete_repository(repo_id) do
-    with :ok <- WAL.destroy(repo_id) do
-      # Evict everywhere rather than waiting for the reaper, so the bytes stop
-      # existing when the caller was told they would.
-      Cluster.members()
-      |> Enum.each(fn node ->
-        :erpc.cast(node, Replica, :evict, [repo_id])
-      end)
+  @doc """
+  Delete a repository and everything belonging to it. Irreversible.
 
-      Logger.info("deleted repository", repo_id: repo_id)
-      :ok
+  Only an existing repository can be deleted: an id that names no repository
+  — an account, say, which is a prefix of every repository in it — is
+  `:not_found`, never a prefix to sweep. Deletion goes through a tombstone in
+  the index (see `Code.WAL.destroy/2`), so concurrent writers are refused
+  rather than racing it, and a nested repository such as `acme/app/tools` is
+  untouched by deleting `acme/app`.
+
+  `{:error, {:partial_cleanup, failed}}` means the repository no longer exists
+  for anyone but some of its objects could not be removed; calling this again
+  resumes the cleanup.
+  """
+  @spec delete_repository(String.t()) ::
+          :ok | {:error, :not_found | {:invalid_repo_id, term()} | {:partial_cleanup, pos_integer()} | term()}
+  def delete_repository(repo_id) do
+    if WAL.valid_id?(repo_id) do
+      result = WAL.destroy(repo_id, fn -> factory_keys(repo_id) end)
+
+      if result == :ok or match?({:error, {:partial_cleanup, _}}, result) do
+        # Evict everywhere rather than waiting for the reaper, so the bytes stop
+        # existing when the caller was told they would. A partial cleanup has
+        # still tombstoned the repository, so its caches are just as dead.
+        Cluster.members()
+        |> Enum.each(fn node ->
+          :erpc.cast(node, Replica, :evict, [repo_id])
+        end)
+      end
+
+      case result do
+        :ok ->
+          Logger.info("deleted repository", repo_id: repo_id)
+
+        {:error, reason} ->
+          Logger.warning("repository deletion failed", repo_id: repo_id, reason: inspect(reason))
+      end
+
+      result
+    else
+      {:error, {:invalid_repo_id, repo_id}}
+    end
+  end
+
+  # Work-run records are kept beside the log rather than in it, under
+  # `factory/<repo_id>/runs/<run_id>/`. A nested repository's runs live under
+  # the same prefix one level down (`factory/acme/app/tools/runs/...` sits
+  # inside `factory/acme/app/...`), so keys are matched against the exact
+  # shape `Code.Factory` writes rather than deleted by prefix.
+  @run_file ~r"^r[A-Za-z0-9_\-]{24}/(specification\.json|state\.json|events/[^/]+\.json|attempts/[^/]+/(claim|result)\.json)$"
+
+  defp factory_keys(repo_id) do
+    prefix = "factory/#{repo_id}/runs/"
+
+    with {:ok, entries} <- Code.ObjectStore.list(prefix) do
+      {:ok,
+       entries
+       |> Enum.map(& &1.key)
+       |> Enum.filter(&Regex.match?(@run_file, String.replace_prefix(&1, prefix, "")))}
     end
   end
 
@@ -131,16 +208,38 @@ defmodule Code.Control do
     Code.Ingest.set_head(repo_id, ref)
   end
 
-  @doc "Change how many replicas a repository should have."
-  @spec set_replica_count(String.t(), pos_integer()) :: {:ok, map()} | {:error, term()}
-  def set_replica_count(repo_id, count) when count > 0 do
-    with {:ok, index, etag} <- WAL.fetch(repo_id),
-         {:ok, _} <-
-           Code.ObjectStore.put(WAL.index_key(repo_id), Index.encode(%{index | replicas: count}),
-             if_match: etag,
-             content_type: "application/vnd.code.wal.v1+protobuf"
-           ) do
-      {:ok, %{repo_id: repo_id, replicas: count}}
+  @doc """
+  Change how many replicas a repository should have.
+
+  The index is rewritten with a conditional write against the version just
+  read, and a lost race re-reads and retries, so a concurrent push is never
+  overwritten and a busy repository does not turn the change into a spurious
+  failure. Returns `{:error, :invalid_replica_count}` for a count outside
+  `1..max_replicas()`, and `{:error, :cas_exhausted}` if every attempt lost.
+  """
+  @spec set_replica_count(String.t(), term()) :: {:ok, map()} | {:error, term()}
+  def set_replica_count(repo_id, count) do
+    if valid_replica_count?(count),
+      do: put_replica_count(repo_id, count, @replica_cas_attempts),
+      else: {:error, :invalid_replica_count}
+  end
+
+  defp put_replica_count(_repo_id, _count, 0), do: {:error, :cas_exhausted}
+
+  defp put_replica_count(repo_id, count, attempts) do
+    with {:ok, index, etag} <- WAL.fetch(repo_id) do
+      if index.replicas == count do
+        {:ok, %{repo_id: repo_id, replicas: count}}
+      else
+        case Code.ObjectStore.put(WAL.index_key(repo_id), Index.encode(%{index | replicas: count}),
+               if_match: etag,
+               content_type: "application/vnd.code.wal.v1+protobuf"
+             ) do
+          {:ok, _} -> {:ok, %{repo_id: repo_id, replicas: count}}
+          {:error, :precondition_failed} -> put_replica_count(repo_id, count, attempts - 1)
+          {:error, reason} -> {:error, reason}
+        end
+      end
     end
   end
 

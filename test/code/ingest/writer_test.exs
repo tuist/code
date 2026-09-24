@@ -165,6 +165,52 @@ defmodule Code.Ingest.WriterTest do
     end
   end
 
+  describe "admission" do
+    test "refuses once the queue is full, even while the writer is stalled", %{repo: repo} do
+      # A stalled writer never gets to its mailbox, so a limit checked inside
+      # it would admit everything. Suspending it is exactly that stall.
+      Code.Config.put_overrides(Map.put(Code.Config.overrides(), :writer_max_queued, 2))
+      {:ok, writer} = Writer.ensure_started(repo)
+      :sys.suspend(writer)
+
+      tasks =
+        for n <- 1..2 do
+          Task.async(fn ->
+            Writer.commit(repo, prepare(repo, "refs/heads/b#{n}", Entry.zero_oid(), fake_oid(n)))
+          end)
+        end
+
+      wait_for_queue(writer, 2)
+
+      assert {:error, :writer_overloaded} =
+               Writer.commit(repo, prepare(repo, "refs/heads/b3", Entry.zero_oid(), fake_oid(3)))
+
+      :sys.resume(writer)
+      assert Enum.all?(Task.await_many(tasks, 30_000), &match?({:ok, _}, &1))
+
+      # Answered requests stop counting, so the writer admits again.
+      assert {:ok, _} = Writer.commit(repo, prepare(repo, "refs/heads/b4", Entry.zero_oid(), fake_oid(4)))
+    end
+
+    test "a timed-out caller gets a typed error, and its entry may still commit", %{repo: repo} do
+      {:ok, writer} = Writer.ensure_started(repo)
+      :sys.suspend(writer)
+
+      prepared = prepare(repo, "refs/heads/main", Entry.zero_oid(), fake_oid(1))
+      assert {:error, :writer_timeout} = Writer.commit(repo, prepared, timeout: 50)
+
+      :sys.resume(writer)
+
+      # The request was still queued; the writer commits it and releases its
+      # admission slot even though nobody is waiting for the answer.
+      assert {:ok, %{seq: 2}} =
+               Writer.commit(repo, prepare(repo, "refs/heads/other", Entry.zero_oid(), fake_oid(2)))
+
+      {:ok, index, _} = WAL.fetch(repo)
+      assert Index.ref(index, "refs/heads/main") == fake_oid(1)
+    end
+  end
+
   describe "routing" do
     test "a single-node cluster commits locally", %{repo: repo} do
       # There is no other node to prefer, and the absence of one must not be an

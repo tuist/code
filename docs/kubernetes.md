@@ -66,9 +66,31 @@ and a `git upload-pack` for its whole duration — minutes for a large monorepo 
 while CPU stays unremarkable. By the time CPU is a useful signal the node has
 already run out of capacity to accept work.
 
-This needs `prometheus-adapter` or KEDA to expose the metric. The chart ships a
-`ServiceMonitor` and an example adapter rule. CPU is worth keeping as a secondary
-trigger for compaction load.
+This needs `prometheus-adapter` or KEDA to expose the metric. The HPA asks the
+custom metrics API for `code_git_requests_in_flight`, a per-pod gauge of Git
+smart-HTTP requests being served. The chart ships a `ServiceMonitor`
+(`serviceMonitor.enabled=true`) so Prometheus scrapes it, but it does **not**
+install or configure an adapter. With `prometheus-adapter`, a rule along these
+lines exposes the series under the name the HPA uses:
+
+```yaml
+rules:
+  custom:
+    - seriesQuery: 'code_git_requests_in_flight{namespace!="",pod!=""}'
+      resources:
+        overrides:
+          namespace: {resource: namespace}
+          pod: {resource: pod}
+      name:
+        as: code_git_requests_in_flight
+      metricsQuery: 'sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+```
+
+This rule is an example rather than something the project's CI exercises; check
+it against your adapter version with
+`kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` before enabling
+`inFlightMetric`. CPU is worth keeping as a secondary trigger for compaction
+load.
 
 Scale-down is safe at any moment: a terminating pod's repositories are already
 in the log, so the only cost is that whoever inherits them materializes on first
@@ -93,7 +115,9 @@ matter, and both are handled by the chart:
     permission Code ever needs — the read-only
     `system:service-account-issuer-discovery` role — and the chart grants it
     only when this backend is configured. Everything else, clustering
-    included, needs no API access at all.
+    included, needs no API access at all. The token and CA are attached only
+    in this mode, only over HTTPS, and only to the API server and the key-set
+    address it publishes; a configured external issuer never receives them.
 
   * **Do not configure the issuer by hand.** Kubernetes is *reached* at
     `https://kubernetes.default.svc` but *issues* tokens naming

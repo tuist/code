@@ -109,6 +109,23 @@ defmodule Code.ObjectStoreTest do
     refute "other/c" in keys
   end
 
+  test "list_prefixes/1 returns one level, as a delimiter listing does" do
+    ObjectStore.put("repos/acme/index.pb", "1")
+    ObjectStore.put("repos/acme/app/index.pb", "2")
+    ObjectStore.put("repos/acme/wal/e.pb", "3")
+    ObjectStore.put("repos/other/index.pb", "4")
+
+    assert {:ok, %{keys: [%{key: "repos/acme/index.pb", size: 1}], prefixes: prefixes}} =
+             ObjectStore.list_prefixes("repos/acme/")
+
+    assert prefixes == ["repos/acme/app/", "repos/acme/wal/"]
+    assert {:ok, %{keys: [], prefixes: []}} = ObjectStore.list_prefixes("repos/absent/")
+  end
+
+  test "probe/0 succeeds against a reachable store" do
+    assert :ok = ObjectStore.probe()
+  end
+
   describe "streaming" do
     @tag :tmp_dir
     test "a file round trips without being read into a binary", %{tmp_dir: tmp} do

@@ -94,6 +94,47 @@ defmodule Code.Auth.WebhookTest do
       assert {:error, :authority_unreachable} = Webhook.authenticate({:bearer, "t"}, config)
     end
 
+    test "only the four known permissions are accepted", %{config: config} do
+      # `String.to_existing_atom/1` used to turn any loaded atom into a
+      # "permission" and raise on everything else.
+      for grants <- [
+            [%{"pattern" => "acme/**", "permissions" => ["ok"]}],
+            [%{"pattern" => "acme/**", "permissions" => ["superuser"]}],
+            [%{"pattern" => "acme/**", "permissions" => [1]}],
+            ["acme/**:read,erlang"],
+            ["acme/**:not-a-permission-atom-#{:erlang.unique_integer([:positive])}"]
+          ] do
+        respond(200, %{"subject" => "bot", "grants" => grants})
+
+        assert {:error, :invalid_authority_response} = Webhook.authenticate({:bearer, "t"}, config),
+               inspect(grants)
+      end
+
+      respond(200, %{"subject" => "bot", "grants" => ["acme/**:read,write,execute,admin"]})
+      assert {:ok, principal} = Webhook.authenticate({:bearer, "t"}, config)
+      assert [%{permissions: [:read, :write, :execute, :admin]}] = principal.grants
+    end
+
+    test "a malformed body is an error, not a crash", %{config: config} do
+      for body <- [
+            "not json",
+            ["a", "list"],
+            %{"subject" => 42},
+            %{"subject" => "a", "grants" => "acme/**"},
+            %{"subject" => "a", "grants" => [42]},
+            %{"subject" => "a", "grants" => [%{"pattern" => 1, "permissions" => ["read"]}]},
+            %{"subject" => "a", "claims" => "nope"},
+            %{"subject" => "a", "expires_at" => 100_000_000_000_000_000_000},
+            %{"subject" => "a", "expires_at" => "next tuesday"},
+            %{"subject" => "a", "expires_at" => 1.5}
+          ] do
+        respond(200, body)
+
+        assert {:error, :invalid_authority_response} = Webhook.authenticate({:bearer, "t"}, config),
+               inspect(body)
+      end
+    end
+
     test "an anonymous request is not sent to the authority at all", %{config: config} do
       stub(Req, :post, fn _url, _opts -> flunk("should not have called the authority") end)
 

@@ -13,7 +13,7 @@ unchanged to every node. The only per-node value is `CODE_NODE_ID`.
 | `CODE_S3_ENDPOINT` | Object store endpoint |
 | `CODE_S3_ACCESS_KEY_ID` | |
 | `CODE_S3_SECRET_ACCESS_KEY` | |
-| `CODE_ADMIN_TOKEN` | Bearer token for the admin API |
+| `CODE_ADMIN_TOKEN` | Bearer token for the admin API. An empty or whitespace-only value stops the node from booting |
 
 ### Object storage
 
@@ -32,7 +32,7 @@ exist, and Code will not be safe.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CODE_MAX_PORTS` | `65536` | Ceiling on concurrent Git streams and connections. Raising it costs memory: the BEAM pre-allocates the whole table, and a container's default file-descriptor limit would otherwise make that 1.5 GB |
+| `CODE_MAX_PORTS` | `65536` | Ceiling on concurrent Git streams and connections. Raising it costs memory: the BEAM pre-allocates the whole table, and a container's default file-descriptor limit would otherwise make that 1.5 GB. The release script turns it into `ERL_MAX_PORTS`, and it takes precedence over an `ERL_MAX_PORTS` already in the environment |
 | `CODE_DEFAULT_REPLICAS` | `3` | Per-repository, overridable |
 | `CODE_STALENESS_BUDGET_MS` | `0` | See below |
 | `CODE_COMPACTION_ENTRY_THRESHOLD` | `250` | |
@@ -45,6 +45,10 @@ exist, and Code will not be safe.
 | `CODE_MAINTENANCE_SWEEP_MS` | `300000` | How often resident repositories are considered |
 | `CODE_IDLE_EVICTION_MS` | `3600000` | Drop untouched repositories from disk |
 | `CODE_DATA_DIR` | `/var/lib/code/repositories` | Put this on fast local NVMe |
+| `CODE_POLICY_STALENESS_BUDGET_MS` | `5000` | How long a cached authorization policy, or a cached absence of one, is used before revalidating |
+| `CODE_POLICY_MAX_STALE_MS` | `900000` | How long a cached policy may keep authorizing while object storage cannot confirm it. See [Object storage is unreachable](#failure-modes) |
+| `CODE_ADMIN_IP` | all interfaces | Address the admin listener binds to, such as `127.0.0.1`. Leave unset in Kubernetes, where probes reach the pod IP |
+| `CODE_SHUTDOWN_TIMEOUT_MS` | `100000` | How long listeners wait for in-flight requests on shutdown. Keep it below the orchestrator's grace period. See [Graceful shutdown](#graceful-shutdown) |
 
 **`CODE_STALENESS_BUDGET_MS` deserves a moment.** At `0`, every read
 re-validates against object storage before serving, which is what makes a client
@@ -80,8 +84,10 @@ are intentionally unavailable until their public contracts are implemented.
 | Variable | Default | Notes |
 |---|---|---|
 | `CODE_CLUSTER_STRATEGY` | `none` | `kubernetes`, `dns`, `epmd` |
-| `CODE_HEADLESS_SERVICE` | `code-headless` | For the Kubernetes strategy |
-| `CODE_NAMESPACE` | `default` | |
+| `CODE_HEADLESS_SERVICE` | `code-headless` | For the Kubernetes strategy: the headless Service whose DNS records list the pods |
+| `CODE_DNS_QUERY` | | **Required for the `dns` strategy.** The DNS name whose A records list the nodes, for example a Docker Compose service name |
+| `CODE_PEERS` | | For the `epmd` strategy: comma-separated Erlang node names, such as `code@10.0.0.1,code@10.0.0.2` |
+| `CODE_RELEASE_NAME` | `code` | The Erlang node basename used by the `kubernetes` and `dns` strategies |
 | `RELEASE_COOKIE` | | **Required for clustering.** Distributed Erlang's shared secret |
 
 A single node works with no clustering at all. Clustering buys read scaling and
@@ -93,10 +99,22 @@ See [kubernetes.md](kubernetes.md) for the full picture.
 
 | Variable | Notes |
 |---|---|
-| `CODE_AUTH_BACKEND` | `webhook` (default), `oidc`, `static`, `none` |
+| `CODE_AUTH_BACKEND` | `webhook` (default), `oidc`, `static`, `none`. `none` authorizes everything and is refused when `MIX_ENV=prod`, which includes the release image |
 | `CODE_OIDC_ISSUER` | Token issuer, used to discover the JWKS |
 | `CODE_OIDC_AUDIENCE` | **Set this.** Binds tokens to this deployment |
-| `CODE_AUTH_ENDPOINT` | For the webhook backend |
+| `CODE_OIDC_KUBERNETES` | `true` to discover the issuer and keys from the Kubernetes API server. Only then are the pod's service-account token and cluster CA attached, and only to the API server over HTTPS |
+| `CODE_AUTH_ENDPOINT` | For the webhook backend: where credentials are sent to be checked |
+| `CODE_AUTH_TOKEN` | **Required for the webhook backend.** Bearer token Code presents to `CODE_AUTH_ENDPOINT`, so the endpoint can tell Code's requests from anyone else's. Must not be blank |
+| `CODE_AUTH_CACHE_TTL_MS` | For the webhook backend: how long an answer is cached; defaults to `30000` |
+| `CODE_AUTH_TOKENS` | For the static backend: `token=account:permissions` entries separated by `;`. A malformed entry stops the node from booting with an error naming its position, never its contents |
+
+Signing keys for the `oidc` backend are cached per node. Requests are served
+from the cache without waiting on the issuer; a due refresh runs in the
+background, and each fetch is bounded to five seconds. A response that is not
+a usable key set (not JSON, no `keys`, or no key that parses) is logged and
+ignored, so the previous keys keep working. Tokens are accepted up to 60
+seconds past `exp` to absorb clock skew, and that same window applies
+everywhere a token's expiry is checked.
 
 ### Browser login for Git
 
@@ -133,7 +151,7 @@ credentials for other hosts:
 ./scripts/configure-code-git --url https://git.example.com
 ```
 
-The script defaults to `https://code.dev`, downloads metadata only over
+`--url` is required. The script downloads metadata only over
 HTTPS without redirects, validates its strict `key=value` document, and writes
 Git configuration scoped to that exact origin. It neither receives nor stores a
 token. For a release
@@ -198,8 +216,13 @@ service's trace tree.
 
 When tracing is enabled, logs emitted inside Code's explicit spans include
 `otel_trace_id` and `otel_span_id`. Operational logs use fields such as
-`repo_id`, `seq`, `epoch`, `reason`, `service`, and `duration_ms`; configure
-the log collector to retain those fields. Credentials, object keys, and request
+`repo_id`, `seq`, `epoch`, `reason`, `service`, `kind`, `outcome`,
+`duration_ms`, `subcommand` and `stderr` (bounded Git diagnostics, kept out
+of protocol output); configure the log collector to retain those fields.
+Every maintenance job that fails or crashes is logged with its `repo_id`,
+`kind`, `mode` and `reason` and traced as `code.maintenance.job`, including
+jobs a sweep started without anyone waiting for the result. Credentials,
+object keys, and request
 bodies are never logged.
 
 ## Ports
@@ -217,12 +240,19 @@ written to disk. It must never be exposed.
 
 `GET :4002/metrics`, Prometheus format.
 
+Names below are exactly what the exporter emits, and a test compares them with
+a real scrape. Durations are recorded in seconds, but only the HTTP and
+object-store histograms carry a `_seconds` suffix in their names. Histograms
+expose the usual `_bucket`, `_sum` and `_count` series. Labels are always
+bounded: no repository, account, object key or token ever becomes one.
+
 ### The one to watch
 
-**`code_wal_read_duration_seconds{outcome}`.** A healthy node's reads are
+**`code_wal_read_duration{outcome}`** (seconds). A healthy node's reads are
 overwhelmingly `not_modified`: replicas confirm they are current with a
 metadata-only round trip and serve immediately. If `modified` starts dominating,
 replicas are doing real catch-up work on the read path, and latency will follow.
+`code_wal_read_count{outcome}` counts the same reads.
 
 ### The rest
 
@@ -230,23 +260,83 @@ replicas are doing real catch-up work on the read path, and latency will follow.
 |---|---|
 | `code_wal_cas_retry_count` | Is there write contention the writer could not absorb? A few are normal; many mean pushes are arriving at several nodes at once, so routing to the preferred writer is not taking effect |
 | `code_wal_append_batch_size` | Pushes absorbed per compare-and-swap. Rising with load is group commit doing its job |
+| `code_wal_append_count`, `code_wal_append_attempts` | Entries committed, and the compare-and-swap attempts each needed |
+| `code_wal_ambiguous_commit_count` | A lost compare-and-swap turned out to be this node's own write whose reply was lost. Harmless, but a rising rate means the store is dropping replies |
+| `code_wal_compact_count` | Compactions this node performed |
+| `code_wal_pack_upload_bytes`, `code_wal_pack_download_bytes` | Pack bytes streamed into and out of the log. Sustained download growth means caches are rebuilt more often than they are used |
 | `code_replica_sync_entries_behind` | How far behind is this node? Persistent non-zero means hints are not arriving, or the store is slow |
-| `code_git_requests_in_flight` | Should we scale? See below |
-| `code_push_rejected_count{reason}` | `non_fast_forward` is users; `storage` and `contention` are yours |
-| `code_git_aborted_count` | Clients disconnecting mid-clone |
+| `code_replica_sync_duration`, `code_replica_sync_packs_downloaded` | Time (seconds) and packs needed to bring a replica into agreement with the log |
 | `code_replica_evict_count` | Cache churn. High values with high sync duration means the working set does not fit |
-| `code_object_store_request_duration_seconds{operation,outcome}` | Is the source of truth slow or failing? `operation` and `outcome` have bounded values; no repository identifier is a label |
+| `code_replica_evict_deferred_count` | Evictions postponed because a clone or push still held the repository. They are retried on the reaper's next pass |
+| `code_replica_rematerialize_count` | Replicas rebuilt from the log because their local copy disappeared. Expected after someone clears the cache; otherwise, look for what is deleting it |
+| `code_replica_prune_packs`, `code_replica_prune_deferred_packs` | Superseded packfiles removed from local disk, and those kept for now because the repository was in use |
+| `code_git_pack_index_count{outcome}` | Pack indexes installed; `reused` means the downloaded index was verified and kept; `rebuilt` (none was downloaded) and `rebuilt_invalid` (it did not match the pack) mean `index-pack` had to run |
+| `code_git_requests_in_flight` | Should we scale? See below |
+| `code_git_served_duration{service}`, `code_git_served_bytes{service}` | How long Git protocol requests take (seconds), and how much they send |
+| `code_git_aborted_count{service}` | Clients disconnecting mid-clone |
+| `code_git_command_duration{subcommand,outcome}`, `code_git_command_count{subcommand,outcome}` | Are git plumbing commands slow or failing? `outcome` is `ok`, `error` or `timeout` |
+| `code_push_committed_duration`, `code_push_committed_count` | Time (seconds) from receiving a push to it being durable, and how many landed |
+| `code_push_rejected_count{reason}` | `non_fast_forward` is users; `storage`, `contention`, `overloaded` and `timeout` are yours (`timeout` pushes may still have committed). `incomplete_push` is a push naming objects it neither carried nor could rely on the log for; `deleted` is a write to a repository being deleted |
+| `code_push_closure_check_duration{outcome}` | Time spent proving a push carries every object its new refs need. `incomplete` is a push that was refused for it |
+| `code_push_local_apply_failed_count` | Committed pushes this node could not apply to its own cache. The push is durable; the next sync repairs the cache |
+| `code_writer_fallback_count{reason}` | Pushes committed locally because the preferred writer was unreachable. Expected during a rolling deploy; sustained outside one, routing is not taking effect |
+| `code_writer_timeout_count` | Pushes that gave up waiting for the repository writer. Their entries may still have committed |
+| `code_maintenance_job_duration{kind,outcome}`, `code_maintenance_job_count{kind,outcome}` | Is maintenance keeping up, and is any of it failing? Counts every job, including unattended ones; `outcome` is `ok`, `not_due`, `error` or `crashed` |
+| `code_object_store_request_duration_seconds{operation,outcome}` | Is the source of truth slow or failing? |
 | `code_object_store_request_count{operation,outcome}` | Is object-store traffic or a particular failure outcome rising? |
-| `code_http_request_duration_seconds{listener,method,status}` | Is any public, hook, or administration listener slow or returning errors? `method` and `status` use bounded classes; `status` is a response class such as `5xx` |
+| `code_http_request_duration_seconds{listener,method,status}` | Is any public, hook, or administration listener slow or returning errors? `status` is a response class such as `5xx` |
+| `code_http_request_count{listener,method,status}`, `code_http_request_bytes{listener}` | Request volume, and response bytes sent |
 | `code_http_exception_count{listener}` | Did a request terminate unexpectedly before it could return a response? |
-| `code_factory_operation_duration_seconds{operation,outcome}` | Are durable graph-run or account configuration operations slow or failing? Operation and outcome are bounded, so repository work does not create metric-label cardinality. |
+| `code_mcp_request_duration{method}`, `code_mcp_request_count{method,outcome}` | MCP request latency (seconds) and volume |
+| `code_factory_operation_duration{operation,outcome}` | Are durable graph-run or account configuration operations slow (seconds) or failing? |
 | `code_factory_operation_count{operation,outcome}` | Which durable graph-run or account configuration operations are succeeding or failing? |
+| `code_auth_denied_count{permission}` | Authorization denials |
+| `code_cluster_observed_size`, `code_cluster_observed_resident` | Cluster members, and repositories materialized on this node |
+| `code_cluster_observed_disk_used_bytes` | Bytes the local cache occupies. Measured in the background at most every five minutes, so it lags by up to that much and reads `0` until the first measurement |
+| `code_auth_rejected_count{reason}` | Are credentials failing, and whose problem is it? `reason` is one of a fixed set: caller-side values such as `invalid_credential`, `expired`, `audience_mismatch`, `issuer_mismatch`, `unknown_key`; operator-side values `misconfigured`, `key_source_unavailable`, `authority_unavailable`; and `other`. Anonymous requests, which `git` always sends first, are not counted |
+| `code_policy_revalidation_failed_count{outcome}` | Is object storage failing authorization reads? `served_stale` means a cached policy was used within `CODE_POLICY_MAX_STALE_MS`; `failed_closed` means it was older, and policy grants were refused |
+
+Rejected credentials are also logged, at `info` for caller-side reasons and
+`warning` for operator-side ones, with `reason`, `auth_backend` and
+`operation=authenticate` fields. Policy revalidation failures log `account`,
+`reason` and `age_ms` with `operation=policy_revalidate`: a `warning` while
+serving a cached policy, an `error` once grants fail closed. Signing-key refresh
+failures log `reason` with `operation=jwks_refresh`, and webhook authority
+failures `reason` with `operation=webhook_authenticate`.
+
+The BEAM and application metrics from PromEx's standard plugins are exported
+alongside these.
+
+These storage-core [telemetry](https://hexdocs.pm/telemetry) events are
+emitted with bounded metadata (`repo_id` is metadata for traces and logs, never
+a metric label) and have no Prometheus metric yet:
+
+| Event | Meaning |
+|---|---|
+| `[:code, :wal, :ambiguous_commit]` | A write whose response was lost was found committed; `cause` is `precondition_failed` or `transport_error` |
+| `[:code, :wal, :basis_compacted]` | A write's objects were computed before a compaction that may have dropped them; it is redone |
+| `[:code, :wal, :destroy]` | A deletion finished; `outcome` is `ok`, `partial`, `not_found` or `error` |
+| `[:code, :push, :closure_check]` | Duration and `outcome` (`closed`, `incomplete`, `error`) of proving a push's objects are provided |
+| `[:code, :push, :local_apply_failed]` | A committed agent write could not be applied locally; the node converges on its next read |
+| `[:code, :replica, :prune]`, `[:code, :replica, :prune_deferred]` | Packs the log no longer requires were removed, or left because the repository was in use |
+| `[:code, :replica, :evict_deferred]` | The reaper left a repository in use for a later sweep |
+| `[:code, :replica, :rematerialize]` | A cache was missing on disk although the log had not moved, and was rebuilt |
+| `[:code, :git, :pack_index]` | A pack's `.idx` was `reused`, `rebuilt`, or `rebuilt_invalid` because the downloaded one did not match |
+| `[:code, :compaction, :incomplete_repack]` | A repack did not contain everything its refs reach, and was not published |
+
+Git commands report `status` `timeout` on `[:code, :git, :command]` when they
+exceed their time limit (30 minutes unless the caller sets one).
 
 ### What to autoscale on
 
 `code_git_requests_in_flight`, not CPU. A clone occupies a connection, a
 process and a `git upload-pack` for its entire duration, which can be minutes,
 while CPU stays unremarkable. Scaling on CPU alone reacts far too late.
+
+It counts only Git smart-HTTP requests on the public listener: reference
+advertisement, `git-upload-pack` and `git-receive-pack`. Health probes, metric
+scrapes, MCP, API and hook traffic are excluded, so the signal follows clones
+and pushes rather than the scraper. It is a gauge sampled every ten seconds.
 
 Use CPU as a secondary signal for compaction load.
 
@@ -255,7 +345,7 @@ Use CPU as a secondary signal for compaction load.
 | Endpoint | Meaning |
 |---|---|
 | `GET :4002/health` | The process is up. Use as a liveness probe |
-| `GET :4002/ready` | Object storage is reachable. Use as a readiness probe |
+| `GET :4002/ready` | Object storage is reachable. Use as a readiness probe. One request for at most one key, whatever the bucket holds |
 
 Readiness deliberately depends on the object store: a node that cannot read the
 log cannot answer consistently and should leave rotation rather than serve stale
@@ -265,6 +355,14 @@ data.
 
 Bearer `CODE_ADMIN_TOKEN`. Any node answers any question.
 
+Every route except `/health`, `/ready` and `/metrics` requires the token, and
+the API fails closed: a node with no token configured answers `401` to all of
+them rather than serving them openly. A blank or whitespace bearer token never
+matches. The listener binds all interfaces unless `CODE_ADMIN_IP` is set, so
+outside Kubernetes set it, or firewall port 4002, to keep the API off public
+networks. `/policy/<account>` answers `404` for anything that is not a single
+valid account name.
+
 ```sh
 curl :4002/status                            # this node
 curl :4002/cluster                           # membership and resident repositories
@@ -272,15 +370,53 @@ curl :4002/repositories                      # every repository in the store
 curl :4002/repositories/acme/app             # log state, placement, replica health
 curl :4002/placement/acme/app                # where it should live, computed
 curl -XPOST :4002/repositories -d '{"repository":"acme/app"}'
-curl -XPOST :4002/compact/acme/app           # forwarded to the primary
+curl -XPOST :4002/compact/acme/app           # run on the preferred maintenance node
 curl -XPOST :4002/evict/acme/app             # drop the local cache
 curl -XPUT  :4002/replicas/acme/app -d '{"replicas":30}'
+curl -XDELETE :4002/repositories/acme/app    # irreversible; see below
 ```
+
+Replica counts must be integers from 1 to 256; anything else is a `422`, and a
+missing repository is a `404`. `DELETE /repositories/<id>` answers `204` when
+everything is gone, `404` for an id that is not a repository (including an
+account prefix such as `acme`, which never deletes the repositories under it),
+and `503` with `Retry-After` when the repository is tombstoned but some objects
+remain. Repeating the request finishes the cleanup. A `503` with `Retry-After`
+also means a conditional write lost its retries to concurrent writers; the
+request was valid and can be repeated as is.
+
+`POST /compact/<id>` can be sent to any node. It is forwarded to the node that
+rendezvous hashing prefers among those with the `maintain` role, which is not
+necessarily one of the repository's serving replicas. If that node cannot be
+reached, a local node with the `maintain` role runs the job instead; the
+conditional write that publishes a compaction keeps a duplicate harmless.
+
+`GET /repositories` walks the bucket one prefix level at a time rather than
+listing every object, so its cost grows with the number of repositories and
+accounts, not with their history. It is not paginated.
 
 `GET /repositories/<id>` is the one to reach for first when something is wrong.
 It reports the log's position, each replica's position, and the ages of its
 last verification and last access. That makes "which nodes are behind, and by
 how much" and "is this cache actively used" answerable in one request.
+
+## Graceful shutdown
+
+When a pod is deleted, two things happen at once: Kubernetes starts removing
+it from Service endpoints, and the kubelet runs its preStop hook and then sends
+`SIGTERM`. The chart's preStop hook sleeps for `shutdown.preStopSleepSeconds`
+(10 by default) so the pod keeps serving while endpoints converge, instead of
+refusing requests that were already routed to it.
+
+On `SIGTERM` the listeners stop accepting connections and wait up to
+`CODE_SHUTDOWN_TIMEOUT_MS` (100 seconds by default, `shutdown.shutdownTimeoutMs`
+in the chart) for in-flight clones and pushes to finish, then close whatever is
+left. The chart refuses values where the preStop delay plus that timeout plus
+five seconds exceed `terminationGracePeriodSeconds` (120 by default), because
+the kubelet's `SIGKILL` would otherwise cut connections before Code does.
+Requests longer than the whole window are cut off; a push cut off this way
+has not committed unless its log entry was already written, and the client
+sees a failed push it can retry.
 
 ## Failure modes
 
@@ -294,6 +430,14 @@ fail, because the node cannot confirm it is current and would rather refuse than
 lie. Writes fail. `/ready` goes red and the node leaves rotation. This is a hard
 dependency by design.
 
+Authorization policies are read from the same store. A policy this node has
+already read keeps authorizing for up to `CODE_POLICY_MAX_STALE_MS` (15 minutes
+by default) after the store last confirmed it, so a brief outage does not
+revoke everybody's access. Past that, policy grants fail closed until the store
+answers again, so a grant revoked during a long outage cannot keep working on a
+node that cannot see the revocation. Grants carried in tokens are unaffected.
+Watch `code_policy_revalidation_failed_count{outcome="failed_closed"}`.
+
 **A git command hangs with no output on macOS.** Not Code. The `osxkeychain`
 credential helper blocks storing a credential for a host and port it has not
 seen before. Add `-c credential.helper=` to confirm, then approve it once.
@@ -303,16 +447,30 @@ intended: another push landed first, possibly on another node. The client should
 fetch and retry. If it happens constantly on one repository, that repository is
 a write hotspot.
 
+**A push is rejected with "compacted while this push was in flight".** A
+compaction landed between the push being checked and being committed, and may
+have dropped objects the push relied on. Rare, and retrying the push is enough.
+
+**A push is rejected with "did not include".** The push refers to objects it
+did not carry and that no pack in the log provides, even though this node's
+cache happened to hold them. Fetching first and pushing again sends them.
+
 **`cas_exhausted`.** Too many concurrent writers on one repository for the retry
 budget. Bounded by object store latency, not by Code.
 
 **A replica cannot converge.** Almost always a log entry naming an object no
 pack provides, which the sync will refuse loudly rather than paper over. Check
-`code_replica_sync_*` and the node's logs; the repository is intact in the
+`code_replica_sync_duration`, `code_replica_sync_entries_behind` and the node's
+logs; the repository is intact in the
 log, so evicting the replica and letting it rebuild is safe and usually enough.
 
 **Disk fills.** Lower `CODE_IDLE_EVICTION_MS` or add nodes. The cache tracks
-the working set, so this means the working set grew.
+the working set, so this means the working set grew. Eviction and pack pruning
+both wait while a repository is in use (a clone streaming, a push in flight),
+so a repository that is never idle holds superseded packs until it is (the
+`[:code, :replica, :prune_deferred]` event). Caches are one directory per repository directly under the
+data directory (`acme/app` is `acme~app`); directories left in the older nested
+layout by earlier releases are no longer used and can be deleted.
 
 ## Capacity
 
@@ -330,7 +488,13 @@ the working set, so this means the working set grew.
 ## Storage growth, and what is safe to delete
 
 Object storage only grows. Nothing in Code deletes an object except
-`DELETE /repositories/<id>`, which removes that repository's prefix entirely.
+`DELETE /repositories/<id>`, which tombstones the repository and then removes
+exactly the objects it owns — never a nested repository's, which share its
+prefix (see `docs/architecture.md`, *Deleting a repository*). If some deletions
+fail it reports `partial_cleanup` with the number left, keeps refusing writes,
+and resumes when called again. While a deletion is in progress or stopped
+there, `GET /repositories` and MCP `list_repositories` leave the repository
+out.
 That is a deliberate consequence of the provenance guarantee — every state a
 repository has been in stays reconstructible — but it is a cost, and it is
 worth understanding before it surprises you.
@@ -341,7 +505,7 @@ Per repository:
 |---|---|---|
 | `packs/` | every push, plus one full set per compaction | The dominant cost. Compaction writes a fresh full set and the superseded packs stay |
 | `wal/` | every push | Small: a few hundred bytes per entry |
-| `history/` | every compaction | One index snapshot per epoch |
+| `history/` | every compaction | One index snapshot per compaction attempt, keyed by epoch and digest; the base names the one it replaced |
 | `index.pb` | nothing | One object, overwritten under CAS |
 
 A repository pushed to constantly will therefore accumulate roughly one full

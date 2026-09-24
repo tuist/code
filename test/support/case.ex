@@ -36,7 +36,10 @@ defmodule Code.Case do
 
   setup do
     id = :erlang.unique_integer([:positive])
-    root = Path.join(System.tmp_dir!(), "code-test-#{id}")
+    # `unique_integer` only is unique within one VM, and several suites can
+    # share `System.tmp_dir!()` (separate checkouts or worktrees running at
+    # once). The OS process id keeps one run's cleanup out of another's store.
+    root = Path.join(System.tmp_dir!(), "code-test-#{System.pid()}-#{id}")
     store = Path.join(root, "store")
     data = Path.join(root, "repositories")
     File.mkdir_p!(store)
@@ -80,6 +83,7 @@ defmodule Code.Case do
   """
   def start_replica_runtime do
     ensure_started({Registry, keys: :unique, name: Code.ReplicaRegistry}, Code.ReplicaRegistry)
+    ensure_started({Registry, keys: :duplicate, name: Code.LeaseRegistry}, Code.LeaseRegistry)
 
     ensure_started(
       {DynamicSupervisor, strategy: :one_for_one, name: Code.ReplicaSupervisor},

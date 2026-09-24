@@ -17,8 +17,10 @@ defmodule Code.Git do
   Three shapes of invocation exist here, supervised differently, and the
   differences are forced rather than chosen:
 
-    * `run/3` runs plumbing whose output we need. It uses `System.cmd/3`,
-      wrapped in `isolated/2` so that no port failure can kill the caller.
+    * `run/3` runs plumbing whose output we need. The port is owned by an
+      isolated process (`isolated/1`) so that no port failure can kill the
+      caller, it is terminated when its timeout expires, and it is terminated
+      when the caller dies.
 
     * `run_supervised/3` runs long, expensive commands whose output we do not
       need — `repack` above all. These go through MuonTrap, which ties the OS
@@ -62,6 +64,13 @@ defmodule Code.Git do
 
   @type path :: Path.t()
   @type oid :: String.t()
+
+  # No command runs unbounded. Callers with a reason to allow longer — an
+  # `index-pack` of a large pack, a repack — say so explicitly.
+  @default_timeout :timer.minutes(30)
+
+  # How much of a command's standard error is kept for a diagnostic.
+  @diagnostic_bytes 8 * 1024
 
   @doc "Absolute path to the `git` binary this node will use."
   @spec executable() :: String.t()
@@ -230,38 +239,178 @@ defmodule Code.Git do
   @doc """
   Install a packfile that is already on disk into the repository.
 
-  `git index-pack` verifies the pack and writes the `.idx` beside it, so a
-  corrupt or truncated download fails here rather than surfacing later as an
-  inexplicable repository error.
+  Installation is atomic from Git's point of view and from ours. The pack is
+  copied into a staging directory Git never looks in, given a verified `.idx`
+  there, and only then renamed into `objects/pack/` — the pack first, its
+  index last. Git only considers a pack that has an index, and so does
+  `installed_packs/1`, so an install interrupted at any point leaves either
+  nothing or a pack without an index, which the next sync treats as missing
+  and installs again. It never leaves a truncated pack that looks installed.
+
+  An `.idx` next to `pack_file` (one downloaded with the pack) is reused when
+  it checks out against the pack: its own checksum, the pack checksum it
+  records, and its object count. It carries no digest in the log, so it is a
+  cache like everything else here: anything that does not check out is
+  discarded and the index rebuilt with `git index-pack`, which also verifies
+  every object in the pack.
   """
   @spec install_pack(path(), Path.t()) :: {:ok, Path.t()} | {:error, term()}
   def install_pack(repo_path, pack_file) do
-    destination = Path.join([repo_path, "objects", "pack", Path.basename(pack_file)])
-    File.mkdir_p!(Path.dirname(destination))
-    if Path.expand(pack_file) != Path.expand(destination), do: File.cp!(pack_file, destination)
+    pack_dir = Path.join([repo_path, "objects", "pack"])
+    name = Path.basename(pack_file)
+    destination = Path.join(pack_dir, name)
+    File.mkdir_p!(pack_dir)
 
-    idx = Path.rootname(destination) <> ".idx"
-
-    if File.exists?(idx) do
-      # The index came down with the pack; verifying it is cheaper than
-      # rebuilding it, and it is what lets replicas skip index-pack entirely.
-      case run(repo_path, ["verify-pack", "-q", idx]) do
-        {:ok, _} -> {:ok, destination}
-        {:error, _} -> rebuild_index(repo_path, destination)
-      end
+    if Path.expand(pack_file) == Path.expand(destination) do
+      # Already in place, as `git repack` leaves its output. Only its index
+      # can be missing.
+      if File.exists?(index_path(destination)),
+        do: {:ok, destination},
+        else: stage_and_publish(repo_path, pack_file, pack_dir, name)
     else
-      rebuild_index(repo_path, destination)
+      stage_and_publish(repo_path, pack_file, pack_dir, name)
     end
   end
 
-  defp rebuild_index(repo_path, destination) do
-    with {:ok, _} <- run(repo_path, ["index-pack", destination]), do: {:ok, destination}
+  defp stage_and_publish(repo_path, pack_file, pack_dir, name) do
+    # A dot-directory inside objects/pack: on the same filesystem, so the
+    # renames below are atomic, and invisible both to Git (which never
+    # descends into subdirectories there) and to `packs/1`.
+    staging = Path.join(pack_dir, ".incoming-" <> random_suffix())
+    staged = Path.join(staging, name)
+    destination = Path.join(pack_dir, name)
+
+    try do
+      File.mkdir_p!(staging)
+
+      with :ok <- File.cp(pack_file, staged),
+           :ok <- stage_index(repo_path, pack_file, staged) do
+        publish(staged, destination)
+      else
+        {:error, reason} -> {:error, reason}
+      end
+    after
+      File.rm_rf(staging)
+    end
+  end
+
+  defp stage_index(repo_path, source, staged) do
+    downloaded = index_path(source)
+    staged_idx = index_path(staged)
+
+    reused? =
+      File.exists?(downloaded) and File.cp(downloaded, staged_idx) == :ok and
+        valid_index?(staged, staged_idx)
+
+    if reused? do
+      :telemetry.execute([:code, :git, :pack_index], %{count: 1}, %{outcome: :reused})
+      :ok
+    else
+      File.rm(staged_idx)
+      outcome = if File.exists?(downloaded), do: :rebuilt_invalid, else: :rebuilt
+      :telemetry.execute([:code, :git, :pack_index], %{count: 1}, %{outcome: outcome})
+
+      if outcome == :rebuilt_invalid do
+        Logger.warning("downloaded pack index did not match its pack; rebuilding",
+          pack: Path.basename(source)
+        )
+      end
+
+      with {:ok, _} <- run(repo_path, ["index-pack", staged], timeout: :timer.hours(2)), do: :ok
+    end
+  end
+
+  # The pack first, then its companions, the index last: the index is what
+  # makes a pack visible, to Git and to `installed_packs/1` alike.
+  defp publish(staged, destination) do
+    rev = Path.rootname(staged) <> ".rev"
+
+    with :ok <- File.rename(staged, destination),
+         :ok <- if(File.exists?(rev), do: File.rename(rev, Path.rootname(destination) <> ".rev"), else: :ok),
+         :ok <- File.rename(index_path(staged), index_path(destination)) do
+      {:ok, destination}
+    end
+  end
+
+  defp index_path(pack), do: Path.rootname(pack) <> ".idx"
+
+  # A structural check of a version 2 pack index against its pack, without
+  # reading the pack: the index's trailing SHA-1 must match its own contents,
+  # the pack checksum it records must be the pack's trailer, and its object
+  # count must be the pack's. The pack itself was already verified against the
+  # digest in the log, so an index passing this describes that pack; one that
+  # fails is rebuilt rather than trusted.
+  @doc false
+  @spec valid_index?(Path.t(), Path.t()) :: boolean()
+  def valid_index?(pack, idx) do
+    with {:ok, %{size: idx_size}} when idx_size >= 1072 <- File.stat(idx),
+         {:ok, %{size: pack_size}} when pack_size >= 32 <- File.stat(pack),
+         {:ok, <<0xFF, ?t, ?O, ?c, 2::32, _::binary>> = head} <- pread(idx, 0, 1032),
+         <<_::binary-size(8 + 255 * 4), idx_count::32>> <- head,
+         {:ok, <<"PACK", _version::32, pack_count::32>>} <- pread(pack, 0, 12),
+         true <- idx_count == pack_count,
+         rest when rest >= 0 and rem(rest, 8) == 0 <- idx_size - 1072 - 28 * idx_count,
+         {:ok, <<recorded_pack::binary-size(20), recorded_idx::binary-size(20)>>} <-
+           pread(idx, idx_size - 40, 40),
+         {:ok, pack_trailer} <- pread(pack, pack_size - 20, 20),
+         true <- recorded_pack == pack_trailer,
+         {:ok, actual_idx} <- sha1_prefix(idx, idx_size - 20) do
+      actual_idx == recorded_idx
+    else
+      _ -> false
+    end
+  end
+
+  defp pread(path, offset, length) do
+    with {:ok, io} <- :file.open(path, [:read, :binary, :raw]) do
+      try do
+        case :file.pread(io, offset, length) do
+          {:ok, data} when byte_size(data) == length -> {:ok, data}
+          {:ok, _short} -> {:error, :short_read}
+          other -> other
+        end
+      after
+        :file.close(io)
+      end
+    end
+  end
+
+  defp sha1_prefix(path, length) do
+    with {:ok, io} <- :file.open(path, [:read, :binary, :raw, :read_ahead]) do
+      try do
+        hash_chunks(io, :crypto.hash_init(:sha), length)
+      after
+        :file.close(io)
+      end
+    end
+  end
+
+  defp hash_chunks(_io, state, 0), do: {:ok, :crypto.hash_final(state)}
+
+  defp hash_chunks(io, state, remaining) do
+    case :file.read(io, min(remaining, 256 * 1024)) do
+      {:ok, data} -> hash_chunks(io, :crypto.hash_update(state, data), remaining - byte_size(data))
+      :eof -> {:error, :short_read}
+      error -> error
+    end
   end
 
   @doc "Packfiles currently in the repository, as absolute paths."
   @spec packs(path()) :: [Path.t()]
   def packs(repo_path) do
     repo_path |> Path.join("objects/pack/*.pack") |> Path.wildcard() |> Enum.sort()
+  end
+
+  @doc """
+  Packfiles that are fully installed: present together with their `.idx`.
+
+  A pack without an index is what an interrupted install leaves behind, and it
+  is invisible to Git, so for deciding what still has to be installed it does
+  not count.
+  """
+  @spec installed_packs(path()) :: [Path.t()]
+  def installed_packs(repo_path) do
+    repo_path |> packs() |> Enum.filter(&File.exists?(index_path(&1)))
   end
 
   @doc """
@@ -292,6 +441,11 @@ defmodule Code.Git do
       {:ok, _} ->
         {:ok, packs(repo_path)}
 
+      # A repack that ran out of time would run out of time again: two hours
+      # more of a saturated core is not a fallback.
+      {:error, {:git, :timeout, _}} = error ->
+        error
+
       # Bitmaps cannot be written for every repository shape. The pack is what
       # the log records, so fall back rather than fail compaction over an index.
       {:error, _} ->
@@ -306,11 +460,26 @@ defmodule Code.Git do
   @spec prune_packs(path(), [String.t()]) :: :ok
   def prune_packs(repo_path, keep) do
     keep = MapSet.new(keep)
+    pack_dir = Path.join([repo_path, "objects", "pack"])
 
-    for pack <- packs(repo_path), not MapSet.member?(keep, Path.basename(pack)) do
-      base = Path.rootname(pack)
-      for ext <- [".pack", ".idx", ".rev", ".bitmap", ".promisor", ".keep"], do: File.rm(base <> ext)
+    removed =
+      for pack <- packs(repo_path), not MapSet.member?(keep, Path.basename(pack)) do
+        base = Path.rootname(pack)
+        # The index goes first, so a prune interrupted halfway leaves a pack
+        # Git and `installed_packs/1` both already ignore.
+        for ext <- [".idx", ".pack", ".rev", ".bitmap", ".promisor", ".keep"], do: File.rm(base <> ext)
+        pack
+      end
+
+    if removed != [] do
+      # The multi-pack lookup file names the packs it covers; one naming a pack
+      # that is gone is a stale cache. The maintenance job rebuilds it.
+      File.rm(Path.join(pack_dir, "multi-pack-index"))
     end
+
+    # Staging directories of installs that never finished. Callers prune only
+    # when nothing else is working on the repository, so none is in use.
+    for dir <- Path.wildcard(Path.join(pack_dir, ".incoming-*"), match_dot: true), do: File.rm_rf(dir)
 
     :ok
   end
@@ -588,6 +757,121 @@ defmodule Code.Git do
     end
   end
 
+  @doc """
+  Count the objects reachable from `tips` but not from `exclude` that
+  `object_dir` does not hold on its own.
+
+  This is how a writer proves its packs are closed: everything the new refs
+  need that the repository cannot already reach from `exclude` must be in the
+  writer's own packs. The walk runs over the repository's objects plus
+  `object_dir` (a push's quarantine, whose objects are not in the repository
+  yet); the presence check runs against `object_dir` alone, without the
+  repository behind it, so an object that happens to sit in this node's cache
+  — loose, or in a pack the log no longer names — does not count as provided.
+  With `object_dir` `nil` nothing is provided and every such object counts.
+
+  The object list goes through a file rather than memory: for an initial push
+  it is every object in the repository.
+  """
+  @spec count_unprovided(path(), [oid()], [oid()], Path.t() | nil, keyword()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def count_unprovided(repo_path, tips, exclude, object_dir, opts \\ [])
+  def count_unprovided(_repo_path, [], _exclude, _object_dir, _opts), do: {:ok, 0}
+
+  def count_unprovided(repo_path, tips, exclude, object_dir, opts) do
+    scratch = Path.join(System.tmp_dir!(), "code-closure-" <> random_suffix())
+    File.mkdir_p!(scratch)
+    revs = Path.join(scratch, "revs")
+    listed = Path.join(scratch, "objects")
+    timeout = Keyword.get(opts, :timeout, @default_timeout)
+
+    walk_env =
+      Keyword.get_lazy(opts, :walk_env, fn ->
+        if object_dir,
+          do: [
+            {"GIT_OBJECT_DIRECTORY", object_dir},
+            {"GIT_ALTERNATE_OBJECT_DIRECTORIES", Path.join(repo_path, "objects")}
+          ],
+          else: []
+      end)
+
+    try do
+      File.write!(revs, Enum.map_join(tips, &"#{&1}\n") <> Enum.map_join(exclude, &"^#{&1}\n"))
+
+      with {:ok, _} <-
+             run(repo_path, ["rev-list", "--objects", "--no-object-names", "--stdin"],
+               stdin_file: revs,
+               stdout_file: listed,
+               env: walk_env,
+               timeout: timeout
+             ) do
+        count_absent(repo_path, listed, object_dir, timeout)
+      end
+    after
+      File.rm_rf(scratch)
+    end
+  end
+
+  defp count_absent(repo_path, listed, object_dir, timeout) do
+    cond do
+      File.stat!(listed).size == 0 ->
+        {:ok, 0}
+
+      is_nil(object_dir) ->
+        {:ok, listed |> File.stream!() |> Enum.count()}
+
+      true ->
+        # An empty format prints an empty line per object found and
+        # "<oid> missing" per object not found, so the output stays a byte per
+        # object however large the push.
+        with {:ok, out} <-
+               run(repo_path, ["cat-file", "--batch-check="],
+                 stdin_file: listed,
+                 env: [{"GIT_OBJECT_DIRECTORY", object_dir}, {"GIT_ALTERNATE_OBJECT_DIRECTORIES", nil}],
+                 timeout: timeout
+               ) do
+          {:ok, out |> String.split("\n", trim: true) |> Enum.count(&String.ends_with?(&1, " missing"))}
+        end
+    end
+  end
+
+  @doc """
+  Whether `packs` alone contain every object reachable from `tips`.
+
+  Compaction publishes a repack as the new base, and every later push that
+  omits objects "because the repository already has them" relies on the base
+  really holding everything its refs reach. A repack includes whatever is
+  reachable from the local refs and reflogs, which should be a superset, but
+  the local refs are a cache; this checks the artefact itself before it is
+  published. The packs are hard-linked into a scratch object directory so the
+  check sees nothing else.
+  """
+  @spec verify_packs_closed(path(), [Path.t()], [oid()]) :: :ok | {:error, term()}
+  def verify_packs_closed(_repo_path, _packs, []), do: :ok
+
+  def verify_packs_closed(repo_path, packs, tips) do
+    scratch = Path.join(repo_path, ".code-verify-" <> random_suffix())
+    pack_dir = Path.join(scratch, "pack")
+    File.mkdir_p!(pack_dir)
+
+    try do
+      for pack <- packs, file <- [pack, index_path(pack)] do
+        File.ln!(file, Path.join(pack_dir, Path.basename(file)))
+      end
+
+      case count_unprovided(repo_path, tips, [], scratch,
+             walk_env: [],
+             timeout: :timer.hours(1)
+           ) do
+        {:ok, 0} -> :ok
+        {:ok, missing} -> {:error, {:repack_incomplete, missing}}
+        {:error, reason} -> {:error, reason}
+      end
+    after
+      File.rm_rf(scratch)
+    end
+  end
+
   @doc "Object count and on-disk size, for the admin and MCP APIs."
   @spec stats(path()) :: %{objects: non_neg_integer(), size_kb: non_neg_integer(), packs: non_neg_integer()}
   def stats(repo_path) do
@@ -615,9 +899,27 @@ defmodule Code.Git do
   end
 
   @doc """
-  Run a git command to completion and return its combined output.
+  Run a git command to completion and return its output.
 
   `path` is the repository to operate on, or `nil` for commands that need none.
+
+  Options:
+
+    * `:timeout` — milliseconds the command may run, 30 minutes by default.
+      When it expires the process is sent `SIGTERM` and the result is
+      `{:error, {:git, :timeout, output}}`. No command runs unbounded.
+    * `:stderr` — `:merge` (the default) interleaves standard error with the
+      output, which is what a diagnostic wants. `:separate` keeps it out of
+      the output entirely, for output that is protocol data a client parses;
+      it is then logged, bounded, and used as the diagnostic on failure.
+    * `:stdin` — a binary to feed the command, `:stdin_file` a file to feed it.
+    * `:stdout_file` — write the output to this file instead of returning it,
+      for output proportional to the repository rather than to the request.
+    * `:env` and `:cd`.
+
+  The process is owned by an isolated Erlang process that also watches the
+  caller: if the caller dies — a request handler killed, a task timed out — the
+  command is terminated with it rather than left running.
   """
   @spec run(path() | nil, [String.t()], keyword()) ::
           {:ok, String.t()} | {:error, {:git, integer() | :timeout, String.t()}}
@@ -625,8 +927,13 @@ defmodule Code.Git do
     subcommand = subcommand(args)
     args = if path, do: ["--git-dir", path | args], else: args
     started = System.monotonic_time(:microsecond)
+    timeout = Keyword.get(opts, :timeout, @default_timeout)
 
-    {output, status} = isolated(fn -> invoke(args, opts) end)
+    {output, status, stderr} =
+      case isolated(fn -> invoke(args, opts, timeout) end) do
+        {:ok, result} -> result
+        {:crashed, reason} -> {"git invocation failed: #{inspect(reason)}", 125, ""}
+      end
 
     duration = System.monotonic_time(:microsecond) - started
 
@@ -635,18 +942,153 @@ defmodule Code.Git do
       status: status
     })
 
-    if status == 0 do
-      {:ok, output}
-    else
-      Logger.debug("git #{Enum.join(args, " ")} exited #{inspect(status)}: #{output}")
-      {:error, {:git, status, String.trim(output)}}
+    separate? = Keyword.get(opts, :stderr, :merge) == :separate
+
+    cond do
+      status == 0 ->
+        if separate? and stderr != "" do
+          Logger.debug("git wrote to standard error", subcommand: subcommand, stderr: stderr)
+        end
+
+        {:ok, output}
+
+      separate? ->
+        Logger.debug("git exited unsuccessfully",
+          subcommand: subcommand,
+          status: inspect(status),
+          stderr: stderr
+        )
+
+        {:error, {:git, status, String.trim(stderr)}}
+
+      true ->
+        Logger.debug("git #{Enum.join(args, " ")} exited #{inspect(status)}: #{output}")
+        {:error, {:git, status, String.trim(output)}}
     end
   end
 
-  defp invoke(args, opts) do
-    case Keyword.get(opts, :stdin) do
-      nil -> System.cmd(executable(), args, cmd_opts(opts))
-      stdin -> run_with_stdin(args, stdin, opts)
+  # Runs inside the isolated process, which owns the port. Exits are trapped
+  # so that the watchdog in `isolated/1` can tell it the caller has gone, and so
+  # that a port failure arrives as a message rather than an exit signal.
+  defp invoke(args, opts, timeout) do
+    Process.flag(:trap_exit, true)
+    files = redirect_files(opts)
+
+    try do
+      {executable, argv, extra_env} = command_line(args, files)
+      separate? = Keyword.get(opts, :stderr, :merge) == :separate
+
+      port_opts =
+        [
+          :binary,
+          :exit_status,
+          :use_stdio,
+          :hide,
+          {:args, argv},
+          {:env, charlist_env(env(opts) ++ extra_env)}
+        ] ++
+          if(separate?, do: [], else: [:stderr_to_stdout]) ++
+          if(cd = opts[:cd], do: [{:cd, cd}], else: [])
+
+      port = Port.open({:spawn_executable, executable}, port_opts)
+      deadline = System.monotonic_time(:millisecond) + timeout
+      {output, status} = collect(port, [], deadline)
+      {output, status, read_bounded(files[:stderr])}
+    after
+      for {kind, file} <- files, kind in [:stdin, :stderr], do: File.rm(file)
+    end
+  end
+
+  defp redirect_files(opts) do
+    stdin =
+      case {Keyword.get(opts, :stdin), Keyword.get(opts, :stdin_file)} do
+        {nil, nil} ->
+          []
+
+        {nil, file} ->
+          [stdin_file: file]
+
+        {payload, _} ->
+          tmp = Path.join(System.tmp_dir!(), "code-stdin-" <> random_suffix())
+          File.write!(tmp, payload)
+          File.chmod!(tmp, 0o600)
+          [stdin: tmp]
+      end
+
+    stderr =
+      if Keyword.get(opts, :stderr, :merge) == :separate,
+        do: [stderr: Path.join(System.tmp_dir!(), "code-stderr-" <> random_suffix())],
+        else: []
+
+    stdout = if file = opts[:stdout_file], do: [stdout: file], else: []
+    stdin ++ stderr ++ stdout
+  end
+
+  # Neither a port nor System.cmd/3 can half-close a child's stdin, which
+  # matters because `update-ref --stdin` and `hash-object --stdin` only act on
+  # EOF, and a port cannot separate a child's stderr from its stdout. Handing
+  # both to the shell as redirects solves each without quoting anything:
+  # `sh -c script name args...` binds $0 and $@, so neither the git path nor its
+  # arguments are ever re-parsed by the shell, and `exec` makes git the process
+  # the port's pid refers to, so terminating it terminates git.
+  defp command_line(args, []), do: {executable(), args, []}
+
+  defp command_line(args, files) do
+    {redirects, env} =
+      Enum.reduce(files, {"", []}, fn
+        {kind, file}, {script, env} when kind in [:stdin, :stdin_file] ->
+          {script <> ~S( < "$CODE_GIT_STDIN"), [{"CODE_GIT_STDIN", file} | env]}
+
+        {:stderr, file}, {script, env} ->
+          {script <> ~S( 2> "$CODE_GIT_STDERR"), [{"CODE_GIT_STDERR", file} | env]}
+
+        {:stdout, file}, {script, env} ->
+          {script <> ~S( > "$CODE_GIT_STDOUT"), [{"CODE_GIT_STDOUT", file} | env]}
+      end)
+
+    {"/bin/sh", ["-c", ~S(exec "$0" "$@") <> redirects, executable() | args], env}
+  end
+
+  defp collect(port, acc, deadline) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 0)
+
+    receive do
+      {^port, {:data, data}} ->
+        collect(port, [acc | data], deadline)
+
+      {^port, {:exit_status, status}} ->
+        {IO.iodata_to_binary(acc), status}
+
+      {:EXIT, ^port, reason} ->
+        {IO.iodata_to_binary(acc) <> "git port failed: #{inspect(reason)}", 125}
+
+      {:EXIT, _from, reason} ->
+        # The caller is gone; nobody will read the answer.
+        terminate(port)
+        exit(reason)
+    after
+      remaining ->
+        terminate(port)
+        {IO.iodata_to_binary(acc), :timeout}
+    end
+  end
+
+  defp read_bounded(nil), do: ""
+
+  defp read_bounded(file) do
+    case File.open(file, [:read, :binary]) do
+      {:ok, io} ->
+        try do
+          case IO.binread(io, @diagnostic_bytes) do
+            data when is_binary(data) -> data
+            _ -> ""
+          end
+        after
+          File.close(io)
+        end
+
+      {:error, _} ->
+        ""
     end
   end
 
@@ -654,20 +1096,35 @@ defmodule Code.Git do
   Run a long, expensive command whose output is not needed.
 
   Goes through MuonTrap, so the OS process dies with its owner and can be
-  confined to a cgroup. Output is deliberately discarded — see the note above
-  on why capturing it through MuonTrap is unsafe — so on failure the command is
-  re-run through `run/3` purely to obtain a diagnostic.
+  confined to a cgroup, and its owner dies with the caller. Output is
+  deliberately kept out of MuonTrap — see the note above on why capturing it
+  there is unsafe — so standard error is redirected to a file by the shell
+  instead, and the first few kilobytes of it are the diagnostic on failure.
+  The command is never re-run to find out why it failed: a second `repack`
+  would mutate the same repository again.
   """
   @spec run_supervised(path(), [String.t()], keyword()) :: {:ok, String.t()} | {:error, term()}
   def run_supervised(path, args, opts \\ []) do
     subcommand = subcommand(args)
     full = ["--git-dir", path | args]
     started = System.monotonic_time(:microsecond)
+    stderr = Path.join(System.tmp_dir!(), "code-stderr-" <> random_suffix())
+    opts = Keyword.update(opts, :env, [{"CODE_GIT_STDERR", stderr}], &[{"CODE_GIT_STDERR", stderr} | &1])
 
-    {_output, status} =
-      isolated(fn ->
-        MuonTrap.cmd(executable(), full, supervised_opts(opts))
-      end)
+    status =
+      case isolated(fn ->
+             MuonTrap.cmd(
+               "/bin/sh",
+               ["-c", ~S(exec "$0" "$@" 2> "$CODE_GIT_STDERR"), executable() | full],
+               supervised_opts(opts)
+             )
+           end) do
+        {:ok, {_output, status}} -> status
+        {:crashed, _reason} -> 125
+      end
+
+    diagnostic = read_bounded(stderr)
+    File.rm(stderr)
 
     :telemetry.execute(
       [:code, :git, :command],
@@ -681,20 +1138,22 @@ defmodule Code.Git do
     if status == 0 do
       {:ok, ""}
     else
-      # Re-run to find out why. Rare enough that the cost does not matter, and
-      # a repack that fails without an explanation is unactionable.
-      case run(path, args, opts) do
-        {:ok, output} -> {:ok, output}
-        {:error, reason} -> {:error, reason}
-      end
+      Logger.warning("supervised git command failed",
+        subcommand: subcommand,
+        status: inspect(status),
+        stderr: diagnostic
+      )
+
+      {:error, {:git, status, String.trim(diagnostic)}}
     end
   end
 
-  # stderr is deliberately not merged: any output at all would exercise
-  # MuonTrap's acknowledgement path, which is the unsafe one.
+  # Nothing reaches MuonTrap's output path: the command's stderr goes to a file
+  # through the shell, and the commands run this way write nothing to stdout.
+  # Any output at all would exercise MuonTrap's acknowledgement path, which is
+  # the unsafe one.
   defp supervised_opts(opts) do
-    base = [env: env(opts), delay_to_sigkill: 1_000]
-    base = if timeout = opts[:timeout], do: Keyword.put(base, :timeout, timeout), else: base
+    base = [env: env(opts), delay_to_sigkill: 1_000, timeout: Keyword.get(opts, :timeout, @default_timeout)]
 
     case Keyword.get(opts, :cgroup) do
       nil -> base
@@ -708,48 +1167,45 @@ defmodule Code.Git do
   # monitored process turns it into a value we can act on instead of a dead
   # request handler.
   #
+  # The isolation must not outlive the caller, though, or a request handler
+  # killed mid-command leaves its command running with nobody to read the
+  # answer. A watchdog monitors both: when the caller goes first it sends the
+  # worker an exit signal. A port-owning worker traps it and terminates its
+  # command; a MuonTrap worker dies of it, and MuonTrap kills the command.
+  #
   # The single retry is safe because every command run this way is idempotent.
   defp isolated(fun, attempt \\ 1) do
     parent = self()
     tag = make_ref()
 
     {pid, monitor} = spawn_monitor(fn -> send(parent, {tag, fun.()}) end)
+    watch(parent, pid)
 
     receive do
       {^tag, result} ->
         Process.demonitor(monitor, [:flush])
-        result
+        {:ok, result}
 
       {:DOWN, ^monitor, :process, ^pid, reason} ->
         if attempt < 2 do
           Logger.debug("git invocation died with #{inspect(reason)}; retrying once")
           isolated(fun, attempt + 1)
         else
-          {"git invocation failed: #{inspect(reason)}", 125}
+          {:crashed, reason}
         end
     end
   end
 
-  # Neither System.cmd/3 nor MuonTrap.cmd/3 can write to stdin, and a port has
-  # no way to half-close it, which matters because `update-ref --stdin` and
-  # `hash-object --stdin` only act on EOF. Handing the payload to the shell as
-  # a redirect gives a real EOF without quoting anything: `sh -c script name
-  # args...` binds $0 and $@, so neither the git path nor its arguments are
-  # ever re-parsed by the shell.
-  defp run_with_stdin(args, stdin, opts) do
-    tmp = Path.join(System.tmp_dir!(), "code-stdin-" <> random_suffix())
-    File.write!(tmp, stdin)
-    File.chmod!(tmp, 0o600)
+  defp watch(parent, worker) do
+    spawn(fn ->
+      caller = Process.monitor(parent)
+      command = Process.monitor(worker)
 
-    try do
-      System.cmd(
-        "/bin/sh",
-        ["-c", ~S(exec "$0" "$@" < "$CODE_GIT_STDIN"), executable() | args],
-        cmd_opts(Keyword.update(opts, :env, [{"CODE_GIT_STDIN", tmp}], &[{"CODE_GIT_STDIN", tmp} | &1]))
-      )
-    after
-      File.rm(tmp)
-    end
+      receive do
+        {:DOWN, ^caller, :process, _pid, _reason} -> Process.exit(worker, :caller_down)
+        {:DOWN, ^command, :process, _pid, _reason} -> :ok
+      end
+    end)
   end
 
   @doc """
@@ -765,18 +1221,26 @@ defmodule Code.Git do
   Returns the port. The caller owns it and must consume `{port, {:data, _}}`
   and `{port, {:exit_status, _}}`, and must call `terminate/1` if it stops
   before the process exits.
+
+  The repository at `path` is leased for as long as the port is open (see
+  `Code.Replica.Lease`), so housekeeping does not evict it or prune its packs
+  while a clone is reading them or a push is being checked against them.
   """
   @spec stream(path(), [String.t()], keyword()) :: port()
   def stream(path, args, opts \\ []) do
-    args = if path, do: ["--git-dir", path | args], else: args
+    full = if path, do: ["--git-dir", path | args], else: args
 
-    Port.open({:spawn_executable, executable()}, [
-      :binary,
-      :exit_status,
-      :use_stdio,
-      {:args, args},
-      {:env, charlist_env(env(opts))}
-    ])
+    port =
+      Port.open({:spawn_executable, executable()}, [
+        :binary,
+        :exit_status,
+        :use_stdio,
+        {:args, full},
+        {:env, charlist_env(env(opts))}
+      ])
+
+    if path, do: Code.Replica.Lease.hold_while_open(path, port)
+    port
   end
 
   @doc """
@@ -810,11 +1274,6 @@ defmodule Code.Git do
     :ok
   catch
     _, _ -> :ok
-  end
-
-  defp cmd_opts(opts) do
-    base = [stderr_to_stdout: true, env: env(opts)]
-    if cd = opts[:cd], do: Keyword.put(base, :cd, cd), else: base
   end
 
   defp env(opts) do

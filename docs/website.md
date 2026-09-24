@@ -7,19 +7,9 @@ committed.
 Run `mise run site` to build the site once or `mise run site:serve` to preview
 it locally.
 
-## Cloudflare Workers
+## Deployment
 
-`mise run site:deploy` builds `public/` and uploads it to the `code-site`
-Cloudflare Worker. The Worker route serves every path on `code.dev` without
-replacing the existing apex record.
-
-Pushing a website change to `main` runs
-`.github/workflows/deploy-site.yml`. It builds with the pinned mise tools and
-deploys with Wrangler.
-
-The workflow requires these GitHub repository secrets:
-
-| Secret | Value |
-| --- | --- |
-| `CLOUDFLARE_ACCOUNT_ID` | The Tuist Cloudflare account identifier. |
-| `CLOUDFLARE_API_TOKEN` | A restricted [Cloudflare API token](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/) with the **Edit Cloudflare Workers** policy scoped to the Tuist account and the `code.dev` zone. |
+The site is not deployed. Code is expected to run as instances operated
+alongside Tuist rather than behind its own public website, so there is no
+hosting configuration, deploy workflow or domain in this repository. The
+sources stay buildable locally for previewing and reuse.
