@@ -97,6 +97,49 @@ defmodule Code.IssuesTest do
     assert Enum.map(issues, &{&1.number, &1.title}) == [{1, "first"}, {3, "third"}]
   end
 
+  test "concurrent creators each get a distinct number and none is lost", %{repo: repo, principal: principal} do
+    # Every creator reads the same next_number and races on the private
+    # reference; the losers must re-read and take the next number rather than
+    # reuse one or overwrite the winner's issue.
+    results =
+      1..6
+      |> Task.async_stream(fn n -> Issues.create(repo, "Concurrent #{n}", "", principal) end,
+        max_concurrency: 6,
+        timeout: 60_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.all?(results, &match?({:ok, _}, &1)), inspect(results)
+    numbers = results |> Enum.map(fn {:ok, %{issue: issue}} -> issue.number end) |> Enum.sort()
+    assert numbers == Enum.to_list(1..6)
+
+    assert {:ok, %{issues: issues}} = Issues.list(repo)
+
+    assert issues |> Enum.map(& &1.title) |> Enum.sort() ==
+             Enum.map(1..6, &"Concurrent #{&1}") |> Enum.sort()
+  end
+
+  test "concurrent comments on one issue are all kept", %{repo: repo, principal: principal} do
+    assert {:ok, %{issue: issue}} = Issues.create(repo, "Busy", "", principal)
+
+    results =
+      1..6
+      |> Task.async_stream(fn n -> Issues.add_comment(repo, issue.number, "comment #{n}", principal) end,
+        max_concurrency: 6,
+        timeout: 60_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.all?(results, &match?({:ok, _}, &1)), inspect(results)
+
+    assert {:ok, %{issue: current}} = Issues.get(repo, issue.number)
+    assert current.comment_count == 6
+    assert current.comments |> Enum.map(& &1.body) |> Enum.sort() == Enum.map(1..6, &"comment #{&1}")
+
+    assert {:ok, %{events: events}} = Issues.events(repo, issue.number)
+    assert Enum.count(events, &(&1.type == "comment_added")) == 6
+  end
+
   test "refuses a comment on a deleted issue without recording one", %{repo: repo, principal: principal} do
     assert {:ok, %{issue: issue}} = Issues.create(repo, "Doomed", "", principal)
     assert {:ok, _} = Issues.delete(repo, issue.number, principal)

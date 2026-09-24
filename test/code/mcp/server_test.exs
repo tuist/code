@@ -628,11 +628,98 @@ defmodule Code.MCP.ServerTest do
       assert again.structuredContent.attempt == first.structuredContent.attempt
       assert again.structuredContent.replayed
     end
+
+    test "approve_work_node needs repository administration and releases dependent work", %{
+      opts: opts,
+      repo: repo
+    } do
+      run_id =
+        create_mcp_run(opts, repo, [
+          %{"id" => "review", "kind" => "approval", "title" => "Review"},
+          %{"id" => "ship", "title" => "Ship", "depends_on" => ["review"]}
+        ])
+
+      args = %{"repository" => repo, "run" => run_id, "node" => "review"}
+
+      # A writer and executor, but not an administrator: indistinguishable
+      # from a repository it cannot see.
+      refused = call_tool("approve_work_node", args, opts)
+      assert refused.isError
+      assert hd(refused.content).text == "repository #{repo} not found"
+
+      approved = call_tool("approve_work_node", args, administrator_opts(opts))
+      refute approved[:isError], inspect(approved)
+      assert node_statuses(approved) == %{"review" => "succeeded", "ship" => "ready"}
+
+      again = call_tool("approve_work_node", args, administrator_opts(opts))
+      assert again.isError
+      assert again.structuredContent.error.kind == :conflict
+    end
+
+    test "cancel_work_run needs repository administration and settles every node", %{opts: opts, repo: repo} do
+      run_id = create_mcp_run(opts, repo, [%{"id" => "a", "title" => "A"}, %{"id" => "b", "title" => "B"}])
+
+      claimed =
+        call_tool("claim_work_node", %{"repository" => repo, "run" => run_id, "executor" => "pod"}, opts)
+
+      refute claimed[:isError], inspect(claimed)
+
+      args = %{"repository" => repo, "run" => run_id}
+      assert call_tool("cancel_work_run", args, opts).isError
+
+      cancelled = call_tool("cancel_work_run", args, administrator_opts(opts))
+      refute cancelled[:isError], inspect(cancelled)
+      assert cancelled.structuredContent.status == "cancelled"
+      assert node_statuses(cancelled) == %{"a" => "abandoned", "b" => "skipped"}
+
+      events = call_tool("work_run_events", args, opts)
+      assert List.last(events.structuredContent.events)["actor"]["subject"] == "factory-administrator"
+    end
+
+    test "expire_work_node requeues a stale lease and records who expired it", %{opts: opts, repo: repo} do
+      run_id =
+        create_mcp_run(opts, repo, [%{"id" => "work", "title" => "Work"}], %{"lease_duration_ms" => 1_000})
+
+      claimed =
+        call_tool("claim_work_node", %{"repository" => repo, "run" => run_id, "executor" => "pod"}, opts)
+
+      refute claimed[:isError], inspect(claimed)
+
+      args = %{"repository" => repo, "run" => run_id, "node" => "work"}
+
+      early = call_tool("expire_work_node", args, administrator_opts(opts))
+      assert early.isError
+      assert hd(early.content).text == "work attempt lease has not expired"
+
+      Process.sleep(1_050)
+      assert call_tool("expire_work_node", args, opts).isError
+
+      expired = call_tool("expire_work_node", args, administrator_opts(opts))
+      refute expired[:isError], inspect(expired)
+      assert node_statuses(expired) == %{"work" => "ready"}
+
+      events = call_tool("work_run_events", %{"repository" => repo, "run" => run_id}, opts)
+      last = List.last(events.structuredContent.events)
+      assert last["type"] == "attempt_expired"
+      assert last["actor"]["subject"] == "factory-administrator"
+    end
   end
+
+  defp administrator_opts(opts) do
+    principal = Keyword.fetch!(opts, :principal)
+
+    Keyword.put(opts, :principal, %Principal{
+      principal
+      | subject: "factory-administrator",
+        grants: [Principal.grant("#{principal.account}/**", [:read, :write, :execute, :admin])]
+    })
+  end
+
+  defp node_statuses(result), do: Map.new(result.structuredContent.nodes, &{&1["id"], &1["status"]})
 
   # Seeds a real commit, because a replica must be able to materialize `main`,
   # and creates a run over it through the tool surface.
-  defp create_mcp_run(opts, repo, nodes) do
+  defp create_mcp_run(opts, repo, nodes, extra \\ %{}) do
     seeded =
       call_tool(
         "commit",
@@ -650,11 +737,11 @@ defmodule Code.MCP.ServerTest do
     created =
       call_tool(
         "create_work_run",
-        %{
+        Map.merge(extra, %{
           "repository" => repo,
           "base_commit" => seeded.structuredContent.commit,
           "graph" => %{"nodes" => nodes}
-        },
+        }),
         opts
       )
 
