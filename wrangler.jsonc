@@ -8,9 +8,16 @@
   },
   // Keep the existing apex record intact while routing every request through
   // the Worker. The Worker is the origin for the static assets.
+  //
+  // The route pattern must belong to the zone named by zone_id. This zone is
+  // micelio.dev: the rename to code.dev changed only the pattern, and Cloudflare
+  // rejected the deploy ("Route pattern must include zone name: micelio.dev",
+  // code 10022). Keep serving micelio.dev until a code.dev zone is confirmed in
+  // this Cloudflare account, then switch the pattern to "code.dev/*" and replace
+  // zone_id with that zone's id (or with "zone_name": "code.dev").
   "routes": [
     {
-      "pattern": "code.dev/*",
+      "pattern": "micelio.dev/*",
       "zone_id": "de20b5392f09fda6ab480245ee934066"
     }
   ]
