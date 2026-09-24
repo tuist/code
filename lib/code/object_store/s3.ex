@@ -165,7 +165,29 @@ defmodule Code.ObjectStore.S3 do
 
   @impl true
   def list(prefix, config) do
-    list_page(prefix, config, nil, [])
+    with {:ok, %{keys: keys}} <- list_all(prefix, config, []), do: {:ok, keys}
+  end
+
+  @impl true
+  def list_prefixes(prefix, config) do
+    list_all(prefix, config, [{"delimiter", "/"}])
+  end
+
+  # One ListObjectsV2 request for at most one key. Its cost is constant however
+  # large the bucket is, and unlike a HEAD of an absent key it distinguishes a
+  # missing bucket (404 NoSuchBucket) from a missing object.
+  @impl true
+  def probe(config) do
+    params = [{"list-type", "2"}, {"max-keys", "1"}, {"prefix", full_key("", config)}]
+    url = bucket_url(config) <> "?" <> URI.encode_query(params)
+
+    case Req.request(
+           build(config, method: :get, url: url, decode_body: false, max_retries: 1, receive_timeout: 5_000)
+         ) do
+      {:ok, %{status: 200}} -> :ok
+      {:ok, resp} -> {:error, {:unexpected_status, resp.status, body_excerpt(resp)}}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @impl true
@@ -191,19 +213,36 @@ defmodule Code.ObjectStore.S3 do
     end
   end
 
-  defp list_page(prefix, config, token, acc) do
+  defp list_all(prefix, config, extra) do
+    list_page(prefix, config, extra, nil, {[], []})
+  end
+
+  # Pages are collected in reverse and flattened once at the end. Appending
+  # each page to the accumulated list instead copies everything seen so far on
+  # every page, which makes a listing quadratic in the number of pages.
+  defp list_page(prefix, config, extra, token, {key_pages, prefix_pages}) do
     params =
-      [{"list-type", "2"}, {"prefix", full_key(prefix, config)}]
+      [{"list-type", "2"}, {"prefix", full_key(prefix, config)} | extra]
       |> then(fn p -> if token, do: p ++ [{"continuation-token", token}], else: p end)
 
     url = bucket_url(config) <> "?" <> URI.encode_query(params)
 
     case Req.request(build(config, method: :get, url: url, decode_body: false)) do
       {:ok, %{status: 200} = resp} ->
-        {keys, next} = parse_list_response(resp.body, config)
-        acc = acc ++ keys
+        %{keys: keys, prefixes: prefixes, next: next} = parse_list_response(resp.body, config)
+        acc = {[keys | key_pages], [prefixes | prefix_pages]}
 
-        if next, do: list_page(prefix, config, next, acc), else: {:ok, acc}
+        if next do
+          list_page(prefix, config, extra, next, acc)
+        else
+          {key_pages, prefix_pages} = acc
+
+          {:ok,
+           %{
+             keys: key_pages |> Enum.reverse() |> Enum.concat(),
+             prefixes: prefix_pages |> Enum.reverse() |> Enum.concat()
+           }}
+        end
 
       {:ok, resp} ->
         {:error, {:unexpected_status, resp.status, body_excerpt(resp)}}
@@ -214,9 +253,10 @@ defmodule Code.ObjectStore.S3 do
   end
 
   # ListObjectsV2 returns XML. Rather than take an XML dependency for one call
-  # site, pull out the two elements we need with a scan; keys are URL-safe
+  # site, pull out the elements we need with a scan; keys are URL-safe
   # because Code generates all of them.
-  defp parse_list_response(xml, config) do
+  @doc false
+  def parse_list_response(xml, config) do
     prefix = Keyword.get(config, :prefix, "")
 
     keys =
@@ -228,6 +268,10 @@ defmodule Code.ObjectStore.S3 do
         }
       end)
 
+    prefixes =
+      Regex.scan(~r{<CommonPrefixes>.*?</CommonPrefixes>}s, xml)
+      |> Enum.map(fn [chunk] -> chunk |> extract("Prefix") |> strip_prefix(prefix) end)
+
     next =
       case extract(xml, "NextContinuationToken") do
         "" -> nil
@@ -236,7 +280,7 @@ defmodule Code.ObjectStore.S3 do
 
     truncated? = extract(xml, "IsTruncated") == "true"
 
-    {keys, if(truncated?, do: next, else: nil)}
+    %{keys: keys, prefixes: prefixes, next: if(truncated?, do: next, else: nil)}
   end
 
   defp extract(xml, tag) do

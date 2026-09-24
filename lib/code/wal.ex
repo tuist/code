@@ -509,20 +509,59 @@ defmodule Code.WAL do
     end
   end
 
-  @doc "Every repository in the store, by scanning for index objects."
+  @doc """
+  Every repository in the store.
+
+  Walks the key hierarchy one level at a time with delimiter listings, instead
+  of listing every object under `repos/`. A flat listing returns every log
+  entry, pack and history snapshot of every repository, which grows with the
+  corpus's whole history; this grows with the number of repositories and
+  account prefixes.
+
+  A repository's own storage prefixes (`wal/`, `packs/`, `history/`) are never
+  listed. A repository nested at exactly one of those names, such as
+  `acme/app/wal` beside `acme/app`, is still found with a single `stat` of its
+  index; one nested further below such a name is not.
+  """
   @spec list_repositories() :: {:ok, [repo_id()]} | {:error, term()}
   def list_repositories do
-    with {:ok, entries} <- ObjectStore.list("repos/") do
-      ids =
-        entries
-        |> Enum.filter(&String.ends_with?(&1.key, "/index.pb"))
-        |> Enum.map(fn %{key: key} ->
-          key |> String.replace_prefix("repos/", "") |> String.replace_suffix("/index.pb", "")
-        end)
-        |> Enum.sort()
+    with {:ok, ids} <- walk_repositories("repos/", []), do: {:ok, Enum.sort(ids)}
+  end
 
-      {:ok, ids}
+  @storage_prefixes ["wal/", "packs/", "history/"]
+
+  defp walk_repositories(prefix, acc) do
+    with {:ok, %{keys: keys, prefixes: children}} <- ObjectStore.list_prefixes(prefix) do
+      index = prefix <> "index.pb"
+      repository? = Enum.any?(keys, &(&1.key == index))
+      acc = if repository?, do: [repository_id(prefix) | acc], else: acc
+
+      Enum.reduce_while(children, {:ok, acc}, fn child, {:ok, acc} ->
+        result =
+          if repository? and String.replace_prefix(child, prefix, "") in @storage_prefixes do
+            nested_under_storage(child, acc)
+          else
+            walk_repositories(child, acc)
+          end
+
+        case result do
+          {:ok, acc} -> {:cont, {:ok, acc}}
+          error -> {:halt, error}
+        end
+      end)
     end
+  end
+
+  defp nested_under_storage(child, acc) do
+    case ObjectStore.stat(child <> "index.pb") do
+      {:ok, _} -> {:ok, [repository_id(child) | acc]}
+      {:error, :not_found} -> {:ok, acc}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp repository_id(prefix) do
+    prefix |> String.replace_prefix("repos/", "") |> String.trim_trailing("/")
   end
 
   @spec digest(binary()) :: String.t()

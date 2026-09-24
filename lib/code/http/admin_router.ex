@@ -33,9 +33,13 @@ defmodule Code.HTTP.AdminRouter do
   # Readiness means this node can do its assigned work. Every role needs the
   # object store: serving nodes read the log, and maintenance nodes derive and
   # conditionally publish work from it.
+  #
+  # The check is a constant-cost probe, never a listing. Every pod answers this
+  # every few seconds, so anything proportional to the bucket's size turns
+  # readiness into the largest consumer of object-store requests.
   get "/ready" do
-    case Code.ObjectStore.list("repos/") do
-      {:ok, _} -> send_json(conn, 200, %{status: "ready"})
+    case Code.ObjectStore.probe() do
+      :ok -> send_json(conn, 200, %{status: "ready"})
       {:error, reason} -> send_json(conn, 503, %{status: "not_ready", reason: inspect(reason)})
     end
   end

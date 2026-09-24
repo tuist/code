@@ -42,6 +42,30 @@ defmodule Code.ObjectStore do
   @callback stat(key(), config :: keyword()) ::
               {:ok, %{etag: etag(), size: non_neg_integer()}} | {:error, :not_found} | error()
 
+  @typedoc """
+  One level of a listing: the objects directly under a prefix, and the
+  next-level prefixes below it, each ending in `/`.
+  """
+  @type level :: %{keys: [entry()], prefixes: [String.t()]}
+
+  @doc """
+  List one level below `prefix`, treating `/` as a directory separator.
+
+  This is S3's delimiter listing. Its cost is proportional to what sits
+  directly under the prefix, not to everything beneath it, which is what lets
+  a caller walk a hierarchy without scanning every object in the bucket.
+  """
+  @callback list_prefixes(prefix :: String.t(), config :: keyword()) :: {:ok, level()} | error()
+
+  @doc """
+  Confirm the store is reachable and the configured credentials can use it.
+
+  A bounded, constant-cost request, whatever the bucket holds. Readiness probes
+  call this on every node every few seconds, so its cost must never grow with
+  the number of repositories.
+  """
+  @callback probe(config :: keyword()) :: :ok | error()
+
   @doc """
   Upload a local file without reading it into memory.
 
@@ -78,6 +102,14 @@ defmodule Code.ObjectStore do
 
   @spec stat(key()) :: {:ok, %{etag: etag(), size: non_neg_integer()}} | {:error, :not_found} | error()
   def stat(key), do: dispatch(:stat, [key])
+
+  @doc "List one level below `prefix`: its direct objects and its child prefixes."
+  @spec list_prefixes(String.t()) :: {:ok, level()} | error()
+  def list_prefixes(prefix), do: dispatch(:list_prefixes, [prefix])
+
+  @doc "A constant-cost reachability check against the store."
+  @spec probe() :: :ok | error()
+  def probe, do: dispatch(:probe, [])
 
   @doc "Upload a local file without reading it into memory."
   @spec put_file(key(), Path.t(), [put_opt()]) :: {:ok, etag()} | {:error, :precondition_failed} | error()
