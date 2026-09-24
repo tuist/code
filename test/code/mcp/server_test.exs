@@ -165,6 +165,34 @@ defmodule Code.MCP.ServerTest do
     assert "complete_work_attempt" in names
   end
 
+  test "tools/list keeps one stable public order across the tool domains", %{opts: opts} do
+    {:reply, %{result: %{tools: tools}}} = request("tools/list", %{}, opts)
+
+    # The tools live in per-domain modules; this pins the surface they add up
+    # to, so moving a handler between modules cannot silently drop or reorder
+    # a tool.
+    assert Enum.map(tools, & &1.name) == ~w(
+             list_repositories describe_repository create_repository
+             create_issue list_issues get_issue update_issue delete_issue add_issue_comment
+             get_issue_comment update_issue_comment delete_issue_comment issue_history
+             create_work_run
+             configure_secret_backend list_secret_backends get_secret_backend
+             configure_inference_profile list_inference_profiles get_inference_profile
+             list_work_runs get_work_run work_run_events claim_work_node complete_work_attempt
+             approve_work_node cancel_work_run expire_work_node get_work_attempt
+             list_refs read_file list_tree search log diff commit create_branch delete_branch
+             history clone_url
+           )
+
+    assert tools |> Enum.map(& &1.name) |> Enum.uniq() |> length() == length(tools)
+  end
+
+  test "an unknown tool is an ordinary tool error", %{opts: opts} do
+    result = call_tool("no_such_tool", %{}, opts)
+    assert result.isError
+    assert hd(result.content).text == "unknown tool: no_such_tool"
+  end
+
   describe "authorization" do
     test "a repository outside the principal's grants is reported as not found", %{opts: opts} do
       result = call_tool("describe_repository", %{"repository" => "other/secret"}, opts)
