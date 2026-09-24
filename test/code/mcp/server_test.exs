@@ -231,6 +231,26 @@ defmodule Code.MCP.ServerTest do
 
       assert result.structuredContent.repositories == [repo]
     end
+
+    test "list_repositories counts account policy grants, not only token grants", %{
+      opts: opts,
+      namespace: namespace
+    } do
+      granted = "#{namespace}/policy-only"
+      {:ok, _} = Control.create_repository(granted)
+      {:ok, _} = Control.create_repository("#{namespace}/ungranted")
+
+      # A principal whose token carries no grants at all: its only access is a
+      # binding in the account's policy object.
+      {:ok, _} = Code.Policy.bind(namespace, "policy-reader", [granted], ["read"])
+      on_exit(fn -> Code.Policy.invalidate(namespace) end)
+
+      reader = %Principal{subject: "policy-reader", account: namespace, grants: [], source: :test}
+      result = call_tool("list_repositories", %{}, Keyword.put(opts, :principal, reader))
+
+      refute result[:isError], inspect(result)
+      assert result.structuredContent.repositories == [granted]
+    end
   end
 
   describe "tool errors" do

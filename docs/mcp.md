@@ -188,7 +188,9 @@ Grants are patterns, and a repository the caller may not read is reported as
 **not found** rather than forbidden. Distinguishing the two would let an agent
 enumerate which repositories exist, which on a multi-tenant host leaks the shape
 of every customer's estate. `list_repositories` filters to what the principal can
-actually read, for the same reason.
+actually read, for the same reason, using the same decision as every other
+tool: grants carried by the token and bindings in the account's policy object
+both count.
 
 Discovery follows OAuth 2.1: a `401` carries
 

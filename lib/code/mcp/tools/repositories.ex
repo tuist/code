@@ -246,7 +246,10 @@ defmodule Code.MCP.Tools.Repositories do
     with {:ok, ids} <- Control.list_repositories() do
       visible =
         ids
-        |> Enum.filter(&Auth.Principal.allows?(principal, &1, :read))
+        # The same decision every other tool makes, so a repository readable
+        # through the account's policy object is listed, not only one the
+        # token's own grants cover.
+        |> Enum.filter(&(Auth.authorize(principal, &1, :read) == :ok))
         |> then(fn list -> if prefix, do: Enum.filter(list, &String.starts_with?(&1, prefix)), else: list end)
 
       {:ok, %{repositories: visible, count: length(visible)}}
