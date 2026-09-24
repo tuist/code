@@ -6,6 +6,8 @@ defmodule Code.HTTP.IssuesRouter do
   import Plug.Conn
 
   alias Code.HTTP.AuthPlug
+  alias Code.HTTP.QueryParams
+  alias Code.HTTP.ServiceResponse
   alias Code.Issues
 
   plug(:match)
@@ -13,7 +15,14 @@ defmodule Code.HTTP.IssuesRouter do
   plug(:dispatch)
 
   get "/" do
-    with_authorized(conn, :read, fn repo_id, _principal -> Issues.list(repo_id) end)
+    with {:ok, limit} <- QueryParams.integer(conn, "limit"),
+         {:ok, cursor} <- QueryParams.integer(conn, "cursor") do
+      with_authorized(conn, :read, fn repo_id, _principal ->
+        Issues.list(repo_id, limit: limit, cursor: cursor)
+      end)
+    else
+      {:error, message} -> error(conn, 422, "code: #{message}")
+    end
   end
 
   post "/" do
@@ -137,24 +146,7 @@ defmodule Code.HTTP.IssuesRouter do
   defp maybe_put_change(changes, _key, nil), do: changes
   defp maybe_put_change(changes, key, value), do: Map.put(changes, key, value)
 
-  defp respond(conn, {:ok, payload}, status), do: json(conn, status, payload)
+  defp respond(conn, result, status), do: ServiceResponse.send_result(conn, result, status)
 
-  defp respond(conn, {:error, message}, _status) do
-    status =
-      cond do
-        String.contains?(message, "not found") -> 404
-        String.contains?(message, "changed concurrently") -> 409
-        true -> 422
-      end
-
-    error(conn, status, "code: #{message}")
-  end
-
-  defp error(conn, status, message), do: json(conn, status, %{error: message})
-
-  defp json(conn, status, payload) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, JSON.encode!(payload))
-  end
+  defp error(conn, status, message), do: ServiceResponse.error(conn, status, message)
 end

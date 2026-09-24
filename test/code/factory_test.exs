@@ -5,6 +5,7 @@ defmodule Code.FactoryTest do
   alias Code.Factory
   alias Code.Factory.InferenceProfile
   alias Code.Factory.SecretBackend
+  alias Code.ServiceError
   alias Code.WAL
   alias Code.WAL.Entry
 
@@ -194,7 +195,7 @@ defmodule Code.FactoryTest do
     namespace: namespace,
     principal: principal
   } do
-    assert {:error, "inference profile contains an unsupported field"} =
+    assert {:error, %ServiceError{kind: :invalid, message: "inference profile contains an unsupported field"}} =
              InferenceProfile.put(
                namespace,
                "unsafe",
@@ -202,13 +203,111 @@ defmodule Code.FactoryTest do
                principal
              )
 
-    assert {:error, "inference profile contains an unsupported field"} =
+    assert {:error, %ServiceError{kind: :invalid, message: "inference profile contains an unsupported field"}} =
              InferenceProfile.put(
                namespace,
                "unsafe-root",
                Map.put(profile_attrs(), "token", "secret"),
                principal
              )
+  end
+
+  test "reports an invalid secret reference as a validation error rather than crashing", %{
+    namespace: namespace,
+    principal: principal
+  } do
+    assert {:ok, _} =
+             SecretBackend.put(
+               namespace,
+               "production",
+               %{"driver" => "managed_infisical", "project" => "acme-production"},
+               principal
+             )
+
+    for secret <- [
+          %{"reference" => "/production/\ncoding"},
+          %{"reference" => "/production/coding", "field" => ""}
+        ] do
+      attrs = put_in(profile_attrs(), ["credential_binding", "secret"], secret)
+
+      assert {:error, %ServiceError{kind: :invalid}} =
+               InferenceProfile.put(namespace, "coding", attrs, principal)
+    end
+
+    assert {:error, %ServiceError{kind: :not_found}} = InferenceProfile.get(namespace, "coding")
+  end
+
+  test "rejects endpoints and credential locators that could carry a secret", %{
+    namespace: namespace,
+    principal: principal
+  } do
+    assert {:ok, _} =
+             SecretBackend.put(
+               namespace,
+               "production",
+               %{"driver" => "managed_infisical", "project" => "acme-production"},
+               principal
+             )
+
+    # A worker receives the endpoint in its claim, so a query or fragment
+    # (where an api_key parameter would hide) is refused, even an empty one.
+    for endpoint <- [
+          "https://inference.example.com/v1?api_key=sk-live",
+          "https://inference.example.com/v1#sk-live",
+          "https://inference.example.com/v1?",
+          "https://user:pass@inference.example.com/v1"
+        ] do
+      assert {:error, %ServiceError{kind: :invalid, message: message}} =
+               InferenceProfile.put(
+                 namespace,
+                 "coding",
+                 Map.put(profile_attrs(), "endpoint", endpoint),
+                 principal
+               )
+
+      assert message =~ "without user information, query, or fragment"
+    end
+
+    unsafe_bindings = [
+      put_in(profile_attrs(), ["credential_binding", "identity_id"], "coding-machine-identity"),
+      put_in(profile_attrs(), ["credential_binding", "secret", "reference"], "production/coding"),
+      put_in(profile_attrs(), ["credential_binding", "secret", "reference"], "/production/../coding"),
+      put_in(profile_attrs(), ["credential_binding", "secret", "reference"], "/production/sk-proj-abcdef"),
+      put_in(
+        profile_attrs(),
+        ["credential_binding", "secret", "reference"],
+        "/production/Q9x7Lm2Pz8Rt4Vw6Yb1Nc3Kd"
+      ),
+      put_in(profile_attrs(), ["credential_binding", "secret", "field"], "ghp_0123456789abcdef"),
+      put_in(profile_attrs(), ["credential_binding", "secret", "field"], "api key")
+    ]
+
+    for attrs <- unsafe_bindings do
+      assert {:error, %ServiceError{kind: :invalid}} =
+               InferenceProfile.put(namespace, "coding", attrs, principal),
+             inspect(attrs["credential_binding"])
+    end
+
+    for project <- ["AcmeProduction", "xoxb-123-456", "acme production", String.duplicate("a", 65)] do
+      assert {:error, %ServiceError{kind: :invalid}} =
+               SecretBackend.put(
+                 namespace,
+                 "other",
+                 %{"driver" => "managed_infisical", "project" => project},
+                 principal
+               ),
+             project
+    end
+
+    assert {:ok, _} =
+             SecretBackend.put(
+               namespace,
+               "by-id",
+               %{"driver" => "managed_infisical", "project" => "0f9e8d7c-6b5a-4938-8271-6a5b4c3d2e1f"},
+               principal
+             )
+
+    assert {:error, %ServiceError{kind: :not_found}} = InferenceProfile.get(namespace, "coding")
   end
 
   test "emits bounded telemetry for durable graph operations", %{repo: repo, principal: principal} do
@@ -254,6 +353,101 @@ defmodule Code.FactoryTest do
     assert Enum.count(events, &(&1["type"] == "node_claimed")) == 1
   end
 
+  describe "idempotent claims" do
+    setup %{repo: repo, principal: principal} do
+      graph = %{"nodes" => [%{"id" => "first", "title" => "First"}, %{"id" => "second", "title" => "Second"}]}
+      assert {:ok, run} = Factory.create(repo, graph, %{base_commit: base_commit()}, principal)
+      {:ok, run: run}
+    end
+
+    test "a repeated claim with the same key returns the same attempt", %{
+      repo: repo,
+      run: run,
+      principal: principal
+    } do
+      assert {:ok, first} = Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "claim-1")
+      refute Map.get(first, :replayed)
+
+      # The response was lost; the worker retries with the same key. Another
+      # node is still ready, so a non-idempotent retry would claim it.
+      assert {:ok, again} = Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "claim-1")
+      assert again.replayed
+      assert again.attempt == first.attempt
+      assert again.work == first.work
+      assert first.attempt["idempotency_key"] == "claim-1"
+
+      assert {:ok, current} = Factory.get(repo, run.id)
+      assert Enum.map(current.nodes, & &1["status"]) == ["running", "ready"]
+
+      assert {:ok, %{events: events}} = Factory.events(repo, run.id)
+      assert Enum.count(events, &(&1["type"] == "node_claimed")) == 1
+
+      # A different key is a different request.
+      assert {:ok, other} = Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "claim-2")
+      assert other.attempt["node"] == "second"
+    end
+
+    test "concurrent claims with one key produce exactly one attempt", %{
+      repo: repo,
+      run: run,
+      principal: principal
+    } do
+      results =
+        1..10
+        |> Task.async_stream(
+          fn _ -> Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "shared") end,
+          max_concurrency: 10,
+          timeout: 30_000
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert Enum.all?(results, &match?({:ok, _}, &1)), inspect(results)
+      assert results |> Enum.map(fn {:ok, claim} -> claim.attempt["id"] end) |> Enum.uniq() |> length() == 1
+
+      assert {:ok, %{events: events}} = Factory.events(repo, run.id)
+      assert Enum.count(events, &(&1["type"] == "node_claimed")) == 1
+    end
+
+    test "still answers with the claimed attempt after the run is cancelled", %{
+      repo: repo,
+      run: run,
+      principal: principal
+    } do
+      assert {:ok, first} = Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "before-cancel")
+      assert {:ok, _} = Factory.cancel(repo, run.id, principal)
+
+      assert {:ok, %{replayed: true, attempt: attempt}} =
+               Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "before-cancel")
+
+      assert attempt == first.attempt
+
+      assert {:error, %ServiceError{kind: :conflict, message: "work run is cancelled"}} =
+               Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "after-cancel")
+    end
+
+    test "refuses a key reused by another principal or executor, and a malformed key", %{
+      repo: repo,
+      run: run,
+      principal: principal
+    } do
+      assert {:ok, _} = Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "mine")
+
+      assert {:error, %ServiceError{kind: :conflict}} =
+               Factory.claim(repo, run.id, "pod-a", %{principal | subject: "someone-else"},
+                 idempotency_key: "mine"
+               )
+
+      assert {:error, %ServiceError{kind: :conflict}} =
+               Factory.claim(repo, run.id, "pod-b", principal, idempotency_key: "mine")
+
+      for key <- ["", "-leading", "has space", String.duplicate("k", 129), 42] do
+        assert {:error, %ServiceError{kind: :invalid}} =
+                 Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: key),
+               inspect(key)
+      end
+    end
+  end
+
   test "does not lose either result when independent attempts complete together", %{
     repo: repo,
     principal: principal
@@ -293,7 +487,8 @@ defmodule Code.FactoryTest do
 
     other = %{principal | subject: "another-worker"}
 
-    assert {:error, "attempt belongs to a different executor identity"} =
+    assert {:error,
+            %ServiceError{kind: :conflict, message: "attempt belongs to a different executor identity"}} =
              Factory.complete(repo, run.id, "work", claimed.attempt["id"], "succeeded", [], other)
 
     assert {:ok, current} = Factory.get(repo, run.id)
@@ -307,7 +502,12 @@ defmodule Code.FactoryTest do
   } do
     assert {:ok, run} = Factory.create(repo, one_node_graph(), %{base_commit: base_commit()}, principal)
     assert {:ok, claimed} = Factory.claim(repo, run.id, "pod-a", principal)
-    assert {:ok, %{status: "cancelled"}} = Factory.cancel(repo, run.id, principal)
+    assert {:ok, %{status: "cancelled", nodes: [node]}} = Factory.cancel(repo, run.id, principal)
+
+    # The run is over, so the node no longer claims to be running, but it
+    # still names the attempt whose late result is retained below.
+    assert node["status"] == "abandoned"
+    assert node["attempt_id"] == claimed.attempt["id"]
 
     assert {:ok, rejected} =
              Factory.complete(
@@ -363,7 +563,10 @@ defmodule Code.FactoryTest do
 
     assert {:ok, claimed} = Factory.claim(repo, run.id, "pod-a", principal)
     Process.sleep(1_050)
-    assert {:ok, %{status: "active"}} = Factory.expire(repo, run.id, "work")
+    assert {:ok, %{status: "active"}} = Factory.expire(repo, run.id, "work", principal)
+    assert {:ok, %{events: [expired]}} = Factory.events(repo, run.id, 2)
+    assert expired["type"] == "attempt_expired"
+    assert expired["actor"] == %{"subject" => principal.subject, "account" => principal.account}
 
     assert {:ok, late} =
              Factory.complete(repo, run.id, "work", claimed.attempt["id"], "succeeded", [], principal)
@@ -406,6 +609,40 @@ defmodule Code.FactoryTest do
     assert failed.nodes |> Enum.find(&(&1["id"] == "second")) |> Map.fetch!("status") == "skipped"
   end
 
+  test "marks a still-running sibling abandoned when the run fails, and rejects its late result", %{
+    repo: repo,
+    principal: principal
+  } do
+    graph = %{
+      "nodes" => [
+        %{"id" => "first", "title" => "First"},
+        %{"id" => "second", "title" => "Second"},
+        %{"id" => "third", "title" => "Third", "depends_on" => ["first"]}
+      ]
+    }
+
+    assert {:ok, run} = Factory.create(repo, graph, %{base_commit: base_commit()}, principal)
+    assert {:ok, first} = Factory.claim(repo, run.id, "pod-a", principal)
+    assert {:ok, second} = Factory.claim(repo, run.id, "pod-b", principal)
+
+    assert {:ok, failed} =
+             Factory.complete(repo, run.id, "first", first.attempt["id"], "failed", [], principal)
+
+    assert failed.status == "failed"
+
+    assert Map.new(failed.nodes, &{&1["id"], &1["status"]}) == %{
+             "first" => "failed",
+             "second" => "abandoned",
+             "third" => "skipped"
+           }
+
+    assert {:ok, late} =
+             Factory.complete(repo, run.id, "second", second.attempt["id"], "succeeded", [], principal)
+
+    refute late.accepted
+    assert {:ok, %{result: %{"outcome" => "succeeded"}}} = Factory.attempt(repo, run.id, second.attempt["id"])
+  end
+
   test "replays an accepted result without appending a second event", %{repo: repo, principal: principal} do
     assert {:ok, run} = Factory.create(repo, one_node_graph(), %{base_commit: base_commit()}, principal)
     assert {:ok, claimed} = Factory.claim(repo, run.id, "pod-a", principal)
@@ -414,11 +651,16 @@ defmodule Code.FactoryTest do
              Factory.complete(repo, run.id, "work", claimed.attempt["id"], "succeeded", [], principal)
 
     assert accepted.accepted
+    Process.sleep(5)
 
     assert {:ok, replay} =
              Factory.complete(repo, run.id, "work", claimed.attempt["id"], "succeeded", [], principal)
 
     assert replay.accepted
+    # A replay answers with the stored record, not a freshly stamped copy.
+    assert replay.result == accepted.result
+    assert {:ok, %{result: stored}} = Factory.attempt(repo, run.id, claimed.attempt["id"])
+    assert replay.result == stored
     assert {:ok, %{events: events}} = Factory.events(repo, run.id)
     assert Enum.map(events, & &1["type"]) == ["work_run_created", "node_claimed", "attempt_succeeded"]
   end
@@ -431,17 +673,25 @@ defmodule Code.FactoryTest do
       ]
     }
 
-    assert {:error, "work graph must not contain a cycle"} =
+    assert {:error, %ServiceError{kind: :invalid, message: "work graph must not contain a cycle"}} =
              Factory.create(repo, cycle, %{base_commit: base_commit()}, principal)
 
     assert {:ok, run} = Factory.create(repo, one_node_graph(), %{base_commit: base_commit()}, principal)
-    assert {:error, "work attempt id is invalid"} = Factory.attempt(repo, run.id, "../../state")
-    assert {:error, "after must be a non-negative integer"} = Factory.events(repo, run.id, "not-a-cursor")
 
-    assert {:error, "issue must be a positive integer"} =
+    assert {:error, %ServiceError{kind: :invalid, message: "work attempt id is invalid"}} =
+             Factory.attempt(repo, run.id, "../../state")
+
+    assert {:error, %ServiceError{kind: :invalid, message: "after must be a non-negative integer"}} =
+             Factory.events(repo, run.id, "not-a-cursor")
+
+    assert {:error, %ServiceError{kind: :invalid, message: "issue must be a positive integer"}} =
              Factory.create(repo, one_node_graph(), %{base_commit: base_commit(), issue: 0}, principal)
 
-    assert {:error, "base_commit is not the current head of a public reference"} =
+    assert {:error,
+            %ServiceError{
+              kind: :invalid,
+              message: "base_commit is not the current head of a public reference"
+            }} =
              Factory.create(repo, one_node_graph(), %{base_commit: String.duplicate("b", 40)}, principal)
   end
 
@@ -464,7 +714,7 @@ defmodule Code.FactoryTest do
       "model" => "coding-model",
       "credential_binding" => %{
         "backend" => "production",
-        "identity_id" => "coding-machine-identity",
+        "identity_id" => "5b0c2f1e-8d7a-4c3b-9e6f-1a2b3c4d5e6f",
         "secret" => %{"reference" => "/production/coding", "field" => "api_key"}
       }
     }

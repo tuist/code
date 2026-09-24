@@ -165,6 +165,47 @@ defmodule Code.MCP.ServerTest do
     assert "complete_work_attempt" in names
   end
 
+  test "tools/list keeps one stable public order across the tool domains", %{opts: opts} do
+    {:reply, %{result: %{tools: tools}}} = request("tools/list", %{}, opts)
+
+    # The tools live in per-domain modules; this pins the surface they add up
+    # to, so moving a handler between modules cannot silently drop or reorder
+    # a tool.
+    assert Enum.map(tools, & &1.name) == ~w(
+             list_repositories describe_repository create_repository
+             create_issue list_issues get_issue update_issue delete_issue add_issue_comment
+             get_issue_comment update_issue_comment delete_issue_comment issue_history
+             create_work_run
+             configure_secret_backend list_secret_backends get_secret_backend
+             configure_inference_profile list_inference_profiles get_inference_profile
+             list_work_runs get_work_run work_run_events claim_work_node complete_work_attempt
+             approve_work_node cancel_work_run expire_work_node get_work_attempt
+             list_refs read_file list_tree search log diff commit create_branch delete_branch
+             history clone_url
+           )
+
+    assert tools |> Enum.map(& &1.name) |> Enum.uniq() |> length() == length(tools)
+  end
+
+  test "an unknown tool is an ordinary tool error", %{opts: opts} do
+    result = call_tool("no_such_tool", %{}, opts)
+    assert result.isError
+    assert hd(result.content).text == "unknown tool: no_such_tool"
+  end
+
+  test "a typed service failure says what kind it is and whether to retry", %{opts: opts, repo: repo} do
+    result = call_tool("get_work_run", %{"repository" => repo, "run" => "rmissing"}, opts)
+
+    assert result.isError
+    assert hd(result.content).text == "work run rmissing not found"
+
+    assert result.structuredContent.error == %{
+             kind: :not_found,
+             message: "work run rmissing not found",
+             retryable: false
+           }
+  end
+
   describe "authorization" do
     test "a repository outside the principal's grants is reported as not found", %{opts: opts} do
       result = call_tool("describe_repository", %{"repository" => "other/secret"}, opts)
@@ -189,6 +230,26 @@ defmodule Code.MCP.ServerTest do
       result = call_tool("list_repositories", %{}, opts)
 
       assert result.structuredContent.repositories == [repo]
+    end
+
+    test "list_repositories counts account policy grants, not only token grants", %{
+      opts: opts,
+      namespace: namespace
+    } do
+      granted = "#{namespace}/policy-only"
+      {:ok, _} = Control.create_repository(granted)
+      {:ok, _} = Control.create_repository("#{namespace}/ungranted")
+
+      # A principal whose token carries no grants at all: its only access is a
+      # binding in the account's policy object.
+      {:ok, _} = Code.Policy.bind(namespace, "policy-reader", [granted], ["read"])
+      on_exit(fn -> Code.Policy.invalidate(namespace) end)
+
+      reader = %Principal{subject: "policy-reader", account: namespace, grants: [], source: :test}
+      result = call_tool("list_repositories", %{}, Keyword.put(opts, :principal, reader))
+
+      refute result[:isError], inspect(result)
+      assert result.structuredContent.repositories == [granted]
     end
   end
 
@@ -451,7 +512,7 @@ defmodule Code.MCP.ServerTest do
             "model" => "coding-model",
             "credential_binding" => %{
               "backend" => "production",
-              "identity_id" => "coding-machine-identity",
+              "identity_id" => "5b0c2f1e-8d7a-4c3b-9e6f-1a2b3c4d5e6f",
               "secret" => %{"reference" => "/production/coding", "field" => "api_key"}
             }
           },
@@ -554,6 +615,138 @@ defmodule Code.MCP.ServerTest do
                "attempt_succeeded"
              ]
     end
+
+    test "claim_work_node replays a claim repeated with the same idempotency key", %{opts: opts, repo: repo} do
+      run_id = create_mcp_run(opts, repo, [%{"id" => "a", "title" => "A"}, %{"id" => "b", "title" => "B"}])
+      args = %{"repository" => repo, "run" => run_id, "executor" => "pod", "idempotency_key" => "mcp-claim-1"}
+
+      first = call_tool("claim_work_node", args, opts)
+      again = call_tool("claim_work_node", args, opts)
+
+      refute first[:isError], inspect(first)
+      refute again[:isError], inspect(again)
+      assert again.structuredContent.attempt == first.structuredContent.attempt
+      assert again.structuredContent.replayed
+    end
+
+    test "approve_work_node needs repository administration and releases dependent work", %{
+      opts: opts,
+      repo: repo
+    } do
+      run_id =
+        create_mcp_run(opts, repo, [
+          %{"id" => "review", "kind" => "approval", "title" => "Review"},
+          %{"id" => "ship", "title" => "Ship", "depends_on" => ["review"]}
+        ])
+
+      args = %{"repository" => repo, "run" => run_id, "node" => "review"}
+
+      # A writer and executor, but not an administrator: indistinguishable
+      # from a repository it cannot see.
+      refused = call_tool("approve_work_node", args, opts)
+      assert refused.isError
+      assert hd(refused.content).text == "repository #{repo} not found"
+
+      approved = call_tool("approve_work_node", args, administrator_opts(opts))
+      refute approved[:isError], inspect(approved)
+      assert node_statuses(approved) == %{"review" => "succeeded", "ship" => "ready"}
+
+      again = call_tool("approve_work_node", args, administrator_opts(opts))
+      assert again.isError
+      assert again.structuredContent.error.kind == :conflict
+    end
+
+    test "cancel_work_run needs repository administration and settles every node", %{opts: opts, repo: repo} do
+      run_id = create_mcp_run(opts, repo, [%{"id" => "a", "title" => "A"}, %{"id" => "b", "title" => "B"}])
+
+      claimed =
+        call_tool("claim_work_node", %{"repository" => repo, "run" => run_id, "executor" => "pod"}, opts)
+
+      refute claimed[:isError], inspect(claimed)
+
+      args = %{"repository" => repo, "run" => run_id}
+      assert call_tool("cancel_work_run", args, opts).isError
+
+      cancelled = call_tool("cancel_work_run", args, administrator_opts(opts))
+      refute cancelled[:isError], inspect(cancelled)
+      assert cancelled.structuredContent.status == "cancelled"
+      assert node_statuses(cancelled) == %{"a" => "abandoned", "b" => "skipped"}
+
+      events = call_tool("work_run_events", args, opts)
+      assert List.last(events.structuredContent.events)["actor"]["subject"] == "factory-administrator"
+    end
+
+    test "expire_work_node requeues a stale lease and records who expired it", %{opts: opts, repo: repo} do
+      run_id =
+        create_mcp_run(opts, repo, [%{"id" => "work", "title" => "Work"}], %{"lease_duration_ms" => 1_000})
+
+      claimed =
+        call_tool("claim_work_node", %{"repository" => repo, "run" => run_id, "executor" => "pod"}, opts)
+
+      refute claimed[:isError], inspect(claimed)
+
+      args = %{"repository" => repo, "run" => run_id, "node" => "work"}
+
+      early = call_tool("expire_work_node", args, administrator_opts(opts))
+      assert early.isError
+      assert hd(early.content).text == "work attempt lease has not expired"
+
+      Process.sleep(1_050)
+      assert call_tool("expire_work_node", args, opts).isError
+
+      expired = call_tool("expire_work_node", args, administrator_opts(opts))
+      refute expired[:isError], inspect(expired)
+      assert node_statuses(expired) == %{"work" => "ready"}
+
+      events = call_tool("work_run_events", %{"repository" => repo, "run" => run_id}, opts)
+      last = List.last(events.structuredContent.events)
+      assert last["type"] == "attempt_expired"
+      assert last["actor"]["subject"] == "factory-administrator"
+    end
+  end
+
+  defp administrator_opts(opts) do
+    principal = Keyword.fetch!(opts, :principal)
+
+    Keyword.put(opts, :principal, %Principal{
+      principal
+      | subject: "factory-administrator",
+        grants: [Principal.grant("#{principal.account}/**", [:read, :write, :execute, :admin])]
+    })
+  end
+
+  defp node_statuses(result), do: Map.new(result.structuredContent.nodes, &{&1["id"], &1["status"]})
+
+  # Seeds a real commit, because a replica must be able to materialize `main`,
+  # and creates a run over it through the tool surface.
+  defp create_mcp_run(opts, repo, nodes, extra \\ %{}) do
+    seeded =
+      call_tool(
+        "commit",
+        %{
+          "repository" => repo,
+          "branch" => "main",
+          "message" => "feat: seed factory work",
+          "changes" => [%{"path" => "README.md", "content" => "# factory fixture\n"}]
+        },
+        opts
+      )
+
+    refute seeded[:isError], inspect(seeded)
+
+    created =
+      call_tool(
+        "create_work_run",
+        Map.merge(extra, %{
+          "repository" => repo,
+          "base_commit" => seeded.structuredContent.commit,
+          "graph" => %{"nodes" => nodes}
+        }),
+        opts
+      )
+
+    refute created[:isError], inspect(created)
+    created.structuredContent.id
   end
 
   describe "reading" do

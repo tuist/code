@@ -42,7 +42,17 @@ defmodule Code.HTTP.ApiSpec do
   defp paths do
     %{
       "/api/issues" => %PathItem{
-        get: operation("listIssues", "List issues", [repository_parameter()], list_schema()),
+        get:
+          operation(
+            "listIssues",
+            "List issues",
+            [
+              repository_parameter(),
+              limit_parameter(),
+              Operation.parameter(:cursor, :query, :integer, "The next_cursor of the previous page")
+            ],
+            list_schema()
+          ),
         post:
           operation("createIssue", "Create issue", [repository_parameter()], mutation_schema(),
             request_body: create_issue_schema(),
@@ -80,7 +90,15 @@ defmodule Code.HTTP.ApiSpec do
       },
       "/api/work-runs" => %PathItem{
         get:
-          operation("listWorkRuns", "List work runs", [repository_parameter()], work_run_list_schema(),
+          operation(
+            "listWorkRuns",
+            "List work runs",
+            [
+              repository_parameter(),
+              limit_parameter(),
+              Operation.parameter(:cursor, :query, :string, "The next_cursor of the previous page")
+            ],
+            work_run_list_schema(),
             tags: ["Work runs"]
           ),
         post:
@@ -102,7 +120,10 @@ defmodule Code.HTTP.ApiSpec do
             "getWorkRunEvents",
             "Get immutable work-run events",
             work_run_parameters() ++
-              [Operation.parameter(:after, :query, :integer, "Exclusive state-revision cursor")],
+              [
+                Operation.parameter(:after, :query, :integer, "Exclusive state-revision cursor"),
+                limit_parameter()
+              ],
             work_events_schema(),
             tags: ["Work runs"]
           )
@@ -221,9 +242,20 @@ defmodule Code.HTTP.ApiSpec do
           Operation.response("Success", "application/json", schema),
         "401" => Operation.response("Authentication required", "application/json", error_schema()),
         "403" => Operation.response("Permission denied", "application/json", error_schema()),
-        "404" => Operation.response("Repository or issue not found", "application/json", error_schema()),
-        "409" => Operation.response("Concurrent update", "application/json", error_schema()),
-        "422" => Operation.response("Invalid request", "application/json", error_schema())
+        "404" =>
+          Operation.response(
+            "Repository, issue, run, or record not found",
+            "application/json",
+            error_schema()
+          ),
+        "409" =>
+          Operation.response(
+            "The request conflicts with current durable state; re-read before retrying",
+            "application/json",
+            error_schema()
+          ),
+        "422" => Operation.response("Invalid request", "application/json", error_schema()),
+        "503" => temporary_failure_response()
       }
 
     %Operation{
@@ -238,6 +270,33 @@ defmodule Code.HTTP.ApiSpec do
       responses: responses,
       security: [%{"bearerAuth" => []}]
     }
+  end
+
+  # Storage failures, an overloaded repository writer, and exhausted optimistic
+  # retries. The same request may succeed after `Retry-After` seconds.
+  defp temporary_failure_response do
+    %{
+      Operation.response(
+        "Temporary failure; retry the same request later",
+        "application/json",
+        error_schema()
+      )
+      | headers: %{
+          "Retry-After" => %OpenApiSpex.Header{
+            description: "Seconds to wait before retrying.",
+            schema: %Schema{type: :integer, minimum: 1}
+          }
+        }
+    }
+  end
+
+  defp limit_parameter do
+    Operation.parameter(
+      :limit,
+      :query,
+      %Schema{type: :integer, minimum: 1, maximum: Code.Page.max_limit()},
+      "Page size. Omit both limit and cursor to receive every item."
+    )
   end
 
   defp repository_parameter do
@@ -345,7 +404,8 @@ defmodule Code.HTTP.ApiSpec do
       required: [:issues, :count],
       properties: %{
         issues: %Schema{type: :array, items: issue_schema()},
-        count: %Schema{type: :integer, minimum: 0}
+        count: %Schema{type: :integer, minimum: 0},
+        next_cursor: %Schema{type: :integer, nullable: true, description: "Null on the last page."}
       }
     }
   end
@@ -428,7 +488,7 @@ defmodule Code.HTTP.ApiSpec do
         depends_on: %Schema{type: :array, items: %Schema{type: :string}},
         status: %Schema{
           type: :string,
-          enum: ["pending", "ready", "waiting", "running", "succeeded", "failed", "skipped"]
+          enum: ["pending", "ready", "waiting", "running", "succeeded", "failed", "skipped", "abandoned"]
         },
         attempts: %Schema{type: :integer, minimum: 0},
         attempt_id: %Schema{type: :string},
@@ -487,7 +547,8 @@ defmodule Code.HTTP.ApiSpec do
       properties: %{
         repository: %Schema{type: :string},
         runs: %Schema{type: :array, items: work_run_schema()},
-        count: %Schema{type: :integer, minimum: 0}
+        count: %Schema{type: :integer, minimum: 0},
+        next_cursor: %Schema{type: :string, nullable: true, description: "Null on the last page."}
       }
     }
   end
@@ -496,7 +557,15 @@ defmodule Code.HTTP.ApiSpec do
     %Schema{
       type: :object,
       required: [:executor],
-      properties: %{executor: %Schema{type: :string, minLength: 1}}
+      properties: %{
+        executor: %Schema{type: :string, minLength: 1},
+        idempotency_key: %Schema{
+          type: :string,
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+          description:
+            "Optional; may also be sent as the Idempotency-Key header. Repeating a claim with the same key returns the attempt it already claimed."
+        }
+      }
     }
   end
 
@@ -528,7 +597,8 @@ defmodule Code.HTTP.ApiSpec do
         run_id: %Schema{type: :string},
         events: %Schema{type: :array, items: %Schema{type: :object}},
         count: %Schema{type: :integer, minimum: 0},
-        next_cursor: %Schema{type: :integer, minimum: 1}
+        next_cursor: %Schema{type: :integer, minimum: 0},
+        has_more: %Schema{type: :boolean, description: "Whether events after next_cursor exist."}
       }
     }
   end
@@ -541,7 +611,11 @@ defmodule Code.HTTP.ApiSpec do
         account: %Schema{type: :string},
         name: %Schema{type: :string},
         version: %Schema{type: :string},
-        endpoint: %Schema{type: :string, format: :uri},
+        endpoint: %Schema{
+          type: :string,
+          format: :uri,
+          description: "HTTPS inference endpoint with no user information, query, or fragment."
+        },
         model: %Schema{type: :string},
         credential_binding: credential_binding_schema(),
         created_at_ms: %Schema{type: :integer},
@@ -567,7 +641,11 @@ defmodule Code.HTTP.ApiSpec do
       type: :object,
       required: [:endpoint, :model, :credential_binding],
       properties: %{
-        endpoint: %Schema{type: :string, format: :uri},
+        endpoint: %Schema{
+          type: :string,
+          format: :uri,
+          description: "HTTPS inference endpoint with no user information, query, or fragment."
+        },
         model: %Schema{type: :string},
         credential_binding: credential_binding_schema(),
         previous_version: %Schema{type: :string}
@@ -579,7 +657,27 @@ defmodule Code.HTTP.ApiSpec do
     %Schema{
       type: :object,
       description:
-        "Non-secret reference to an account secret backend, its machine identity, and a logical secret locator. It never includes a provider endpoint, workload-token audience, token, or secret value."
+        "Non-secret reference to an account secret backend, its machine identity, and a logical secret locator. It never includes a provider endpoint, workload-token audience, token, or secret value.",
+      required: [:backend, :identity_id, :secret],
+      additionalProperties: false,
+      properties: %{
+        backend: %Schema{type: :string, description: "Account secret backend name."},
+        identity_id: %Schema{type: :string, format: :uuid, description: "Infisical machine identity id."},
+        secret: %Schema{
+          type: :object,
+          required: [:reference],
+          additionalProperties: false,
+          properties: %{
+            reference: %Schema{
+              type: :string,
+              maxLength: 512,
+              pattern: "^(/[A-Za-z0-9_.-]{1,64}){1,16}$",
+              description: "Absolute secret path, such as /production/coding."
+            },
+            field: %Schema{type: :string, pattern: "^[A-Za-z_][A-Za-z0-9_]{0,63}$", description: "Key name."}
+          }
+        }
+      }
     }
   end
 
@@ -617,7 +715,10 @@ defmodule Code.HTTP.ApiSpec do
       required: [:driver, :project],
       properties: %{
         driver: %Schema{type: :string, enum: ["managed_infisical"]},
-        project: %Schema{type: :string},
+        project: %Schema{
+          type: :string,
+          description: "Infisical project id (a UUID) or lowercase project slug of up to 64 characters."
+        },
         previous_version: %Schema{type: :string}
       }
     }

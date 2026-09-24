@@ -6,6 +6,7 @@ defmodule Code.IssuesTest do
   alias Code.Git
   alias Code.Issues
   alias Code.Replica
+  alias Code.ServiceError
 
   setup %{repo: repo, namespace: namespace} do
     start_replica_runtime()
@@ -60,7 +61,10 @@ defmodule Code.IssuesTest do
     assert {:ok, %{issue: issue}} = Issues.delete_comment(repo, issue.number, comment.id, principal)
     assert issue.comments == []
     assert issue.comment_count == 0
-    assert {:error, message} = Issues.get_comment(repo, issue.number, comment.id)
+
+    assert {:error, %ServiceError{kind: :not_found, message: message}} =
+             Issues.get_comment(repo, issue.number, comment.id)
+
     assert message =~ "not found"
 
     assert {:ok, %{events: events}} = Issues.events(repo, issue.number)
@@ -75,10 +79,76 @@ defmodule Code.IssuesTest do
 
     assert {:ok, %{issue: deleted}} = Issues.delete(repo, issue.number, principal)
     assert deleted.state == "deleted"
-    assert {:error, message} = Issues.get(repo, issue.number)
+    assert {:error, %ServiceError{kind: :not_found, message: message}} = Issues.get(repo, issue.number)
     assert message =~ "not found"
     assert {:ok, %{issues: []}} = Issues.list(repo)
     assert {:ok, %{events: events}} = Issues.events(repo, issue.number)
     assert List.last(events).type == "issue_deleted"
+  end
+
+  test "lists every current issue in number order, without deleted ones", %{repo: repo, principal: principal} do
+    for title <- ~w(first second third) do
+      assert {:ok, _} = Issues.create(repo, title, "", principal)
+    end
+
+    assert {:ok, _} = Issues.delete(repo, 2, principal)
+
+    assert {:ok, %{issues: issues, count: 2}} = Issues.list(repo)
+    assert Enum.map(issues, &{&1.number, &1.title}) == [{1, "first"}, {3, "third"}]
+  end
+
+  test "concurrent creators each get a distinct number and none is lost", %{repo: repo, principal: principal} do
+    # Every creator reads the same next_number and races on the private
+    # reference; the losers must re-read and take the next number rather than
+    # reuse one or overwrite the winner's issue.
+    results =
+      1..6
+      |> Task.async_stream(fn n -> Issues.create(repo, "Concurrent #{n}", "", principal) end,
+        max_concurrency: 6,
+        timeout: 60_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.all?(results, &match?({:ok, _}, &1)), inspect(results)
+    numbers = results |> Enum.map(fn {:ok, %{issue: issue}} -> issue.number end) |> Enum.sort()
+    assert numbers == Enum.to_list(1..6)
+
+    assert {:ok, %{issues: issues}} = Issues.list(repo)
+
+    assert issues |> Enum.map(& &1.title) |> Enum.sort() ==
+             Enum.map(1..6, &"Concurrent #{&1}") |> Enum.sort()
+  end
+
+  test "concurrent comments on one issue are all kept", %{repo: repo, principal: principal} do
+    assert {:ok, %{issue: issue}} = Issues.create(repo, "Busy", "", principal)
+
+    results =
+      1..6
+      |> Task.async_stream(fn n -> Issues.add_comment(repo, issue.number, "comment #{n}", principal) end,
+        max_concurrency: 6,
+        timeout: 60_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.all?(results, &match?({:ok, _}, &1)), inspect(results)
+
+    assert {:ok, %{issue: current}} = Issues.get(repo, issue.number)
+    assert current.comment_count == 6
+    assert current.comments |> Enum.map(& &1.body) |> Enum.sort() == Enum.map(1..6, &"comment #{&1}")
+
+    assert {:ok, %{events: events}} = Issues.events(repo, issue.number)
+    assert Enum.count(events, &(&1.type == "comment_added")) == 6
+  end
+
+  test "refuses a comment on a deleted issue without recording one", %{repo: repo, principal: principal} do
+    assert {:ok, %{issue: issue}} = Issues.create(repo, "Doomed", "", principal)
+    assert {:ok, _} = Issues.delete(repo, issue.number, principal)
+
+    assert {:error, %ServiceError{kind: :not_found, message: "issue #1 not found"}} =
+             Issues.add_comment(repo, issue.number, "Too late", principal)
+
+    # The tombstone stays the last thing that happened to the issue.
+    assert {:ok, %{events: events}} = Issues.events(repo, issue.number)
+    assert Enum.map(events, & &1.type) == ["issue_opened", "issue_deleted"]
   end
 end

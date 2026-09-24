@@ -86,7 +86,7 @@ credential binding. For example:
   "model": "coding-model",
   "credential_binding": {
     "backend": "production",
-    "identity_id": "coding-machine-identity",
+    "identity_id": "5b0c2f1e-8d7a-4c3b-9e6f-1a2b3c4d5e6f",
     "secret": {"reference": "/production/coding", "field": "api_key"}
   }
 }
@@ -94,11 +94,42 @@ credential binding. For example:
 
 The binding pins the backend's immutable version with the profile. Secret
 values, bearer tokens, provider endpoints, workload-token audiences, and user
-information in inference endpoints are rejected.
+information in inference endpoints are rejected. Because the endpoint is
+returned to workers in their claim, it must also have no query and no fragment
+(not even an empty `?` or `#`), so a credential cannot ride along as an
+`api_key=` parameter.
+
+The values that locate the credential are restricted to the shapes the managed
+Infisical driver uses, so they cannot hold one:
+
+| Field | Accepted shape |
+|---|---|
+| backend `project` | An Infisical project id (a UUID) or a lowercase slug of up to 64 characters, such as `acme-production` |
+| `identity_id` | An Infisical machine identity id, which is a UUID |
+| `secret.reference` | An absolute secret path of 1 to 16 segments of 1 to 64 characters from `[A-Za-z0-9_.-]`, at most 512 bytes, such as `/production/coding`; `.` and `..` segments are rejected |
+| `secret.field` | Optional; a key name of up to 64 characters from `[A-Za-z0-9_]` starting with a letter or underscore, such as `api_key` |
+
+Every free-form segment is also checked against well-known credential formats
+(for example `sk-`, `ghp_`, `xoxb-`, `AKIA` and `glpat-` prefixes and JSON Web
+Tokens) and against long runs of mixed letters and digits with no separator,
+which is what generated secrets look like. That check guards against pasting a
+secret into the wrong field; the narrow shapes above are the actual boundary.
 
 Code does not resolve this binding. A work claim returns only the profile
 name, version, inference endpoint, and model. It does not return the backend,
 machine identity, or logical secret reference.
+
+#### Who may select a profile
+
+Profiles are created and changed only by an account administrator (see
+[Observation and control](#observation-and-control)). Selecting one is
+broader: **any principal with repository write permission on any repository in
+the account can create a work run whose nodes name any of the account's current
+inference profiles.** Code pins the selected version when the run is created.
+There is currently no per-repository or per-principal allowlist of profiles; an
+account that needs one must keep profiles it does not want every repository
+writer to use in a separate account. This is current behaviour, not a
+recommendation, and a narrower selection policy is not implemented.
 
 ### Trusted runtime delivery
 
@@ -163,10 +194,15 @@ Leases are advisory. Each immutable claim records its expiry time, and an
 authorized reconciler can requeue a running node after that deadline. It never
 deletes the old claim or result. A worker that reports after requeue has its
 immutable result retained as rejected evidence, rather than silently losing it.
+The `attempt_expired` event records the verified principal that requested the
+expiry, whether an operator or an automated reconciler.
 
-If a node fails, the work run becomes failed, and nodes that have not started
-are marked `skipped`. A still-running sibling may report evidence, but cannot
-change the terminal outcome.
+If a node fails, the work run becomes failed. When a run becomes failed or is
+cancelled, no node is left looking as if it could still progress: nodes that
+have not started are marked `skipped`, and a node whose attempt is still out is
+marked `abandoned`. An abandoned node keeps its attempt id, executor, and
+claimant, so the attempt may still report evidence, which is retained as
+rejected and cannot change the terminal outcome.
 
 ## Observation and control
 
@@ -189,7 +225,23 @@ run is retained as immutable rejected evidence and never becomes the node's
 accepted result.
 
 Completion is replay-safe: resubmitting the same attempt result returns its
-original accepted or rejected disposition without adding another event.
+original accepted or rejected disposition, and the stored result record
+(including its original `recorded_at_ms` and `recorded_by`), without adding
+another event.
+
+Claims can be made replay-safe too. A worker may send an idempotency key with a
+claim: `idempotency_key` in the request body or the `Idempotency-Key` header
+over HTTP, or the `idempotency_key` argument of `claim_work_node`. A key is 1 to
+128 characters of `[A-Za-z0-9._:-]`, starting with a letter or digit. Code
+records the key, the attempt it produced, the executor, and the claiming
+principal in `state.json`, in the same conditional write that makes the claim
+canonical. Repeating the claim with the same key, for example after a lost
+response or a timeout, returns that same attempt, marked `"replayed": true`,
+instead of claiming another node, and adds no event. This holds even after the
+run has become terminal. Keys are scoped to one run. Reusing a key from a
+different principal or with a different executor is a `409` conflict. Without
+a key, a retried claim may claim a second node, and the first attempt is then
+recovered only through lease expiry.
 
 The [Model Context Protocol](https://modelcontextprotocol.io/) exposes the same
 contract through `create_work_run`, `list_work_runs`, `get_work_run`,
@@ -204,3 +256,44 @@ Events are revision-cursored immutable records. A client can poll events after
 the most recent `next_cursor`, reconstruct the canonical graph state, and link
 attempt evidence to its corresponding work. Streaming logs, sandbox telemetry,
 and a worker reconciler are not implemented yet.
+
+### Pagination
+
+Listing runs and reading events can be paged. Without paging parameters both
+behave as they always have and return everything.
+
+| Operation | Parameters | Page order |
+|---|---|---|
+| `GET /api/work-runs`, `list_work_runs` | `limit` (1 to 500, default 100 once paging) and `cursor` | Run id |
+| `GET /api/work-runs/{run}/events`, `work_run_events` | `after` and `limit` (1 to 500) | Revision |
+
+A run page returns `next_cursor`, the run id to pass as `cursor` for the next
+page, or `null` on the last one. The page is selected from the listed run ids
+before anything is read, so a page costs `limit` reads however many runs the
+repository has. Run ids are time-ordered, newest first (`q` followed by an
+inverted creation timestamp and a random suffix), so pages run newest first.
+Runs created before ids were time-ordered have random `r` ids and come after
+every newer run, in id order. The unpaged list is still sorted by creation
+time. The listing of run ids itself is still one object-store prefix listing.
+
+An event page reads only the events it returns, because `state.json` lists one
+event id per revision. `next_cursor` is the last revision returned, and
+`has_more` says whether later events exist; without `limit`, `next_cursor` is
+the run's current revision, as before.
+
+## Errors
+
+Failures are typed, and the HTTP status follows the type rather than the
+message wording:
+
+| Status | When |
+|---|---|
+| `422` | The request is malformed: an invalid graph, identifier, cursor, or profile attribute, or a graph that names an unknown inference profile |
+| `404` | The repository, run, node, attempt, profile, or backend does not exist |
+| `409` | The request conflicts with durable state: the run is no longer active, no node is ready, the node is not running or not awaiting approval, the lease has not expired, the attempt no longer owns its node or belongs to another identity, or `previous_version` is stale |
+| `503` | A temporary failure, with `Retry-After`: object storage failed, or a run changed on every one of its bounded compare-and-swap attempts |
+
+A `409` means the caller should re-read the run before deciding what to do. A
+`503` means the same request may succeed later. The Model Context Protocol
+tools return the same classification in `structuredContent`; see
+[mcp.md](mcp.md#errors).
