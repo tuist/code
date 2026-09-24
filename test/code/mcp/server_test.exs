@@ -492,7 +492,7 @@ defmodule Code.MCP.ServerTest do
             "model" => "coding-model",
             "credential_binding" => %{
               "backend" => "production",
-              "identity_id" => "coding-machine-identity",
+              "identity_id" => "5b0c2f1e-8d7a-4c3b-9e6f-1a2b3c4d5e6f",
               "secret" => %{"reference" => "/production/coding", "field" => "api_key"}
             }
           },

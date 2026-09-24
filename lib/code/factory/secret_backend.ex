@@ -11,6 +11,7 @@ defmodule Code.Factory.SecretBackend do
   """
 
   alias Code.Auth.Principal
+  alias Code.Factory.CredentialLocator
   alias Code.Factory.Shared
   alias Code.Factory.VersionedConfig
   alias Code.ServiceError
@@ -92,11 +93,5 @@ defmodule Code.Factory.SecretBackend do
   defp driver("managed_infisical"), do: {:ok, "managed_infisical"}
   defp driver(_), do: {:error, "secret backend driver must be managed_infisical"}
 
-  defp project(value) when is_binary(value) and byte_size(value) in 1..512 do
-    if String.match?(value, ~r/[\x00-\x1F]/),
-      do: {:error, "secret backend project must be a non-empty printable string"},
-      else: {:ok, value}
-  end
-
-  defp project(_), do: {:error, "secret backend project must be a non-empty printable string"}
+  defp project(value), do: CredentialLocator.project(value)
 end

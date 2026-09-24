@@ -237,6 +237,79 @@ defmodule Code.FactoryTest do
     assert {:error, %ServiceError{kind: :not_found}} = InferenceProfile.get(namespace, "coding")
   end
 
+  test "rejects endpoints and credential locators that could carry a secret", %{
+    namespace: namespace,
+    principal: principal
+  } do
+    assert {:ok, _} =
+             SecretBackend.put(
+               namespace,
+               "production",
+               %{"driver" => "managed_infisical", "project" => "acme-production"},
+               principal
+             )
+
+    # A worker receives the endpoint in its claim, so a query or fragment
+    # (where an api_key parameter would hide) is refused, even an empty one.
+    for endpoint <- [
+          "https://inference.example.com/v1?api_key=sk-live",
+          "https://inference.example.com/v1#sk-live",
+          "https://inference.example.com/v1?",
+          "https://user:pass@inference.example.com/v1"
+        ] do
+      assert {:error, %ServiceError{kind: :invalid, message: message}} =
+               InferenceProfile.put(
+                 namespace,
+                 "coding",
+                 Map.put(profile_attrs(), "endpoint", endpoint),
+                 principal
+               )
+
+      assert message =~ "without user information, query, or fragment"
+    end
+
+    unsafe_bindings = [
+      put_in(profile_attrs(), ["credential_binding", "identity_id"], "coding-machine-identity"),
+      put_in(profile_attrs(), ["credential_binding", "secret", "reference"], "production/coding"),
+      put_in(profile_attrs(), ["credential_binding", "secret", "reference"], "/production/../coding"),
+      put_in(profile_attrs(), ["credential_binding", "secret", "reference"], "/production/sk-proj-abcdef"),
+      put_in(
+        profile_attrs(),
+        ["credential_binding", "secret", "reference"],
+        "/production/Q9x7Lm2Pz8Rt4Vw6Yb1Nc3Kd"
+      ),
+      put_in(profile_attrs(), ["credential_binding", "secret", "field"], "ghp_0123456789abcdef"),
+      put_in(profile_attrs(), ["credential_binding", "secret", "field"], "api key")
+    ]
+
+    for attrs <- unsafe_bindings do
+      assert {:error, %ServiceError{kind: :invalid}} =
+               InferenceProfile.put(namespace, "coding", attrs, principal),
+             inspect(attrs["credential_binding"])
+    end
+
+    for project <- ["AcmeProduction", "xoxb-123-456", "acme production", String.duplicate("a", 65)] do
+      assert {:error, %ServiceError{kind: :invalid}} =
+               SecretBackend.put(
+                 namespace,
+                 "other",
+                 %{"driver" => "managed_infisical", "project" => project},
+                 principal
+               ),
+             project
+    end
+
+    assert {:ok, _} =
+             SecretBackend.put(
+               namespace,
+               "by-id",
+               %{"driver" => "managed_infisical", "project" => "0f9e8d7c-6b5a-4938-8271-6a5b4c3d2e1f"},
+               principal
+             )
+
+    assert {:error, %ServiceError{kind: :not_found}} = InferenceProfile.get(namespace, "coding")
+  end
+
   test "emits bounded telemetry for durable graph operations", %{repo: repo, principal: principal} do
     handler = {__MODULE__, :factory_operation, self()}
 
@@ -499,7 +572,7 @@ defmodule Code.FactoryTest do
       "model" => "coding-model",
       "credential_binding" => %{
         "backend" => "production",
-        "identity_id" => "coding-machine-identity",
+        "identity_id" => "5b0c2f1e-8d7a-4c3b-9e6f-1a2b3c4d5e6f",
         "secret" => %{"reference" => "/production/coding", "field" => "api_key"}
       }
     }

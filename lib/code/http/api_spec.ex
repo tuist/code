@@ -570,7 +570,11 @@ defmodule Code.HTTP.ApiSpec do
         account: %Schema{type: :string},
         name: %Schema{type: :string},
         version: %Schema{type: :string},
-        endpoint: %Schema{type: :string, format: :uri},
+        endpoint: %Schema{
+          type: :string,
+          format: :uri,
+          description: "HTTPS inference endpoint with no user information, query, or fragment."
+        },
         model: %Schema{type: :string},
         credential_binding: credential_binding_schema(),
         created_at_ms: %Schema{type: :integer},
@@ -596,7 +600,11 @@ defmodule Code.HTTP.ApiSpec do
       type: :object,
       required: [:endpoint, :model, :credential_binding],
       properties: %{
-        endpoint: %Schema{type: :string, format: :uri},
+        endpoint: %Schema{
+          type: :string,
+          format: :uri,
+          description: "HTTPS inference endpoint with no user information, query, or fragment."
+        },
         model: %Schema{type: :string},
         credential_binding: credential_binding_schema(),
         previous_version: %Schema{type: :string}
@@ -608,7 +616,27 @@ defmodule Code.HTTP.ApiSpec do
     %Schema{
       type: :object,
       description:
-        "Non-secret reference to an account secret backend, its machine identity, and a logical secret locator. It never includes a provider endpoint, workload-token audience, token, or secret value."
+        "Non-secret reference to an account secret backend, its machine identity, and a logical secret locator. It never includes a provider endpoint, workload-token audience, token, or secret value.",
+      required: [:backend, :identity_id, :secret],
+      additionalProperties: false,
+      properties: %{
+        backend: %Schema{type: :string, description: "Account secret backend name."},
+        identity_id: %Schema{type: :string, format: :uuid, description: "Infisical machine identity id."},
+        secret: %Schema{
+          type: :object,
+          required: [:reference],
+          additionalProperties: false,
+          properties: %{
+            reference: %Schema{
+              type: :string,
+              maxLength: 512,
+              pattern: "^(/[A-Za-z0-9_.-]{1,64}){1,16}$",
+              description: "Absolute secret path, such as /production/coding."
+            },
+            field: %Schema{type: :string, pattern: "^[A-Za-z_][A-Za-z0-9_]{0,63}$", description: "Key name."}
+          }
+        }
+      }
     }
   end
 
@@ -646,7 +674,10 @@ defmodule Code.HTTP.ApiSpec do
       required: [:driver, :project],
       properties: %{
         driver: %Schema{type: :string, enum: ["managed_infisical"]},
-        project: %Schema{type: :string},
+        project: %Schema{
+          type: :string,
+          description: "Infisical project id (a UUID) or lowercase project slug of up to 64 characters."
+        },
         previous_version: %Schema{type: :string}
       }
     }

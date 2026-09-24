@@ -86,7 +86,7 @@ credential binding. For example:
   "model": "coding-model",
   "credential_binding": {
     "backend": "production",
-    "identity_id": "coding-machine-identity",
+    "identity_id": "5b0c2f1e-8d7a-4c3b-9e6f-1a2b3c4d5e6f",
     "secret": {"reference": "/production/coding", "field": "api_key"}
   }
 }
@@ -94,11 +94,42 @@ credential binding. For example:
 
 The binding pins the backend's immutable version with the profile. Secret
 values, bearer tokens, provider endpoints, workload-token audiences, and user
-information in inference endpoints are rejected.
+information in inference endpoints are rejected. Because the endpoint is
+returned to workers in their claim, it must also have no query and no fragment
+(not even an empty `?` or `#`), so a credential cannot ride along as an
+`api_key=` parameter.
+
+The values that locate the credential are restricted to the shapes the managed
+Infisical driver uses, so they cannot hold one:
+
+| Field | Accepted shape |
+|---|---|
+| backend `project` | An Infisical project id (a UUID) or a lowercase slug of up to 64 characters, such as `acme-production` |
+| `identity_id` | An Infisical machine identity id, which is a UUID |
+| `secret.reference` | An absolute secret path of 1 to 16 segments of 1 to 64 characters from `[A-Za-z0-9_.-]`, at most 512 bytes, such as `/production/coding`; `.` and `..` segments are rejected |
+| `secret.field` | Optional; a key name of up to 64 characters from `[A-Za-z0-9_]` starting with a letter or underscore, such as `api_key` |
+
+Every free-form segment is also checked against well-known credential formats
+(for example `sk-`, `ghp_`, `xoxb-`, `AKIA` and `glpat-` prefixes and JSON Web
+Tokens) and against long runs of mixed letters and digits with no separator,
+which is what generated secrets look like. That check guards against pasting a
+secret into the wrong field; the narrow shapes above are the actual boundary.
 
 Code does not resolve this binding. A work claim returns only the profile
 name, version, inference endpoint, and model. It does not return the backend,
 machine identity, or logical secret reference.
+
+#### Who may select a profile
+
+Profiles are created and changed only by an account administrator (see
+[Observation and control](#observation-and-control)). Selecting one is
+broader: **any principal with repository write permission on any repository in
+the account can create a work run whose nodes name any of the account's current
+inference profiles.** Code pins the selected version when the run is created.
+There is currently no per-repository or per-principal allowlist of profiles; an
+account that needs one must keep profiles it does not want every repository
+writer to use in a separate account. This is current behaviour, not a
+recommendation, and a narrower selection policy is not implemented.
 
 ### Trusted runtime delivery
 

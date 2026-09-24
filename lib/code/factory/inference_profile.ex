@@ -11,6 +11,7 @@ defmodule Code.Factory.InferenceProfile do
   """
 
   alias Code.Auth.Principal
+  alias Code.Factory.CredentialLocator
   alias Code.Factory.SecretBackend
   alias Code.Factory.Shared
   alias Code.Factory.VersionedConfig
@@ -111,7 +112,7 @@ defmodule Code.Factory.InferenceProfile do
        when map_size(binding) == 3 do
     with :ok <- backend_name(backend_name),
          {:ok, backend} <- SecretBackend.get(account, backend_name),
-         :ok <- reference(identity_id),
+         :ok <- CredentialLocator.identity_id(identity_id),
          {:ok, secret} <- secret(secret) do
       {:ok,
        %{
@@ -128,15 +129,15 @@ defmodule Code.Factory.InferenceProfile do
   defp credential_binding(_account, _binding), do: {:error, "credential_binding has an unsupported shape"}
 
   defp backend_name(value) do
-    if Shared.valid_identifier?(value), do: :ok, else: {:error, "inference profile name is invalid"}
+    if Shared.valid_identifier?(value), do: :ok, else: {:error, "credential_binding backend name is invalid"}
   end
 
   defp secret(%{"reference" => reference} = secret) do
     field = secret["field"]
 
     with true <- Enum.all?(Map.keys(secret), &(&1 in ["reference", "field"])),
-         :ok <- reference(reference),
-         :ok <- optional_reference(field) do
+         :ok <- CredentialLocator.secret_reference(reference),
+         :ok <- CredentialLocator.secret_field(field) do
       {:ok, Shared.maybe_put(%{"reference" => reference}, "field", field)}
     else
       false -> {:error, "credential_binding secret has an unsupported shape"}
@@ -146,25 +147,26 @@ defmodule Code.Factory.InferenceProfile do
 
   defp secret(_), do: {:error, "credential_binding secret has an unsupported shape"}
 
+  # The endpoint is delivered to workers in their claim, so it must not be
+  # able to carry a credential: no user information, and no query or fragment
+  # where an `api_key=` parameter could hide. An empty `?` or `#` is rejected
+  # too, since URI parsing reports it as an empty, not absent, component.
   defp endpoint(value) when is_binary(value) and byte_size(value) <= 2_048 do
     case URI.parse(value) do
-      %URI{scheme: "https", host: host, userinfo: nil} when is_binary(host) and host != "" -> {:ok, value}
-      _ -> {:error, "endpoint must be an HTTPS URL without user information"}
+      %URI{scheme: "https", host: host, userinfo: nil, query: nil, fragment: nil}
+      when is_binary(host) and host != "" ->
+        {:ok, value}
+
+      _ ->
+        endpoint_error()
     end
   end
 
-  defp endpoint(_), do: {:error, "endpoint must be an HTTPS URL without user information"}
+  defp endpoint(_), do: endpoint_error()
+
+  defp endpoint_error,
+    do: {:error, "endpoint must be an HTTPS URL without user information, query, or fragment"}
 
   defp model(value) when is_binary(value) and byte_size(value) in 1..256, do: {:ok, value}
   defp model(_), do: {:error, "model must be a non-empty string up to 256 bytes"}
-
-  defp reference(value) when is_binary(value) and byte_size(value) in 1..512 do
-    if String.match?(value, ~r/[\x00-\x1F]/),
-      do: {:error, "credential reference must be a non-empty printable string"},
-      else: :ok
-  end
-
-  defp reference(_), do: {:error, "credential reference must be a non-empty printable string"}
-  defp optional_reference(nil), do: :ok
-  defp optional_reference(value), do: reference(value)
 end
