@@ -17,6 +17,9 @@ config :logger, :console,
     :duration_us,
     :packs,
     :bytes,
+    :account,
+    :age_ms,
+    :auth_backend,
     :otel_trace_id,
     :otel_span_id
   ]
