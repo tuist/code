@@ -138,6 +138,7 @@ defmodule Code.Wal.V1.Base do
   field(:symrefs, 3, repeated: true, type: Code.Wal.V1.Base.SymrefsEntry, map: true)
   field(:seq, 4, type: :uint64)
   field(:at_ms, 5, type: :int64, json_name: "atMs")
+  field(:history_key, 6, type: :string, json_name: "historyKey")
 end
 
 defmodule Code.Wal.V1.Index.RefsEntry do
@@ -172,4 +173,6 @@ defmodule Code.Wal.V1.Index do
   field(:updated_by, 9, type: :string, json_name: "updatedBy")
   field(:default_branch, 10, type: :string, json_name: "defaultBranch")
   field(:refs, 11, repeated: true, type: Code.Wal.V1.Index.RefsEntry, map: true)
+  field(:incarnation, 12, type: :string)
+  field(:deleted_at_ms, 13, type: :int64, json_name: "deletedAtMs")
 end
