@@ -29,9 +29,6 @@ defmodule Code.Config do
   @spec node_id() :: String.t()
   def node_id, do: get(:node_id, "code-1")
 
-  @spec advertise_host() :: String.t()
-  def advertise_host, do: get(:advertise_host, "127.0.0.1")
-
   @doc """
   Directory holding materialized bare repositories.
 
@@ -66,15 +63,8 @@ defmodule Code.Config do
   @spec admin_port() :: :inet.port_number()
   def admin_port, do: get(:admin_port, 4002)
 
-  @spec gossip_port() :: :inet.port_number()
-  def gossip_port, do: get(:gossip_port, 4010)
-
   @spec admin_token() :: String.t() | nil
   def admin_token, do: get(:admin_token, nil)
-
-  @doc "Statically configured peers, as `host:gossip_port` strings."
-  @spec peers() :: [String.t()]
-  def peers, do: get(:peers, [])
 
   @spec default_replicas() :: pos_integer()
   def default_replicas, do: get(:default_replicas, 3)

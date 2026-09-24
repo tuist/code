@@ -13,7 +13,6 @@ config :code,
   data_dir: {:system_tmp, "code-test-repositories"},
   object_store: {Code.ObjectStore.Filesystem, root: {:system_tmp, "code-test-object-store"}},
   auth: {Code.Auth.Static, tokens: %{"test-token" => %{account: "test", scopes: [:read, :write, :execute]}}},
-  node_id: "test-1",
-  peers: []
+  node_id: "test-1"
 
 config :code, Code.PromEx, disabled: true

@@ -104,16 +104,13 @@ if config_env() == :prod or System.get_env("CODE_S3_BUCKET") do
 
   config :code,
     node_id: get.("CODE_NODE_ID", nil) || :inet.gethostname() |> elem(1) |> to_string(),
-    advertise_host: get.("CODE_ADVERTISE_HOST", "127.0.0.1"),
     data_dir: get.("CODE_DATA_DIR", "/var/lib/code/repositories"),
     object_store: object_store,
     auth: auth,
     git_port: port.("CODE_GIT_PORT", "4000"),
     hook_port: port.("CODE_HOOK_PORT", "4001"),
     admin_port: port.("CODE_ADMIN_PORT", "4002"),
-    gossip_port: port.("CODE_GOSSIP_PORT", "4010"),
     admin_token: require_env.("CODE_ADMIN_TOKEN"),
-    peers: get.("CODE_PEERS", "") |> String.split(",", trim: true),
     default_replicas: String.to_integer(get.("CODE_DEFAULT_REPLICAS", "3")),
     # How long a replica may serve a read without re-verifying the WAL index
     # against the object store. 0 means "verify every read", which is the
