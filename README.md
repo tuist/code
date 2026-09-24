@@ -32,10 +32,10 @@ cache; the object store is the durable repository.
 [![Deploy to DigitalOcean](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/tuist/code/tree/main)
 [![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://www.heroku.com/deploy?template=https://github.com/tuist/code/tree/main)
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Ftuist%2Fcode%2Fmain%2Finfra%2Fazuredeploy.json)
-[![Deploy to Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ftuist%2Fcode&project-name=code&env=CODE_S3_BUCKET%2CCODE_S3_ENDPOINT%2CCODE_S3_ACCESS_KEY_ID%2CCODE_S3_SECRET_ACCESS_KEY%2CCODE_AUTH_TOKENS%2CCODE_ADMIN_TOKEN&envLink=https%3A%2F%2Fcode.dev%2Fhosting%2F)
+[![Deploy to Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ftuist%2Fcode&project-name=code&env=CODE_S3_BUCKET%2CCODE_S3_ENDPOINT%2CCODE_S3_ACCESS_KEY_ID%2CCODE_S3_SECRET_ACCESS_KEY%2CCODE_AUTH_TOKENS%2CCODE_ADMIN_TOKEN&envLink=https%3A%2F%2Fgithub.com%2Ftuist%2Fcode%2Fblob%2Fmain%2Fcontent%2Fhosting.md)
 
 Both forms request `CODE_AUTH_TOKENS` in the format
-`token=account:read,write`. See the [hosting guide](https://code.dev/hosting/)
+`token=account:read,write`. See the [hosting guide](content/hosting.md)
 for object-store requirements and production options. Vercel is intended for
 small evaluations; use Render, DigitalOcean, Heroku, Azure, or Kubernetes for
 long-lived Git traffic. Railway needs a published template identifier before a

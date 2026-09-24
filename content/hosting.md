@@ -33,7 +33,7 @@ keeps the repositories.
   <a href="https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Ftuist%2Fcode%2Fmain%2Finfra%2Fazuredeploy.json" aria-label="Deploy Code on Azure">
     <img src="https://aka.ms/deploytoazurebutton" alt="Deploy to Azure">
   </a>
-  <a href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ftuist%2Fcode&amp;project-name=code&amp;env=CODE_S3_BUCKET%2CCODE_S3_ENDPOINT%2CCODE_S3_ACCESS_KEY_ID%2CCODE_S3_SECRET_ACCESS_KEY%2CCODE_AUTH_TOKENS%2CCODE_ADMIN_TOKEN&amp;envLink=https%3A%2F%2Fcode.dev%2Fhosting%2F" aria-label="Deploy Code on Vercel">
+  <a href="https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Ftuist%2Fcode&amp;project-name=code&amp;env=CODE_S3_BUCKET%2CCODE_S3_ENDPOINT%2CCODE_S3_ACCESS_KEY_ID%2CCODE_S3_SECRET_ACCESS_KEY%2CCODE_AUTH_TOKENS%2CCODE_ADMIN_TOKEN&amp;envLink=https%3A%2F%2Fgithub.com%2Ftuist%2Fcode%2Fblob%2Fmain%2Fcontent%2Fhosting.md" aria-label="Deploy Code on Vercel">
     <img src="https://vercel.com/button" alt="Deploy to Vercel">
   </a>
 </div>

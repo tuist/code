@@ -2,7 +2,7 @@
   "name": "Code",
   "description": "Git hosting whose durable state lives in object storage.",
   "repository": "https://github.com/tuist/code",
-  "website": "https://code.pages.dev",
+  "website": "https://github.com/tuist/code",
   "stack": "container",
   "env": {
     "CODE_S3_BUCKET": {
