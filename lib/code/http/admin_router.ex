@@ -72,9 +72,10 @@ defmodule Code.HTTP.AdminRouter do
   post "/repositories" do
     params = conn.body_params
 
-    case Control.create_repository(params["repository"] || "", replicas: params["replicas"] || 3) do
+    case Control.create_repository(params["repository"] || "", replicas: replicas_param(params)) do
       {:ok, summary} -> send_json(conn, 201, summary)
       {:error, :already_exists} -> send_json(conn, 409, %{error: "already exists"})
+      {:error, :invalid_replica_count} -> send_json(conn, 422, %{error: invalid_replicas_message()})
       {:error, reason} -> send_json(conn, 422, %{error: inspect(reason)})
     end
   end
@@ -153,11 +154,35 @@ defmodule Code.HTTP.AdminRouter do
   put "/replicas/*repo" do
     repo_id = Enum.join(conn.path_params["repo"], "/")
 
-    case Control.set_replica_count(repo_id, conn.body_params["replicas"] || 3) do
-      {:ok, result} -> send_json(conn, 200, result)
-      {:error, reason} -> send_json(conn, 422, %{error: inspect(reason)})
+    case Control.set_replica_count(repo_id, replicas_param(conn.body_params)) do
+      {:ok, result} ->
+        send_json(conn, 200, result)
+
+      {:error, :invalid_replica_count} ->
+        send_json(conn, 422, %{error: invalid_replicas_message()})
+
+      {:error, :not_found} ->
+        send_json(conn, 404, %{error: "not found"})
+
+      {:error, :cas_exhausted} ->
+        send_json(conn, 503, %{error: "repository index is under contention; retry"})
+
+      {:error, reason} ->
+        send_json(conn, 422, %{error: inspect(reason)})
     end
   end
+
+  # An absent or null count keeps the historical default of three; anything
+  # else is handed to Control, which validates it before touching the log.
+  defp replicas_param(params) do
+    case params["replicas"] do
+      nil -> 3
+      count -> count
+    end
+  end
+
+  defp invalid_replicas_message,
+    do: "replicas must be an integer between 1 and #{Control.max_replicas()}"
 
   # ----------------------------------------------------------------------
   # Authorization policy
