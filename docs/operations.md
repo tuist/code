@@ -32,7 +32,7 @@ exist, and Code will not be safe.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CODE_MAX_PORTS` | `65536` | Ceiling on concurrent Git streams and connections. Raising it costs memory: the BEAM pre-allocates the whole table, and a container's default file-descriptor limit would otherwise make that 1.5 GB |
+| `CODE_MAX_PORTS` | `65536` | Ceiling on concurrent Git streams and connections. Raising it costs memory: the BEAM pre-allocates the whole table, and a container's default file-descriptor limit would otherwise make that 1.5 GB. The release script turns it into `ERL_MAX_PORTS`, and it takes precedence over an `ERL_MAX_PORTS` already in the environment |
 | `CODE_DEFAULT_REPLICAS` | `3` | Per-repository, overridable |
 | `CODE_STALENESS_BUDGET_MS` | `0` | See below |
 | `CODE_COMPACTION_ENTRY_THRESHOLD` | `250` | |
@@ -80,8 +80,10 @@ are intentionally unavailable until their public contracts are implemented.
 | Variable | Default | Notes |
 |---|---|---|
 | `CODE_CLUSTER_STRATEGY` | `none` | `kubernetes`, `dns`, `epmd` |
-| `CODE_HEADLESS_SERVICE` | `code-headless` | For the Kubernetes strategy |
-| `CODE_NAMESPACE` | `default` | |
+| `CODE_HEADLESS_SERVICE` | `code-headless` | For the Kubernetes strategy: the headless Service whose DNS records list the pods |
+| `CODE_DNS_QUERY` | | **Required for the `dns` strategy.** The DNS name whose A records list the nodes, for example a Docker Compose service name |
+| `CODE_PEERS` | | For the `epmd` strategy: comma-separated Erlang node names, such as `code@10.0.0.1,code@10.0.0.2` |
+| `CODE_RELEASE_NAME` | `code` | The Erlang node basename used by the `kubernetes` and `dns` strategies |
 | `RELEASE_COOKIE` | | **Required for clustering.** Distributed Erlang's shared secret |
 
 A single node works with no clustering at all. Clustering buys read scaling and
@@ -96,7 +98,9 @@ See [kubernetes.md](kubernetes.md) for the full picture.
 | `CODE_AUTH_BACKEND` | `webhook` (default), `oidc`, `static`, `none` |
 | `CODE_OIDC_ISSUER` | Token issuer, used to discover the JWKS |
 | `CODE_OIDC_AUDIENCE` | **Set this.** Binds tokens to this deployment |
-| `CODE_AUTH_ENDPOINT` | For the webhook backend |
+| `CODE_AUTH_ENDPOINT` | For the webhook backend: where credentials are sent to be checked |
+| `CODE_AUTH_TOKEN` | **Required for the webhook backend.** Bearer token Code presents to `CODE_AUTH_ENDPOINT`, so the endpoint can tell Code's requests from anyone else's |
+| `CODE_AUTH_CACHE_TTL_MS` | For the webhook backend: how long an answer is cached; defaults to `30000` |
 
 ### Browser login for Git
 
@@ -306,10 +310,20 @@ curl :4002/repositories                      # every repository in the store
 curl :4002/repositories/acme/app             # log state, placement, replica health
 curl :4002/placement/acme/app                # where it should live, computed
 curl -XPOST :4002/repositories -d '{"repository":"acme/app"}'
-curl -XPOST :4002/compact/acme/app           # forwarded to the primary
+curl -XPOST :4002/compact/acme/app           # run on the preferred maintenance node
 curl -XPOST :4002/evict/acme/app             # drop the local cache
 curl -XPUT  :4002/replicas/acme/app -d '{"replicas":30}'
 ```
+
+`POST /compact/<id>` can be sent to any node. It is forwarded to the node that
+rendezvous hashing prefers among those with the `maintain` role, which is not
+necessarily one of the repository's serving replicas. If that node cannot be
+reached, a local node with the `maintain` role runs the job instead; the
+conditional write that publishes a compaction keeps a duplicate harmless.
+
+`GET /repositories` walks the bucket one prefix level at a time rather than
+listing every object, so its cost grows with the number of repositories and
+accounts, not with their history. It is not paginated.
 
 `GET /repositories/<id>` is the one to reach for first when something is wrong.
 It reports the log's position, each replica's position, and the ages of its

@@ -36,7 +36,8 @@ independently. A version this server does not implement comes back as
 ```json
 {"jsonrpc":"2.0","id":1,"error":{"code":-32022,
  "message":"Unsupported protocol version",
- "data":{"supported":["2026-07-28","2025-11-25"],"requested":"1900-01-01"}}}
+ "data":{"supported":["2026-07-28","2025-11-25","2025-06-18","2025-03-26","2024-11-05"],
+         "requested":"1900-01-01"}}}
 ```
 
 so a client can retry with something mutually supported rather than guess.
@@ -53,7 +54,9 @@ round-robin Service is enough, with no affinity rules and no sidecar router.
 
 ### Older clients still work
 
-Revisions up to `2025-11-25` open with `initialize`, and that path is kept.
+Revisions up to `2025-11-25` open with `initialize`, and that path is kept for
+the four the server lists: `2025-11-25`, `2025-06-18`, `2025-03-26` and
+`2024-11-05`.
 Legacy clients have no fall-forward mechanism, so dropping it would simply
 break them. Since this server holds no session state either way, the two eras
 differ only in how a version gets declared.
@@ -83,7 +86,7 @@ cause a hundred materializations.
 | `search` | `git grep` server-side, at a revision |
 | `log` | Commit history, optionally for one path |
 | `diff` | Unified diff between two revisions |
-| `history` | The write-ahead log itself: who pushed what, when |
+| `history` | The write-ahead log itself: each entry's sequence number, type, time, size and pack count. It does not say who made an entry |
 | `clone_url` | For when the agent genuinely does want a working tree |
 
 Everything takes an optional `ref` and defaults to the repository's default

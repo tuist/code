@@ -118,7 +118,9 @@ it is a gap: nothing stops a tenant whose grants are broad from claiming a name
 that should belong to someone else, and nothing records who claimed it.
 
 **Credential isolation: yes.** Tokens are audience-bound to this deployment and
-verified against the issuer configured for the account.
+verified against the single issuer configured for the deployment. Per-account
+issuers are **not implemented**; see [one issuer per
+deployment](#one-issuer-per-deployment-today).
 
 **Durability isolation: yes.** One tenant cannot affect another's data;
 everything authoritative is in object storage under a distinct prefix.
