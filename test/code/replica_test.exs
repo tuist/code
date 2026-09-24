@@ -10,8 +10,10 @@ defmodule Code.ReplicaTest do
   alias Code.Git
   alias Code.Ingest
   alias Code.Replica
+  alias Code.Replica.Lease
   alias Code.WAL
   alias Code.WAL.Entry
+  alias Code.WAL.Index
 
   setup %{repo: repo} do
     start_replica_runtime()
@@ -58,7 +60,7 @@ defmodule Code.ReplicaTest do
 
   defp current_ref(repo) do
     {:ok, index, _} = WAL.fetch(repo)
-    Code.WAL.Index.ref(index, "refs/heads/main")
+    Index.ref(index, "refs/heads/main")
   end
 
   describe "materialization" do
@@ -264,6 +266,164 @@ defmodule Code.ReplicaTest do
     end
   end
 
+  describe "the local cache" do
+    test "a repository's cache is never inside another's", %{repo: repo, source: source} do
+      # Ids nest; directories must not. Evicting the parent used to delete
+      # the child's files from under its live replica.
+      child = repo <> "/tools"
+      {:ok, _} = Control.create_repository(child)
+      %{oid: oid} = push_commit(child, source, "child")
+      {:ok, child_view} = Replica.ensure_fresh(child)
+      {:ok, parent_view} = Replica.ensure_fresh(repo)
+
+      refute String.starts_with?(child_view.path, parent_view.path <> "/")
+      assert Path.dirname(child_view.path) == Path.dirname(parent_view.path)
+
+      assert :ok = Replica.evict(repo)
+      assert File.dir?(child_view.path)
+      assert {:ok, %{"refs/heads/main" => ^oid}} = Git.refs(child_view.path)
+    end
+
+    test "a cache removed behind the replica's back is rebuilt, not served", %{repo: repo, source: source} do
+      %{oid: oid} = push_commit(repo, source, "one")
+      {:ok, view} = Replica.ensure_fresh(repo)
+
+      # The log has not moved, so the next read is a 304. That says the
+      # replica's idea of the log is current, not that its disk still is.
+      File.rm_rf!(view.path)
+
+      assert {:ok, view} = Replica.ensure_fresh(repo)
+      assert {:ok, %{"refs/heads/main" => ^oid}} = Git.refs(view.path)
+    end
+
+    test "a pack left without an index by an interrupted install is installed again", %{
+      repo: repo,
+      source: source
+    } do
+      %{oid: oid} = push_commit(repo, source, "one")
+      Replica.evict(repo)
+      {:ok, view} = Replica.ensure_fresh(repo)
+      stop_without_evicting(repo)
+
+      # What a crash midway through the old copy-then-index install left: a
+      # truncated pack under its final name, and no index beside it.
+      [pack] = Git.packs(view.path)
+      File.rm!(Path.rootname(pack) <> ".idx")
+      overwrite(pack, binary_part(File.read!(pack), 0, 20))
+
+      assert {:ok, view} = Replica.ensure_fresh(repo)
+      assert {:ok, %{"refs/heads/main" => ^oid}} = Git.refs(view.path)
+      assert {:ok, [_ | _]} = Git.log(view.path, "refs/heads/main")
+      assert {:ok, _} = Git.run(view.path, ["fsck", "--connectivity-only"])
+    end
+
+    test "a pack the log does not require is pruned without an epoch change", %{repo: repo, source: source} do
+      %{oid: first} = push_commit(repo, source, "one")
+      {:ok, view} = Replica.ensure_fresh(repo)
+
+      # A pack from a write the log never accepted, or a compaction here that
+      # lost its compare-and-swap. No index names it.
+      stale = stale_pack(view.path, first)
+      assert stale in Git.packs(view.path)
+
+      advance_log(repo, "refs/heads/side", first)
+      {:ok, index, _} = WAL.fetch(repo)
+      {:ok, view} = Replica.ensure_fresh(repo)
+      assert view.epoch == index.epoch
+
+      refute stale in Git.packs(view.path)
+
+      assert Enum.sort(Enum.map(Git.packs(view.path), &Path.basename/1)) ==
+               Enum.sort(Enum.map(Index.required_packs(index), &Path.basename(&1.key)))
+    end
+
+    test "pruning waits while the repository is in use", %{repo: repo, source: source} do
+      %{oid: first} = push_commit(repo, source, "one")
+      {:ok, view} = Replica.ensure_fresh(repo)
+      stale = stale_pack(view.path, first)
+
+      Lease.hold(view.path, fn ->
+        advance_log(repo, "refs/heads/side", first)
+        {:ok, _} = Replica.ensure_fresh(repo)
+        assert stale in Git.packs(view.path), "a pack must not be pruned from under work in flight"
+      end)
+
+      advance_log(repo, "refs/heads/other", first)
+      {:ok, _} = Replica.ensure_fresh(repo)
+      refute stale in Git.packs(view.path)
+    end
+  end
+
+  # A change to the log made elsewhere, touching nothing on this node's disk.
+  defp advance_log(repo, ref, oid) do
+    {:ok, _} =
+      WAL.append(repo, fn index ->
+        {:ok,
+         Entry.new(
+           type: :ENTRY_TYPE_PUSH,
+           commands: [Entry.command(ref, Index.ref(index, ref), oid)]
+         )}
+      end)
+  end
+
+  describe "eviction of a repository in use" do
+    test "is deferred while a Git process is streaming from it", %{repo: repo, source: source} do
+      push_commit(repo, source, "one")
+      {:ok, view} = Replica.ensure_fresh(repo)
+
+      # An upload-pack waiting for its request, as a clone in progress would
+      # be. The stream holds a lease for as long as its port is open.
+      port = Git.stream(view.path, ["upload-pack", "--stateless-rpc", view.path])
+
+      assert {:error, :in_use} = Replica.evict(repo, :if_unused)
+      assert File.dir?(view.path)
+
+      Git.terminate(port)
+      assert eventually(fn -> Replica.evict(repo, :if_unused) == :ok end)
+      refute File.dir?(view.path)
+    end
+
+    test "an explicit eviction is not deferred", %{repo: repo} do
+      {:ok, view} = Replica.ensure_fresh(repo)
+      Lease.hold(view.path, fn -> assert :ok = Replica.evict(repo) end)
+      refute File.dir?(view.path)
+    end
+  end
+
+  # Git writes packs read-only.
+  defp overwrite(path, bytes) do
+    File.chmod!(path, 0o644)
+    File.write!(path, bytes)
+  end
+
+  defp stop_without_evicting(repo) do
+    [{pid, _}] = Registry.lookup(Replica.registry(), repo)
+    ref = Process.monitor(pid)
+    GenServer.stop(pid, :normal)
+    assert_receive {:DOWN, ^ref, :process, _, _}
+    assert eventually(fn -> Registry.lookup(Replica.registry(), repo) == [] end)
+  end
+
+  defp stale_pack(repo_path, parent) do
+    dir = Path.join(System.tmp_dir!(), "code-stale-#{:erlang.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf(dir) end)
+    unique = "stale #{:erlang.unique_integer([:positive])}\n"
+    {:ok, blob} = Git.write_blob(repo_path, unique)
+    {:ok, tree} = Git.write_tree(repo_path, parent, [%{path: "stale.txt", oid: blob, mode: "100644"}])
+    {:ok, commit} = Git.commit_tree(repo_path, tree, [parent], unique, %{name: "T", email: "t@e"})
+    {:ok, pack} = Git.pack_objects(repo_path, [commit], [parent], dir)
+    {:ok, installed} = Git.install_pack(repo_path, pack)
+    installed
+  end
+
+  defp eventually(fun, attempts \\ 100) do
+    cond do
+      fun.() -> true
+      attempts == 0 -> false
+      true -> Process.sleep(20) && eventually(fun, attempts - 1)
+    end
+  end
+
   test "resident/0 lists repositories held on this node", %{repo: repo} do
     {:ok, _} = Replica.ensure_fresh(repo)
     assert repo in Replica.resident()
@@ -290,12 +450,24 @@ defmodule Code.ReplicaTest do
       {:ok, tree} = Git.write_tree(view.path, first, [%{path: "next.txt", oid: blob, mode: "100644"}])
       {:ok, commit} = Git.commit_tree(view.path, tree, [first], "next\n", %{name: "T", email: "t@e"})
 
+      # What receive-pack hands the hook: the new objects in a pack, in a
+      # quarantine directory outside the repository's object store.
+      quarantine = quarantine_with(view.path, [commit], [first])
+
       command = %V1.RefCommand{ref: "refs/heads/main", old_oid: first, new_oid: commit}
-      assert {:ok, result} = Ingest.commit(repo, commands: [command])
+      assert {:ok, result} = Ingest.commit(repo, commands: [command], quarantine: quarantine)
       assert result.seq > 0
 
       {:ok, index, _} = WAL.fetch(repo)
-      assert Code.WAL.Index.ref(index, "refs/heads/main") == commit
+      assert Index.ref(index, "refs/heads/main") == commit
     end
+  end
+
+  defp quarantine_with(repo_path, include, exclude) do
+    quarantine = Path.join(System.tmp_dir!(), "code-quarantine-#{:erlang.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf(quarantine) end)
+    {:ok, pack} = Git.pack_objects(repo_path, include, exclude, Path.join(quarantine, "pack"))
+    assert pack
+    quarantine
   end
 end
