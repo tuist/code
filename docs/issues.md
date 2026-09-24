@@ -24,7 +24,8 @@ header.
 
 Issue and comment deletion writes a tombstone. The item no longer appears in
 current views, while the immutable history remains available to authorized
-readers.
+readers. A deleted issue accepts no further comments or changes; they are
+reported as not found.
 
 The reference is hidden from Git advertisement and fetch, cannot be updated by
 Git push, and is rejected by ordinary agent source-code tools. It is reserved
@@ -76,7 +77,7 @@ interpreting the wording of its message:
 | Kind | Meaning | HTTP |
 |---|---|---|
 | invalid | The request is malformed, for example an empty title | `422` |
-| not found | The repository, issue, or comment does not exist | `404` |
+| not found | The repository, issue, or comment does not exist; a deleted issue or comment counts as missing, and cannot be commented on | `404` |
 | conflict | The request conflicts with the current durable state | `409` |
 | unavailable | A temporary failure: storage, an overloaded writer, or exhausted retries | `503`, with `Retry-After` |
 

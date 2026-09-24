@@ -85,4 +85,16 @@ defmodule Code.IssuesTest do
     assert {:ok, %{events: events}} = Issues.events(repo, issue.number)
     assert List.last(events).type == "issue_deleted"
   end
+
+  test "refuses a comment on a deleted issue without recording one", %{repo: repo, principal: principal} do
+    assert {:ok, %{issue: issue}} = Issues.create(repo, "Doomed", "", principal)
+    assert {:ok, _} = Issues.delete(repo, issue.number, principal)
+
+    assert {:error, %ServiceError{kind: :not_found, message: "issue #1 not found"}} =
+             Issues.add_comment(repo, issue.number, "Too late", principal)
+
+    # The tombstone stays the last thing that happened to the issue.
+    assert {:ok, %{events: events}} = Issues.events(repo, issue.number)
+    assert Enum.map(events, & &1.type) == ["issue_opened", "issue_deleted"]
+  end
 end

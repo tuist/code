@@ -214,9 +214,12 @@ defmodule Code.Issues do
   end
 
   defp comment_in_view(repo_id, view, number, body, principal) do
+    # A deleted issue is gone from every current view, so it cannot gather new
+    # comments either; its tombstone history stays readable.
     with {:ok, head} <- issue_head(view.path),
          true <- is_binary(head),
-         {:ok, issue} <- read_issue(view.path, head, number) do
+         {:ok, issue} <- read_issue(view.path, head, number),
+         :ok <- active_issue(issue) do
       occurred_at = timestamp()
       actor = actor(principal)
 
