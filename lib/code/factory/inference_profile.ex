@@ -140,6 +140,7 @@ defmodule Code.Factory.InferenceProfile do
       {:ok, Shared.maybe_put(%{"reference" => reference}, "field", field)}
     else
       false -> {:error, "credential_binding secret has an unsupported shape"}
+      {:error, reason} -> {:error, reason}
     end
   end
 

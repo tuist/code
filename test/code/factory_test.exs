@@ -212,6 +212,31 @@ defmodule Code.FactoryTest do
              )
   end
 
+  test "reports an invalid secret reference as a validation error rather than crashing", %{
+    namespace: namespace,
+    principal: principal
+  } do
+    assert {:ok, _} =
+             SecretBackend.put(
+               namespace,
+               "production",
+               %{"driver" => "managed_infisical", "project" => "acme-production"},
+               principal
+             )
+
+    for secret <- [
+          %{"reference" => "/production/\ncoding"},
+          %{"reference" => "/production/coding", "field" => ""}
+        ] do
+      attrs = put_in(profile_attrs(), ["credential_binding", "secret"], secret)
+
+      assert {:error, %ServiceError{kind: :invalid}} =
+               InferenceProfile.put(namespace, "coding", attrs, principal)
+    end
+
+    assert {:error, %ServiceError{kind: :not_found}} = InferenceProfile.get(namespace, "coding")
+  end
+
   test "emits bounded telemetry for durable graph operations", %{repo: repo, principal: principal} do
     handler = {__MODULE__, :factory_operation, self()}
 
