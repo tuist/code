@@ -461,6 +461,32 @@ defmodule Code.ReplicaTest do
       {:ok, index, _} = WAL.fetch(repo)
       assert Index.ref(index, "refs/heads/main") == commit
     end
+
+    test "refuses a push that relies on objects the log does not provide", %{source: source, repo: repo} do
+      # The objects exist on this node — loose in the cache, the way an
+      # abandoned agent write or a pack the log stopped naming leaves them —
+      # so receive-pack's own connectivity check would pass. But no pack in
+      # the log carries them, and the push did not include them: accepting it
+      # would name a commit every other replica fails to materialize.
+      %{oid: first} = push_commit(repo, source, "one")
+      {:ok, view} = Replica.ensure_fresh(repo)
+
+      {:ok, blob} = Git.write_blob(view.path, "stranded\n")
+      {:ok, tree} = Git.write_tree(view.path, first, [%{path: "stranded.txt", oid: blob, mode: "100644"}])
+      {:ok, commit} = Git.commit_tree(view.path, tree, [first], "stranded\n", %{name: "T", email: "t@e"})
+
+      # An empty quarantine: the client sent nothing, counting on the server.
+      quarantine = Path.join(System.tmp_dir!(), "code-quarantine-#{:erlang.unique_integer([:positive])}")
+      File.mkdir_p!(Path.join(quarantine, "pack"))
+      on_exit(fn -> File.rm_rf(quarantine) end)
+
+      command = %V1.RefCommand{ref: "refs/heads/main", old_oid: first, new_oid: commit}
+      assert {:error, message} = Ingest.commit(repo, commands: [command], quarantine: quarantine)
+      assert message =~ "did not include"
+
+      {:ok, index, _} = WAL.fetch(repo)
+      assert Index.ref(index, "refs/heads/main") == first, "nothing may be committed"
+    end
   end
 
   defp quarantine_with(repo_path, include, exclude) do

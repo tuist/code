@@ -37,6 +37,7 @@ defmodule Code.Ingest do
   alias Code.Git.Ref
   alias Code.Ingest.Writer
   alias Code.Replica
+  alias Code.Replica.Lease
   alias Code.WAL
   alias Code.WAL.Entry
   alias Code.WAL.Index
@@ -66,7 +67,7 @@ defmodule Code.Ingest do
       fn ->
         result =
           with {:ok, packs} <- collect_packs(repo_id, quarantine),
-               {:ok, result} <- append(repo_id, commands, packs, actor) do
+               {:ok, result} <- commit_pushed(repo_id, commands, packs, actor, quarantine, 1) do
             Replica.record_local_push(repo_id, result.epoch, result.seq)
             Cluster.announce(repo_id, result.epoch, result.seq)
 
@@ -121,12 +122,96 @@ defmodule Code.Ingest do
     end
   end
 
+  # A pushed pack holds only what the client did not expect the server to have.
+  # Everything else the new refs reach was, at the moment `receive-pack`
+  # checked connectivity, somewhere in this node's object database — which is
+  # a cache, and may hold objects no pack in the log provides (loose objects,
+  # a pack the log stopped naming, a pack a compaction has since replaced).
+  #
+  # So before the push is proposed, its closure is proved against a real
+  # version of the index: every object reachable from the new values and not
+  # from that index's tips must be in the quarantine, whose packs are what gets
+  # uploaded. The index's tips are closed within its packs, so that makes the
+  # push closed within the log. The index it was proved against is recorded as
+  # the entry's basis, and the writer re-checks the basis against whichever
+  # index wins the compare-and-swap (see `Code.WAL.check_basis/2`); if a
+  # compaction in between invalidated it, the proof is redone against the new
+  # index, a bounded number of times.
+  @closure_attempts 3
+
+  defp commit_pushed(repo_id, commands, packs, actor, quarantine, attempt) do
+    {basis, closure} = push_basis(repo_id, commands, quarantine, attempt)
+
+    case append(repo_id, commands, packs, actor, basis: basis, closure: closure) do
+      {:error, :basis_compacted} when attempt < @closure_attempts ->
+        commit_pushed(repo_id, commands, packs, actor, quarantine, attempt + 1)
+
+      other ->
+        other
+    end
+  end
+
+  defp push_basis(repo_id, commands, quarantine, attempt) do
+    zero = Entry.zero_oid()
+    tips = commands |> Enum.map(& &1.new_oid) |> Enum.reject(&(&1 == zero)) |> Enum.uniq()
+
+    case basis_index(repo_id, attempt) do
+      {:ok, index} ->
+        exclude = index |> Index.tips() |> MapSet.to_list()
+        {WAL.basis(index, exclude), closure(repo_id, tips, exclude, quarantine)}
+
+      {:error, reason} ->
+        {nil, {:error, {:closure_check_failed, reason}}}
+    end
+  end
+
+  # The replica's own last read of the index on the first attempt: the local
+  # repository holds everything its tips reach, which the proof's walk needs,
+  # and it costs no round trip. A retry follows a compaction, so it reads the
+  # index that won.
+  defp basis_index(repo_id, 1) do
+    case Replica.cached_index(repo_id) do
+      {:ok, index} -> {:ok, index}
+      :error -> basis_index(repo_id, 2)
+    end
+  end
+
+  defp basis_index(repo_id, _attempt) do
+    with {:ok, index, _etag} <- WAL.fetch(repo_id), do: {:ok, index}
+  end
+
+  defp closure(_repo_id, [], _exclude, _quarantine), do: :ok
+
+  defp closure(repo_id, tips, exclude, quarantine) do
+    started = System.monotonic_time(:microsecond)
+    result = Git.count_unprovided(Replica.path(repo_id), tips, exclude, quarantine)
+
+    outcome =
+      case result do
+        {:ok, 0} -> :closed
+        {:ok, _missing} -> :incomplete
+        {:error, _reason} -> :error
+      end
+
+    :telemetry.execute(
+      [:code, :push, :closure_check],
+      %{duration_us: System.monotonic_time(:microsecond) - started},
+      %{repo_id: repo_id, outcome: outcome}
+    )
+
+    case result do
+      {:ok, 0} -> :ok
+      {:ok, missing} -> {:error, {:objects_not_provided, missing}}
+      {:error, reason} -> {:error, {:closure_check_failed, reason}}
+    end
+  end
+
   # Uploading the entry and installing it in the index are separate steps on
   # purpose. The upload is content-addressed and contention-free, so it happens
   # on whichever node received the push; only the index update is funnelled
   # through the repository's writer, where concurrent pushes become one batch
   # instead of a queue of losers retrying. See `Code.Ingest.Writer`.
-  defp append(repo_id, commands, packs, actor, opts \\ []) do
+  defp append(repo_id, commands, packs, actor, opts) do
     entry =
       Entry.new(
         type: :ENTRY_TYPE_PUSH,
@@ -142,13 +227,20 @@ defmodule Code.Ingest do
     # not depend on the index, but it belongs here because this is the last
     # point before a command becomes part of the log, and the log is where an
     # unrepresentable name does permanent damage.
+    #
+    # The closure proof is reported after the ref checks, not before: a push
+    # that is stale or badly named is refused for that reason, which is the
+    # one its author can act on.
+    closure = Keyword.get(opts, :closure, :ok)
+
     validate = fn index ->
-      with :ok <- check_ref_names(commands, Keyword.get(opts, :internal?, false)) do
-        check_fast_forward(index, commands)
+      with :ok <- check_ref_names(commands, Keyword.get(opts, :internal?, false)),
+           :ok <- check_fast_forward(index, commands) do
+        closure
       end
     end
 
-    with {:ok, prepared} <- WAL.prepare(repo_id, entry, validate) do
+    with {:ok, prepared} <- WAL.prepare(repo_id, entry, validate, basis: Keyword.get(opts, :basis)) do
       Writer.commit(repo_id, prepared)
     end
   end
@@ -264,27 +356,57 @@ defmodule Code.Ingest do
 
   @doc false
   @spec update_refs_raw(String.t(), [command()], keyword()) :: {:ok, map()} | {:error, term()}
-  def update_refs_raw(repo_id, commands, opts \\ []) do
-    with {:ok, view} <- Replica.ensure_fresh(repo_id),
-         {:ok, index, _etag} <- WAL.fetch(repo_id),
-         {:ok, packs} <- pack_new_objects(repo_id, view.path, commands, index),
+  def update_refs_raw(repo_id, commands, opts \\ []), do: update_refs_raw(repo_id, commands, opts, 1)
+
+  # A compaction landing between packing and the compare-and-swap can drop
+  # objects the pack left out. The writer refuses that as `:basis_compacted`,
+  # and the write is simply redone from a fresh read of the log.
+  defp update_refs_raw(repo_id, commands, opts, attempt) do
+    result =
+      with {:ok, view} <- Replica.ensure_fresh(repo_id) do
+        # Held from packing until the ref is applied locally: the new pack is
+        # installed here before any index names it, and a sync must not prune
+        # it in that window.
+        Lease.hold(view.path, fn -> agent_write(repo_id, view, commands, opts) end)
+      end
+
+    case result do
+      {:error, :basis_compacted} when attempt < @closure_attempts ->
+        update_refs_raw(repo_id, commands, opts, attempt + 1)
+
+      other ->
+        other
+    end
+  end
+
+  defp agent_write(repo_id, view, commands, opts) do
+    with {:ok, index, _etag} <- WAL.fetch(repo_id),
+         {:ok, packs, exclude} <- pack_new_objects(repo_id, view.path, commands, index),
          {:ok, result} <-
            append(repo_id, commands, packs, Keyword.get(opts, :actor, %V1.Actor{}),
-             internal?: Keyword.get(opts, :internal?, false)
+             internal?: Keyword.get(opts, :internal?, false),
+             basis: WAL.basis(index, exclude)
            ) do
       # The write is durable the moment the log accepted it, so a failure to
       # apply it locally cannot fail the call. It does mean this node is behind,
       # though, so its position is deliberately not recorded — the next read
       # re-reads the log and converges rather than believing it is current.
-      case Git.update_refs(view.path, commands) do
+      #
+      # The local update asserts the old values the log just validated. If the
+      # local refs have moved in the meantime — a sync applied a later push —
+      # applying this older one would move them backwards, so it is refused
+      # and the next read converges instead.
+      case Git.update_refs(view.path, commands, check_old?: true) do
         :ok ->
           Replica.record_local_push(repo_id, result.epoch, result.seq)
 
         {:error, reason} ->
-          Logger.error("could not apply committed push locally",
+          :telemetry.execute([:code, :push, :local_apply_failed], %{count: 1}, %{repo_id: repo_id})
+
+          Logger.warning("could not apply committed push locally; the next read converges from the log",
             repo_id: repo_id,
             seq: result.seq,
-            reason: reason
+            reason: inspect(reason)
           )
       end
 
@@ -312,12 +434,12 @@ defmodule Code.Ingest do
     zero = Entry.zero_oid()
     include = commands |> Enum.map(& &1.new_oid) |> Enum.reject(&(&1 == zero)) |> Enum.uniq()
 
+    exclude = index.refs |> Map.values() |> Enum.uniq()
+
     if include == [] do
       # A pure deletion introduces no objects.
-      {:ok, []}
+      {:ok, [], exclude}
     else
-      exclude = index.refs |> Map.values() |> Enum.uniq()
-
       scratch =
         Path.join(
           System.tmp_dir!(),
@@ -325,15 +447,18 @@ defmodule Code.Ingest do
         )
 
       try do
-        case Git.pack_objects(path, include, exclude, scratch) do
-          {:ok, pack} -> upload_new_pack(repo_id, path, pack)
-          {:error, reason} -> {:error, {:pack_failed, reason}}
+        with {:ok, pack} <- Git.pack_objects(path, include, exclude, scratch) |> pack_failed(),
+             {:ok, packs} <- upload_new_pack(repo_id, path, pack) do
+          {:ok, packs, exclude}
         end
       after
         File.rm_rf(scratch)
       end
     end
   end
+
+  defp pack_failed({:error, reason}), do: {:error, {:pack_failed, reason}}
+  defp pack_failed(ok), do: ok
 
   defp upload_new_pack(_repo_id, _path, nil), do: {:ok, []}
 
@@ -355,7 +480,23 @@ defmodule Code.Ingest do
   defp classify({:stale, _, _, _}), do: :non_fast_forward
   defp classify({:pack_upload_failed, _}), do: :storage
   defp classify(:cas_exhausted), do: :contention
+  defp classify(:basis_compacted), do: :contention
+  defp classify({:objects_not_provided, _}), do: :incomplete_push
+  defp classify(reason) when reason in [:repository_deleted, :repository_replaced, :not_found], do: :deleted
   defp classify(_), do: :other
+
+  defp message({:objects_not_provided, count}) do
+    "code: the push refers to #{count} object(s) it did not include and the repository does not " <>
+      "provide; fetch and push again"
+  end
+
+  defp message(:basis_compacted) do
+    "code: the repository was compacted while this push was in flight; please retry"
+  end
+
+  defp message(reason) when reason in [:repository_deleted, :repository_replaced, :not_found] do
+    "code: this repository does not exist or is being deleted"
+  end
 
   defp message({:stale, ref, proposed, actual}) do
     """
