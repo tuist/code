@@ -4,7 +4,7 @@ defmodule Code.PromEx.Plugin do
 
   Grouped by the question each one answers:
 
-  **Is the cluster healthy?** `code_wal_read_duration_seconds` bucketed by
+  **Is the cluster healthy?** `code_wal_read_duration` (seconds) bucketed by
   outcome. A healthy node's reads are overwhelmingly `not_modified`, because
   that is a metadata-only round trip against object storage. If `modified`
   starts dominating, replicas are doing catch-up work on the read path.
@@ -15,13 +15,19 @@ defmodule Code.PromEx.Plugin do
   that got past it — a few are normal, but many mean pushes are arriving at
   several nodes at once and the preferred-writer routing is not taking effect.
 
-  **How far behind is this node?** `code_replica_entries_behind` on each
+  **How far behind is this node?** `code_replica_sync_entries_behind` on each
   sync. Persistent non-zero values mean hints are not arriving, or object
   storage is slow.
 
   **Should we scale?** `code_git_requests_in_flight` is the honest measure
   of a Git server's load: a clone occupies a connection and a process for its
-  entire duration, so concurrency saturates long before CPU does.
+  entire duration, so concurrency saturates long before CPU does. It counts
+  only Git smart-HTTP requests on the public listener; see
+  `Code.Telemetry.InFlight`.
+
+  **Is maintenance working?** `code_maintenance_job_count{kind,outcome}`
+  counts every job, including the unattended ones a sweep schedules, so a
+  compaction that keeps failing shows up without anyone having asked for it.
   """
 
   use PromEx.Plugin
@@ -34,6 +40,7 @@ defmodule Code.PromEx.Plugin do
       wal_metrics(),
       replica_metrics(),
       push_metrics(),
+      maintenance_metrics(),
       git_metrics(),
       mcp_metrics(),
       factory_metrics(),
@@ -139,6 +146,13 @@ defmodule Code.PromEx.Plugin do
         description: "Pushes that lost a compare-and-swap and retried against newer state."
       ),
       counter(
+        [:code, :wal, :ambiguous_commit, :count],
+        event_name: [:code, :wal, :ambiguous_commit],
+        description:
+          "Lost compare-and-swaps that turned out to be this node's own write, whose reply was lost. " <>
+            "Harmless, since the entry is durable, but a rising rate means the store is dropping replies."
+      ),
+      counter(
         [:code, :wal, :compact, :count],
         event_name: [:code, :wal, :compact],
         description: "Compactions performed by this node."
@@ -213,9 +227,51 @@ defmodule Code.PromEx.Plugin do
         event_name: [:code, :push, :rejected],
         description: "Pushes rejected, by reason.",
         tags: [:reason]
+      ),
+      counter(
+        [:code, :writer, :fallback, :count],
+        event_name: [:code, :writer, :fallback],
+        description:
+          "Pushes committed locally because the preferred writer was unreachable. " <>
+            "Expected during a rolling deploy; sustained outside one, routing is not taking effect.",
+        tags: [:reason]
+      ),
+      counter(
+        [:code, :writer, :timeout, :count],
+        event_name: [:code, :writer, :timeout],
+        description: "Pushes that gave up waiting for the repository writer; their entries may still commit."
       )
     ])
   end
+
+  defp maintenance_metrics do
+    Event.build(:code_maintenance_event_metrics, [
+      distribution(
+        [:code, :maintenance, :job, :duration],
+        event_name: [:code, :maintenance, :job],
+        measurement: :duration_us,
+        description: "Duration of maintenance jobs, by kind and outcome (ok, not_due, error, crashed).",
+        unit: {:microsecond, :second},
+        tags: [:kind, :outcome],
+        reporter_options: [buckets: [0.01, 0.1, 1, 5, 30, 120, 600, 3600]]
+      ),
+      counter(
+        [:code, :maintenance, :job, :count],
+        event_name: [:code, :maintenance, :job],
+        description: "Maintenance jobs finished, by kind and outcome, including unattended ones.",
+        tags: [:kind, :outcome]
+      )
+    ])
+  end
+
+  @doc false
+  def git_command_tags(%{subcommand: subcommand} = meta) do
+    %{subcommand: subcommand, outcome: git_outcome(Map.get(meta, :status))}
+  end
+
+  defp git_outcome(0), do: :ok
+  defp git_outcome(:timeout), do: :timeout
+  defp git_outcome(_status), do: :error
 
   defp git_metrics do
     Event.build(:code_git_event_metrics, [
@@ -223,10 +279,18 @@ defmodule Code.PromEx.Plugin do
         [:code, :git, :command, :duration],
         event_name: [:code, :git, :command],
         measurement: :duration_us,
-        description: "Duration of git plumbing invocations.",
+        description: "Duration of git plumbing invocations, by subcommand and outcome (ok, error, timeout).",
         unit: {:microsecond, :second},
-        tags: [:subcommand],
+        tags: [:subcommand, :outcome],
+        tag_values: &git_command_tags/1,
         reporter_options: [buckets: [0.001, 0.01, 0.05, 0.25, 1, 5, 30, 300]]
+      ),
+      counter(
+        [:code, :git, :command, :count],
+        event_name: [:code, :git, :command],
+        description: "Git plumbing invocations, by subcommand and outcome (ok, error, timeout).",
+        tags: [:subcommand, :outcome],
+        tag_values: &git_command_tags/1
       ),
       distribution(
         [:code, :git, :served, :duration],
@@ -328,8 +392,10 @@ defmodule Code.PromEx.Plugin do
             measurement: :resident,
             description: "Repositories materialized on this node."
           ),
+          # Named for what it measures rather than for the poll that reads it:
+          # this is the series the chart's HorizontalPodAutoscaler asks for.
           last_value(
-            [:code, :cluster, :observed, :in_flight],
+            [:code, :git, :requests_in_flight],
             event_name: [:code, :cluster, :observed],
             measurement: :in_flight,
             description:
@@ -340,7 +406,9 @@ defmodule Code.PromEx.Plugin do
             [:code, :cluster, :observed, :disk_used_bytes],
             event_name: [:code, :cluster, :observed],
             measurement: :disk_used_bytes,
-            description: "Bytes the local repository cache is occupying."
+            description:
+              "Bytes the local repository cache is occupying. Measured in the background at most every " <>
+                "five minutes, so it can lag by that much."
           )
         ]
       )
@@ -355,25 +423,11 @@ defmodule Code.PromEx.Plugin do
         size: length(Code.Cluster.members()),
         resident: length(Code.Replica.resident()),
         in_flight: in_flight(),
-        disk_used_bytes: disk_used()
+        disk_used_bytes: Code.Telemetry.DiskUsage.bytes()
       },
       %{}
     )
   end
 
   defp in_flight, do: Code.Telemetry.InFlight.count()
-
-  defp disk_used do
-    Code.Config.data_dir()
-    |> Path.join("**")
-    |> Path.wildcard(match_dot: true)
-    |> Enum.reduce(0, fn path, acc ->
-      case File.stat(path) do
-        {:ok, %{type: :regular, size: size}} -> acc + size
-        _ -> acc
-      end
-    end)
-  rescue
-    _ -> 0
-  end
 end

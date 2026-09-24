@@ -17,6 +17,11 @@ config :logger, :console,
     :duration_us,
     :packs,
     :bytes,
+    :kind,
+    :mode,
+    :outcome,
+    :detail,
+    :timeout_ms,
     :otel_trace_id,
     :otel_span_id
   ]

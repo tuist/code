@@ -16,6 +16,8 @@ defmodule Code.Maintenance do
 
   use GenServer
 
+  require Logger
+
   alias Code.Cluster.Rendezvous
   alias Code.Config
   alias Code.Replica
@@ -245,7 +247,13 @@ defmodule Code.Maintenance do
       :error ->
         {:noreply, state}
 
-      {:ok, %{key: key}} ->
+      {:ok, %{key: {repo_id, kind} = key} = job} ->
+        # The job cannot report its own crash, so the scheduler does.
+        duration =
+          System.monotonic_time(:microsecond) - Map.get(job, :started_us, System.monotonic_time(:microsecond))
+
+        observe(repo_id, kind, Map.get(job, :mode, :if_due), {:crashed, reason}, duration)
+
         state =
           state
           |> remove_running(ref)
@@ -311,7 +319,15 @@ defmodule Code.Maintenance do
 
             state
             |> Map.put(:pending, pending)
-            |> Map.put(:running, Map.put(state.running, ref, %{key: key, pid: pid}))
+            |> Map.put(
+              :running,
+              Map.put(state.running, ref, %{
+                key: key,
+                pid: pid,
+                mode: job.mode,
+                started_us: System.monotonic_time(:microsecond)
+              })
+            )
             |> start_runnable()
 
           {:error, {:already_started, _pid}} ->
@@ -423,6 +439,53 @@ defmodule Code.Maintenance do
     Process.send_after(self(), :sweep, interval + :rand.uniform(max(div(interval, 4), 1)))
   end
 
+  @doc """
+  Record a finished maintenance job: one telemetry event and, unless it was a
+  routine success, one structured log line.
+
+  `outcome` is bounded (`ok`, `not_due`, `error`, `crashed`), so it is safe as a
+  metric label; the repository identifier appears only in logs and traces.
+  """
+  @spec observe(String.t(), kind(), mode(), term(), integer()) :: :ok
+  def observe(repo_id, kind, mode, result, duration_us) do
+    outcome = job_outcome(result)
+
+    :telemetry.execute(
+      [:code, :maintenance, :job],
+      %{duration_us: max(duration_us, 0)},
+      %{repo_id: repo_id, kind: kind, mode: mode, outcome: outcome}
+    )
+
+    metadata = [repo_id: repo_id, kind: kind, mode: mode, outcome: outcome, duration_us: duration_us]
+
+    case result do
+      {:ok, _summary} ->
+        Logger.info("maintenance job finished", metadata)
+
+      :not_due ->
+        :ok
+
+      {:crashed, reason} ->
+        Logger.error("maintenance job crashed", [reason: inspect(reason, limit: 10)] ++ metadata)
+
+      {:error, reason} ->
+        Logger.warning("maintenance job failed", [reason: inspect(reason, limit: 10)] ++ metadata)
+
+      other ->
+        Logger.warning(
+          "maintenance job returned an unexpected result",
+          [reason: inspect(other, limit: 10)] ++ metadata
+        )
+    end
+
+    :ok
+  end
+
+  defp job_outcome({:ok, _}), do: :ok
+  defp job_outcome(:not_due), do: :not_due
+  defp job_outcome({:crashed, _}), do: :crashed
+  defp job_outcome(_), do: :error
+
   @doc false
   def registry, do: @registry
 
@@ -469,7 +532,23 @@ defmodule Code.Maintenance.Job do
   @impl true
   def handle_info(:run, %{scheduler: scheduler, key: key, mode: mode} = state) do
     {repo_id, kind} = key
-    result = execute(repo_id, kind, mode)
+    started = System.monotonic_time(:microsecond)
+
+    # Instrumented here rather than where a caller waits, because most jobs
+    # are unattended: a sweep or a log hint schedules them and nobody reads the
+    # result, so a failure that is not logged and counted here is invisible.
+    result =
+      Code.Telemetry.span(
+        "code.maintenance.job",
+        %{
+          "code.repository.id" => repo_id,
+          "code.maintenance.kind" => Atom.to_string(kind),
+          "code.maintenance.mode" => Atom.to_string(mode)
+        },
+        fn -> repo_id |> execute(kind, mode) |> Code.Telemetry.put_span_outcome() end
+      )
+
+    Code.Maintenance.observe(repo_id, kind, mode, result, System.monotonic_time(:microsecond) - started)
     send(scheduler, {:maintenance_job_finished, self(), key, result})
     {:stop, :normal, state}
   end

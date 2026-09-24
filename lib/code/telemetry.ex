@@ -18,6 +18,9 @@ defmodule Code.Telemetry do
     * `[:code, :wal, :read]` — `duration_us`, meta `outcome`, `repo_id`
     * `[:code, :wal, :append]` — `seq`, `attempts`, meta `repo_id`
     * `[:code, :wal, :cas_retry]` — a push lost a compare-and-swap
+    * `[:code, :wal, :ambiguous_commit]` — `seq`, meta `repo_id`; a lost
+      compare-and-swap turned out to be this node's own write, whose reply was
+      lost
     * `[:code, :wal, :compact]` — `epoch`, `packs`
     * `[:code, :wal, :pack_upload]` / `[:code, :wal, :pack_download]` —
       `bytes`, meta `repo_id`. Packs stream to and from the store, so these
@@ -33,6 +36,13 @@ defmodule Code.Telemetry do
     * `[:code, :push, :committed]` — `duration_ms`, `refs`, `packs`
     * `[:code, :push, :rejected]` — meta `reason`
     * `[:code, :git, :command]` — `duration_us`, meta `subcommand`, `status`
+      (exported with a bounded `outcome` of `ok`, `error` or `timeout`)
+    * `[:code, :writer, :fallback]` — meta `reason` (`exception` or `exit`);
+      the preferred writer was unreachable and this node committed itself
+    * `[:code, :writer, :timeout]` — a push gave up waiting for its writer
+    * `[:code, :maintenance, :job]` — `duration_us`, meta `repo_id`, `kind`,
+      `mode`, `outcome` (`ok`, `not_due`, `error`, `crashed`); every job,
+      including ones nobody is waiting on
     * `[:code, :git, :served]` — `duration_ms`, `bytes`, meta `service`
     * `[:code, :git, :aborted]` — client vanished or stream failed
     * `[:code, :mcp, :request]` — `duration_us`, meta `method`, `outcome`
@@ -61,6 +71,7 @@ defmodule Code.Telemetry do
       [:code, :push, :rejected],
       [:code, :git, :aborted],
       [:code, :wal, :compact],
+      [:code, :wal, :ambiguous_commit],
       [:code, :factory, :operation]
     ]
 
@@ -76,6 +87,7 @@ defmodule Code.Telemetry do
     )
 
     Code.Telemetry.InFlight.attach()
+    Code.Telemetry.DiskUsage.attach()
     :ok
   end
 
@@ -100,6 +112,12 @@ defmodule Code.Telemetry do
       epoch: measurements.epoch,
       packs: measurements.packs
     )
+  end
+
+  # Rare and harmless when it happens, since the entry is durable, but it means
+  # the object store accepted a write and lost the reply, which is worth seeing.
+  def handle_event([:code, :wal, :ambiguous_commit], measurements, meta, _config) do
+    Logger.info("recovered a commit whose reply was lost", repo_id: meta.repo_id, seq: measurements.seq)
   end
 
   def handle_event([:code, :factory, :operation], measurements, %{outcome: :error} = meta, _config) do

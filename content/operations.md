@@ -26,6 +26,13 @@ autoscaling:
     target: 40
 ```
 
+`inFlightMetric` needs `prometheus-adapter` or KEDA to serve
+`code_git_requests_in_flight` to the autoscaler. The chart does not install
+one, and an autoscaler that cannot read a metric it names stops scaling, so
+leave it off until an adapter is in place. The
+[Kubernetes guide](https://github.com/tuist/code/blob/main/docs/kubernetes.md)
+has an example adapter rule.
+
 Use central processing unit as a secondary signal for compaction load. The
 [operations reference](https://github.com/tuist/code/blob/main/docs/operations.md)
 lists every metric, configuration variable, and failure mode.

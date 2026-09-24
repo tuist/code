@@ -21,6 +21,9 @@ spec:
     # Requires prometheus-adapter or KEDA. Without one the HPA cannot compute a
     # replica count *at all* — a metric it cannot fetch disables the whole
     # object rather than falling back to the others.
+    #
+    # The name must match the exported series exactly; Code.PromExTest checks
+    # it against a real scrape. docs/kubernetes.md has an example adapter rule.
     - type: Pods
       pods:
         metric:

@@ -198,8 +198,11 @@ service's trace tree.
 
 When tracing is enabled, logs emitted inside Code's explicit spans include
 `otel_trace_id` and `otel_span_id`. Operational logs use fields such as
-`repo_id`, `seq`, `epoch`, `reason`, `service`, and `duration_ms`; configure
-the log collector to retain those fields. Credentials, object keys, and request
+`repo_id`, `seq`, `epoch`, `reason`, `service`, `kind`, `outcome`, and
+`duration_ms`; configure the log collector to retain those fields. Every
+maintenance job that fails or crashes is logged with its `repo_id`, `kind`,
+`mode` and `reason` and traced as `code.maintenance.job`, including jobs a
+sweep started without anyone waiting for the result. Credentials, object keys, and request
 bodies are never logged.
 
 ## Ports
@@ -217,12 +220,19 @@ written to disk. It must never be exposed.
 
 `GET :4002/metrics`, Prometheus format.
 
+Names below are exactly what the exporter emits, and a test compares them with
+a real scrape. Durations are recorded in seconds, but only the HTTP and
+object-store histograms carry a `_seconds` suffix in their names. Histograms
+expose the usual `_bucket`, `_sum` and `_count` series. Labels are always
+bounded: no repository, account, object key or token ever becomes one.
+
 ### The one to watch
 
-**`code_wal_read_duration_seconds{outcome}`.** A healthy node's reads are
+**`code_wal_read_duration{outcome}`** (seconds). A healthy node's reads are
 overwhelmingly `not_modified`: replicas confirm they are current with a
 metadata-only round trip and serve immediately. If `modified` starts dominating,
 replicas are doing real catch-up work on the read path, and latency will follow.
+`code_wal_read_count{outcome}` counts the same reads.
 
 ### The rest
 
@@ -230,23 +240,47 @@ replicas are doing real catch-up work on the read path, and latency will follow.
 |---|---|
 | `code_wal_cas_retry_count` | Is there write contention the writer could not absorb? A few are normal; many mean pushes are arriving at several nodes at once, so routing to the preferred writer is not taking effect |
 | `code_wal_append_batch_size` | Pushes absorbed per compare-and-swap. Rising with load is group commit doing its job |
+| `code_wal_append_count`, `code_wal_append_attempts` | Entries committed, and the compare-and-swap attempts each needed |
+| `code_wal_ambiguous_commit_count` | A lost compare-and-swap turned out to be this node's own write whose reply was lost. Harmless, but a rising rate means the store is dropping replies |
+| `code_wal_compact_count` | Compactions this node performed |
+| `code_wal_pack_upload_bytes`, `code_wal_pack_download_bytes` | Pack bytes streamed into and out of the log. Sustained download growth means caches are rebuilt more often than they are used |
 | `code_replica_sync_entries_behind` | How far behind is this node? Persistent non-zero means hints are not arriving, or the store is slow |
-| `code_git_requests_in_flight` | Should we scale? See below |
-| `code_push_rejected_count{reason}` | `non_fast_forward` is users; `storage` and `contention` are yours |
-| `code_git_aborted_count` | Clients disconnecting mid-clone |
+| `code_replica_sync_duration`, `code_replica_sync_packs_downloaded` | Time (seconds) and packs needed to bring a replica into agreement with the log |
 | `code_replica_evict_count` | Cache churn. High values with high sync duration means the working set does not fit |
-| `code_object_store_request_duration_seconds{operation,outcome}` | Is the source of truth slow or failing? `operation` and `outcome` have bounded values; no repository identifier is a label |
+| `code_git_requests_in_flight` | Should we scale? See below |
+| `code_git_served_duration{service}`, `code_git_served_bytes{service}` | How long Git protocol requests take (seconds), and how much they send |
+| `code_git_aborted_count{service}` | Clients disconnecting mid-clone |
+| `code_git_command_duration{subcommand,outcome}`, `code_git_command_count{subcommand,outcome}` | Are git plumbing commands slow or failing? `outcome` is `ok`, `error` or `timeout` |
+| `code_push_committed_duration`, `code_push_committed_count` | Time (seconds) from receiving a push to it being durable, and how many landed |
+| `code_push_rejected_count{reason}` | `non_fast_forward` is users; `storage`, `contention` and `overloaded` are yours |
+| `code_writer_fallback_count{reason}` | Pushes committed locally because the preferred writer was unreachable. Expected during a rolling deploy; sustained outside one, routing is not taking effect |
+| `code_writer_timeout_count` | Pushes that gave up waiting for the repository writer. Their entries may still have committed |
+| `code_maintenance_job_duration{kind,outcome}`, `code_maintenance_job_count{kind,outcome}` | Is maintenance keeping up, and is any of it failing? Counts every job, including unattended ones; `outcome` is `ok`, `not_due`, `error` or `crashed` |
+| `code_object_store_request_duration_seconds{operation,outcome}` | Is the source of truth slow or failing? |
 | `code_object_store_request_count{operation,outcome}` | Is object-store traffic or a particular failure outcome rising? |
-| `code_http_request_duration_seconds{listener,method,status}` | Is any public, hook, or administration listener slow or returning errors? `method` and `status` use bounded classes; `status` is a response class such as `5xx` |
+| `code_http_request_duration_seconds{listener,method,status}` | Is any public, hook, or administration listener slow or returning errors? `status` is a response class such as `5xx` |
+| `code_http_request_count{listener,method,status}`, `code_http_request_bytes{listener}` | Request volume, and response bytes sent |
 | `code_http_exception_count{listener}` | Did a request terminate unexpectedly before it could return a response? |
-| `code_factory_operation_duration_seconds{operation,outcome}` | Are durable graph-run or account configuration operations slow or failing? Operation and outcome are bounded, so repository work does not create metric-label cardinality. |
+| `code_mcp_request_duration{method}`, `code_mcp_request_count{method,outcome}` | MCP request latency (seconds) and volume |
+| `code_factory_operation_duration{operation,outcome}` | Are durable graph-run or account configuration operations slow (seconds) or failing? |
 | `code_factory_operation_count{operation,outcome}` | Which durable graph-run or account configuration operations are succeeding or failing? |
+| `code_auth_denied_count{permission}` | Authorization denials |
+| `code_cluster_observed_size`, `code_cluster_observed_resident` | Cluster members, and repositories materialized on this node |
+| `code_cluster_observed_disk_used_bytes` | Bytes the local cache occupies. Measured in the background at most every five minutes, so it lags by up to that much and reads `0` until the first measurement |
+
+The BEAM and application metrics from PromEx's standard plugins are exported
+alongside these.
 
 ### What to autoscale on
 
 `code_git_requests_in_flight`, not CPU. A clone occupies a connection, a
 process and a `git upload-pack` for its entire duration, which can be minutes,
 while CPU stays unremarkable. Scaling on CPU alone reacts far too late.
+
+It counts only Git smart-HTTP requests on the public listener: reference
+advertisement, `git-upload-pack` and `git-receive-pack`. Health probes, metric
+scrapes, MCP, API and hook traffic are excluded, so the signal follows clones
+and pushes rather than the scraper. It is a gauge sampled every ten seconds.
 
 Use CPU as a secondary signal for compaction load.
 
@@ -255,7 +289,7 @@ Use CPU as a secondary signal for compaction load.
 | Endpoint | Meaning |
 |---|---|
 | `GET :4002/health` | The process is up. Use as a liveness probe |
-| `GET :4002/ready` | Object storage is reachable. Use as a readiness probe |
+| `GET :4002/ready` | Object storage is reachable. Use as a readiness probe. One request for at most one key, whatever the bucket holds |
 
 Readiness deliberately depends on the object store: a node that cannot read the
 log cannot answer consistently and should leave rotation rather than serve stale
@@ -308,7 +342,8 @@ budget. Bounded by object store latency, not by Code.
 
 **A replica cannot converge.** Almost always a log entry naming an object no
 pack provides, which the sync will refuse loudly rather than paper over. Check
-`code_replica_sync_*` and the node's logs; the repository is intact in the
+`code_replica_sync_duration`, `code_replica_sync_entries_behind` and the node's
+logs; the repository is intact in the
 log, so evicting the replica and letting it rebuild is safe and usually enough.
 
 **Disk fills.** Lower `CODE_IDLE_EVICTION_MS` or add nodes. The cache tracks
