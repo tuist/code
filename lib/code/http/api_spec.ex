@@ -42,7 +42,17 @@ defmodule Code.HTTP.ApiSpec do
   defp paths do
     %{
       "/api/issues" => %PathItem{
-        get: operation("listIssues", "List issues", [repository_parameter()], list_schema()),
+        get:
+          operation(
+            "listIssues",
+            "List issues",
+            [
+              repository_parameter(),
+              limit_parameter(),
+              Operation.parameter(:cursor, :query, :integer, "The next_cursor of the previous page")
+            ],
+            list_schema()
+          ),
         post:
           operation("createIssue", "Create issue", [repository_parameter()], mutation_schema(),
             request_body: create_issue_schema(),
@@ -80,7 +90,15 @@ defmodule Code.HTTP.ApiSpec do
       },
       "/api/work-runs" => %PathItem{
         get:
-          operation("listWorkRuns", "List work runs", [repository_parameter()], work_run_list_schema(),
+          operation(
+            "listWorkRuns",
+            "List work runs",
+            [
+              repository_parameter(),
+              limit_parameter(),
+              Operation.parameter(:cursor, :query, :string, "The next_cursor of the previous page")
+            ],
+            work_run_list_schema(),
             tags: ["Work runs"]
           ),
         post:
@@ -102,7 +120,10 @@ defmodule Code.HTTP.ApiSpec do
             "getWorkRunEvents",
             "Get immutable work-run events",
             work_run_parameters() ++
-              [Operation.parameter(:after, :query, :integer, "Exclusive state-revision cursor")],
+              [
+                Operation.parameter(:after, :query, :integer, "Exclusive state-revision cursor"),
+                limit_parameter()
+              ],
             work_events_schema(),
             tags: ["Work runs"]
           )
@@ -269,6 +290,15 @@ defmodule Code.HTTP.ApiSpec do
     }
   end
 
+  defp limit_parameter do
+    Operation.parameter(
+      :limit,
+      :query,
+      %Schema{type: :integer, minimum: 1, maximum: Code.Page.max_limit()},
+      "Page size. Omit both limit and cursor to receive every item."
+    )
+  end
+
   defp repository_parameter do
     Operation.parameter(:repository, :query, :string, "Repository identifier, for example acme/app.",
       required: true
@@ -374,7 +404,8 @@ defmodule Code.HTTP.ApiSpec do
       required: [:issues, :count],
       properties: %{
         issues: %Schema{type: :array, items: issue_schema()},
-        count: %Schema{type: :integer, minimum: 0}
+        count: %Schema{type: :integer, minimum: 0},
+        next_cursor: %Schema{type: :integer, nullable: true, description: "Null on the last page."}
       }
     }
   end
@@ -516,7 +547,8 @@ defmodule Code.HTTP.ApiSpec do
       properties: %{
         repository: %Schema{type: :string},
         runs: %Schema{type: :array, items: work_run_schema()},
-        count: %Schema{type: :integer, minimum: 0}
+        count: %Schema{type: :integer, minimum: 0},
+        next_cursor: %Schema{type: :string, nullable: true, description: "Null on the last page."}
       }
     }
   end
@@ -565,7 +597,8 @@ defmodule Code.HTTP.ApiSpec do
         run_id: %Schema{type: :string},
         events: %Schema{type: :array, items: %Schema{type: :object}},
         count: %Schema{type: :integer, minimum: 0},
-        next_cursor: %Schema{type: :integer, minimum: 1}
+        next_cursor: %Schema{type: :integer, minimum: 0},
+        has_more: %Schema{type: :boolean, description: "Whether events after next_cursor exist."}
       }
     }
   end

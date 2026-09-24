@@ -13,6 +13,16 @@ defmodule Code.MCP.Tools.Support do
     %{type: "string", description: "Repository id, for example acme/ios-app."}
   end
 
+  @spec limit_property() :: map()
+  def limit_property do
+    %{
+      type: "integer",
+      minimum: 1,
+      maximum: Code.Page.max_limit(),
+      description: "Page size. Omit both limit and cursor to receive everything."
+    }
+  end
+
   @spec authorize(Auth.Principal.t(), term(), Auth.Principal.permission()) :: :ok | {:error, String.t()}
   def authorize(principal, repo_id, permission) do
     cond do

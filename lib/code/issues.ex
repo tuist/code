@@ -16,6 +16,7 @@ defmodule Code.Issues do
   alias Code.Auth.Principal
   alias Code.Git
   alias Code.Ingest
+  alias Code.Page
   alias Code.Replica
   alias Code.ServiceError
   alias Code.WAL
@@ -143,20 +144,21 @@ defmodule Code.Issues do
     )
   end
 
-  @doc "List the current issue projection for every issue in a repository."
-  @spec list(String.t()) :: result()
-  def list(repo_id) do
-    typed(
-      in_repository(repo_id, fn view ->
-        case issue_head(view.path) do
-          {:ok, head} ->
-            issues = if head, do: list_issues(view.path, head), else: []
-            {:ok, %{issues: issues, count: length(issues)}}
+  @doc """
+  List the current issues in a repository, in issue-number order.
 
-          {:error, reason} ->
-            {:error, failure("could not list issues", reason)}
-        end
-      end)
+  Without `:limit` or `:cursor` every current issue is returned. With either,
+  at most `:limit` issues numbered above `:cursor` are returned, and only as
+  many issue projections are read as the page needs. `next_cursor` is the
+  number to pass for the next page, or `nil` on the last one. Deleted issues
+  are never returned and never end a page early.
+  """
+  @spec list(String.t(), keyword()) :: result()
+  def list(repo_id, opts \\ []) do
+    typed(
+      with {:ok, page} <- Page.options(opts, &(is_integer(&1) and &1 >= 0)) do
+        in_repository(repo_id, &list_in_view(&1, page))
+      end
     )
   end
 
@@ -502,7 +504,18 @@ defmodule Code.Issues do
     end
   end
 
-  defp list_issues(repo_path, head) do
+  defp list_in_view(view, page) do
+    case issue_head(view.path) do
+      {:ok, head} ->
+        {issues, next_cursor} = if head, do: list_issues(view.path, head, page), else: {[], nil}
+        {:ok, %{issues: issues, count: length(issues), next_cursor: next_cursor}}
+
+      {:error, reason} ->
+        {:error, failure("could not list issues", reason)}
+    end
+  end
+
+  defp list_issues(repo_path, head, page) do
     # The trailing slash lists the directory's children; `issues` alone would
     # name the directory entry itself, and every issue would be missed.
     case Git.list_tree(repo_path, head, "issues/", recursive: false) do
@@ -512,16 +525,37 @@ defmodule Code.Issues do
         |> Enum.map(&issue_number_from_path/1)
         |> Enum.reject(&is_nil/1)
         |> Enum.sort()
-        |> Enum.flat_map(fn number ->
-          case read_issue(repo_path, head, number) do
-            {:ok, %{"state" => "deleted"}} -> []
-            {:ok, issue} -> [issue_summary(issue)]
-            {:error, _} -> []
-          end
-        end)
+        |> page_issues(repo_path, head, page)
 
       {:error, _reason} ->
-        []
+        {[], nil}
+    end
+  end
+
+  defp page_issues(numbers, repo_path, head, :all) do
+    {numbers |> Stream.flat_map(&current_issue(repo_path, head, &1)) |> Enum.to_list(), nil}
+  end
+
+  # Lazily reads one issue past the page, which is how it knows whether a next
+  # page exists without reading the rest.
+  defp page_issues(numbers, repo_path, head, %{limit: limit, cursor: cursor}) do
+    found =
+      numbers
+      |> Stream.drop_while(&(not is_nil(cursor) and &1 <= cursor))
+      |> Stream.flat_map(&current_issue(repo_path, head, &1))
+      |> Enum.take(limit + 1)
+
+    case Enum.split(found, limit) do
+      {page, []} -> {page, nil}
+      {page, _more} -> {page, List.last(page).number}
+    end
+  end
+
+  defp current_issue(repo_path, head, number) do
+    case read_issue(repo_path, head, number) do
+      {:ok, %{"state" => "deleted"}} -> []
+      {:ok, issue} -> [issue_summary(issue)]
+      {:error, _} -> []
     end
   end
 

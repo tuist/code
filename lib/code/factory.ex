@@ -18,6 +18,7 @@ defmodule Code.Factory do
   alias Code.Factory.InferenceProfile
   alias Code.Factory.Shared
   alias Code.ObjectStore
+  alias Code.Page
   alias Code.Policy
   alias Code.ServiceError
   alias Code.WAL
@@ -47,7 +48,7 @@ defmodule Code.Factory do
          :ok <- current_public_commit(repo_id, base_commit),
          {:ok, issue} <- issue(attrs["issue"] || attrs[:issue]),
          {:ok, lease_duration_ms} <- lease_duration(attrs["lease_duration_ms"] || attrs[:lease_duration_ms]) do
-      id = identifier()
+      id = run_identifier()
       now = now()
 
       manifest = %{
@@ -106,30 +107,62 @@ defmodule Code.Factory do
     end
   end
 
-  @doc "List work-run projections in a repository, newest first."
-  @spec list(String.t()) :: result()
-  def list(repo_id) do
-    observe(:list, fn -> do_list(repo_id) end)
+  @doc """
+  List work-run projections in a repository.
+
+  Without `:limit` or `:cursor` every run is returned, newest first, as it
+  always has been. With either option the result is a page of at most
+  `:limit` runs in run-id order, after the run id given as `:cursor`, and only
+  that page's runs are read from storage. Run ids are time-ordered with the
+  newest first, so pages also run newest first; runs created before ids were
+  time-ordered follow every newer run, in id order. `next_cursor` is the id to
+  pass for the next page, or `nil` on the last one.
+  """
+  @spec list(String.t(), keyword()) :: result()
+  def list(repo_id, opts \\ []) do
+    observe(:list, fn -> do_list(repo_id, opts) end)
   end
 
-  defp do_list(repo_id) do
+  defp do_list(repo_id, opts) do
     with :ok <- repository(repo_id),
+         {:ok, page} <- Page.options(opts, &valid_identifier?/1),
          {:ok, entries} <- ObjectStore.list(runs_prefix(repo_id)) do
-      runs =
+      ids =
         entries
         |> Enum.filter(&String.ends_with?(&1.key, "/state.json"))
         |> Enum.map(&run_id_from_state_key/1)
-        |> Enum.map(&do_get(repo_id, &1))
-        |> Enum.flat_map(fn
-          {:ok, run} -> [run]
-          _ -> []
-        end)
-        |> Enum.sort_by(& &1.created_at_ms, :desc)
 
-      {:ok, %{repository: repo_id, runs: runs, count: length(runs)}}
+      {runs, next_cursor} = list_page(repo_id, ids, page)
+      {:ok, %{repository: repo_id, runs: runs, count: length(runs), next_cursor: next_cursor}}
     else
       {:error, reason} -> {:error, storage_error("could not list work runs", reason)}
     end
+  end
+
+  defp list_page(repo_id, ids, :all) do
+    runs = ids |> read_runs(repo_id) |> Enum.sort_by(& &1.created_at_ms, :desc)
+    {runs, nil}
+  end
+
+  # Paging happens on the listed ids, before any run is read, so a page costs
+  # `limit` reads however many runs the repository has.
+  defp list_page(repo_id, ids, %{limit: limit, cursor: cursor}) do
+    {page, rest} =
+      ids
+      |> Enum.sort()
+      |> Enum.drop_while(&(not is_nil(cursor) and &1 <= cursor))
+      |> Enum.split(limit)
+
+    {read_runs(page, repo_id), if(rest == [], do: nil, else: List.last(page))}
+  end
+
+  defp read_runs(ids, repo_id) do
+    Enum.flat_map(ids, fn id ->
+      case do_get(repo_id, id) do
+        {:ok, run} -> [run]
+        _ -> []
+      end
+    end)
   end
 
   @doc """
@@ -244,19 +277,32 @@ defmodule Code.Factory do
     end
   end
 
-  @doc "Return the immutable event history after a durable state revision cursor."
-  @spec events(String.t(), String.t(), non_neg_integer()) :: result()
-  def events(repo_id, run_id, after_revision \\ 0) do
-    observe(:events, fn -> do_events(repo_id, run_id, after_revision) end)
+  @doc """
+  Return the immutable event history after a durable state revision cursor.
+
+  `next_cursor` is the revision to pass as `after_revision` next time. With
+  `limit: n` at most `n` events are read and returned, and `next_cursor`
+  stops at the last of them; `has_more` says whether later events exist.
+  """
+  @spec events(String.t(), String.t(), non_neg_integer(), keyword()) :: result()
+  def events(repo_id, run_id, after_revision \\ 0, opts \\ []) do
+    observe(:events, fn -> do_events(repo_id, run_id, after_revision, Keyword.get(opts, :limit)) end)
   end
 
-  defp do_events(repo_id, run_id, after_revision) when is_integer(after_revision) and after_revision >= 0 do
+  defp do_events(repo_id, run_id, after_revision, limit)
+       when is_integer(after_revision) and after_revision >= 0 do
     with :ok <- repository(repo_id),
          :ok <- run_id(run_id),
+         :ok <- Page.validate_limit(limit),
          {:ok, _manifest} <- read_json(manifest_key(repo_id, run_id)),
          {:ok, state, _etag} <- read_json_with_etag(state_key(repo_id, run_id)) do
+      # `event_ids` holds one id per revision, in order, so the ids after a
+      # cursor are a slice: only the events being returned are read.
+      last = if limit, do: min(after_revision + limit, state["revision"]), else: state["revision"]
+
       events =
         state["event_ids"]
+        |> Enum.slice(after_revision, max(last - after_revision, 0))
         |> Enum.map(&read_json(event_key(repo_id, run_id, &1)))
         |> Enum.flat_map(fn
           {:ok, event} -> [event]
@@ -265,14 +311,22 @@ defmodule Code.Factory do
         |> Enum.filter(&(&1["revision"] > after_revision))
         |> Enum.sort_by(& &1["revision"])
 
-      {:ok, %{run_id: run_id, events: events, count: length(events), next_cursor: state["revision"]}}
+      {:ok,
+       %{
+         run_id: run_id,
+         events: events,
+         count: length(events),
+         next_cursor: max(last, after_revision),
+         has_more: last < state["revision"]
+       }}
     else
       {:error, :not_found} -> {:error, run_not_found(run_id)}
       {:error, reason} -> {:error, storage_error("could not read work events", reason)}
     end
   end
 
-  defp do_events(_repo_id, _run_id, _after_revision), do: {:error, "after must be a non-negative integer"}
+  defp do_events(_repo_id, _run_id, _after_revision, _limit),
+    do: {:error, "after must be a non-negative integer"}
 
   @doc "Read a claimed or completed attempt without trusting a pod-local log."
   @spec attempt(String.t(), String.t(), String.t()) :: result()
@@ -921,6 +975,8 @@ defmodule Code.Factory do
   # A typed error from a nested service keeps its meaning; any other failure
   # reading or writing storage is temporary.
   defp storage_error(_context, %ServiceError{} = error), do: error
+  # A bare message comes from input validation earlier in the same `with`.
+  defp storage_error(_context, message) when is_binary(message), do: message
   defp storage_error(context, reason), do: ServiceError.unavailable("#{context}: #{inspect(reason)}")
 
   defp expired(lease_expires_at_ms) when is_integer(lease_expires_at_ms) do
@@ -1079,6 +1135,17 @@ defmodule Code.Factory do
   end
 
   defp identifier, do: Shared.identifier("r")
+
+  # Run ids sort newest first: `q`, then the creation time subtracted from a
+  # fixed ceiling as 13 zero-padded digits, then a random suffix. Listing a
+  # page can therefore order by id without reading every run. The `q` prefix
+  # sorts before the random `r` ids runs used to get, which stay valid.
+  defp run_identifier do
+    inverted = 9_999_999_999_999 - now()
+    suffix = Base.url_encode64(:crypto.strong_rand_bytes(9), padding: false)
+    "q" <> String.pad_leading(Integer.to_string(inverted), 13, "0") <> "-" <> suffix
+  end
+
   defp put_immutable(key, value), do: Shared.put_immutable(key, value, @content_type)
   defp read_json(key), do: Shared.read_json(key, "factory")
   defp read_json_with_etag(key), do: Shared.read_json_with_etag(key, "factory")

@@ -29,11 +29,17 @@ defmodule Code.MCP.Tools.Factory do
       %{
         name: "list_work_runs",
         title: "List work runs",
-        description: "List the durable work-run projections in a repository.",
+        description:
+          "List the durable work-run projections in a repository. Pass limit or cursor to page " <>
+            "through them; next_cursor is null on the last page.",
         inputSchema: %{
           type: "object",
           required: ["repository"],
-          properties: %{repository: Support.repository_property()}
+          properties: %{
+            repository: Support.repository_property(),
+            limit: Support.limit_property(),
+            cursor: %{type: "string", description: "The next_cursor from the previous page."}
+          }
         }
       },
       %{
@@ -56,7 +62,8 @@ defmodule Code.MCP.Tools.Factory do
           properties: %{
             repository: Support.repository_property(),
             run: %{type: "string"},
-            after: %{type: "integer", minimum: 0, description: "Exclusive state-revision cursor."}
+            after: %{type: "integer", minimum: 0, description: "Exclusive state-revision cursor."},
+            limit: Support.limit_property()
           }
         }
       },
@@ -166,7 +173,8 @@ defmodule Code.MCP.Tools.Factory do
   def call("list_work_runs", args, principal, _opts) do
     repo_id = args["repository"]
 
-    with :ok <- Support.authorize(principal, repo_id, :read), do: Factory.list(repo_id)
+    with :ok <- Support.authorize(principal, repo_id, :read),
+         do: Factory.list(repo_id, limit: args["limit"], cursor: args["cursor"])
   end
 
   def call("get_work_run", args, principal, _opts) do
@@ -179,7 +187,7 @@ defmodule Code.MCP.Tools.Factory do
     repo_id = args["repository"]
 
     with :ok <- Support.authorize(principal, repo_id, :read),
-         do: Factory.events(repo_id, args["run"], args["after"] || 0)
+         do: Factory.events(repo_id, args["run"], args["after"] || 0, limit: args["limit"])
   end
 
   def call("claim_work_node", args, principal, _opts) do

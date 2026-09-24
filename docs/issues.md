@@ -69,6 +69,17 @@ the same bearer-token authentication and per-repository authorization as Git
 and the Model Context Protocol. A caller without read access receives `404` for
 a repository, preserving the existing non-enumeration behavior.
 
+## Pagination
+
+Listing issues (`GET /api/issues` or `list_issues`) returns every current issue
+in number order unless a `limit` (1 to 500) or `cursor` is given. With either,
+the response holds at most `limit` issues (100 when only `cursor` is given)
+numbered above `cursor`, and `next_cursor` is the number to pass next, or
+`null` on the last page. Only as many issue projections are read as the page
+needs, plus one to learn whether another page exists. Deleted issues are
+skipped and never end a page early. Listing the issue numbers is one Git tree
+read of the private reference.
+
 ## Errors
 
 A failure has a kind, and each transport reports the kind rather than

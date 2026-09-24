@@ -6,6 +6,7 @@ defmodule Code.HTTP.IssuesRouter do
   import Plug.Conn
 
   alias Code.HTTP.AuthPlug
+  alias Code.HTTP.QueryParams
   alias Code.HTTP.ServiceResponse
   alias Code.Issues
 
@@ -14,7 +15,14 @@ defmodule Code.HTTP.IssuesRouter do
   plug(:dispatch)
 
   get "/" do
-    with_authorized(conn, :read, fn repo_id, _principal -> Issues.list(repo_id) end)
+    with {:ok, limit} <- QueryParams.integer(conn, "limit"),
+         {:ok, cursor} <- QueryParams.integer(conn, "cursor") do
+      with_authorized(conn, :read, fn repo_id, _principal ->
+        Issues.list(repo_id, limit: limit, cursor: cursor)
+      end)
+    else
+      {:error, message} -> error(conn, 422, "code: #{message}")
+    end
   end
 
   post "/" do

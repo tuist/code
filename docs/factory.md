@@ -257,6 +257,30 @@ the most recent `next_cursor`, reconstruct the canonical graph state, and link
 attempt evidence to its corresponding work. Streaming logs, sandbox telemetry,
 and a worker reconciler are not implemented yet.
 
+### Pagination
+
+Listing runs and reading events can be paged. Without paging parameters both
+behave as they always have and return everything.
+
+| Operation | Parameters | Page order |
+|---|---|---|
+| `GET /api/work-runs`, `list_work_runs` | `limit` (1 to 500, default 100 once paging) and `cursor` | Run id |
+| `GET /api/work-runs/{run}/events`, `work_run_events` | `after` and `limit` (1 to 500) | Revision |
+
+A run page returns `next_cursor`, the run id to pass as `cursor` for the next
+page, or `null` on the last one. The page is selected from the listed run ids
+before anything is read, so a page costs `limit` reads however many runs the
+repository has. Run ids are time-ordered, newest first (`q` followed by an
+inverted creation timestamp and a random suffix), so pages run newest first.
+Runs created before ids were time-ordered have random `r` ids and come after
+every newer run, in id order. The unpaged list is still sorted by creation
+time. The listing of run ids itself is still one object-store prefix listing.
+
+An event page reads only the events it returns, because `state.json` lists one
+event id per revision. `next_cursor` is the last revision returned, and
+`has_more` says whether later events exist; without `limit`, `next_cursor` is
+the run's current revision, as before.
+
 ## Errors
 
 Failures are typed, and the HTTP status follows the type rather than the

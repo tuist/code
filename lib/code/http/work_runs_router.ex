@@ -7,6 +7,7 @@ defmodule Code.HTTP.WorkRunsRouter do
 
   alias Code.Factory
   alias Code.HTTP.AuthPlug
+  alias Code.HTTP.QueryParams
   alias Code.HTTP.ServiceResponse
 
   plug(:match)
@@ -14,7 +15,17 @@ defmodule Code.HTTP.WorkRunsRouter do
   plug(:dispatch)
 
   get "/" do
-    with_authorized(conn, :read, fn repo_id, _principal -> Factory.list(repo_id) end)
+    case QueryParams.integer(conn, "limit") do
+      {:ok, limit} ->
+        cursor = QueryParams.string(conn, "cursor")
+
+        with_authorized(conn, :read, fn repo_id, _principal ->
+          Factory.list(repo_id, limit: limit, cursor: cursor)
+        end)
+
+      {:error, message} ->
+        error(conn, 422, "code: #{message}")
+    end
   end
 
   post "/" do
@@ -29,12 +40,13 @@ defmodule Code.HTTP.WorkRunsRouter do
   end
 
   get "/:run/events" do
-    case after_revision(conn) do
-      {:ok, after_revision} ->
-        with_run(conn, run, :read, fn repo_id, _principal -> Factory.events(repo_id, run, after_revision) end)
-
-      {:error, message} ->
-        error(conn, 422, "code: #{message}")
+    with {:ok, after_revision} <- QueryParams.integer(conn, "after"),
+         {:ok, limit} <- QueryParams.integer(conn, "limit") do
+      with_run(conn, run, :read, fn repo_id, _principal ->
+        Factory.events(repo_id, run, after_revision || 0, limit: limit)
+      end)
+    else
+      {:error, message} -> error(conn, 422, "code: #{message}")
     end
   end
 
@@ -118,21 +130,6 @@ defmodule Code.HTTP.WorkRunsRouter do
     case get_req_header(conn, "idempotency-key") do
       [key | _] -> key
       [] -> conn.body_params["idempotency_key"]
-    end
-  end
-
-  defp after_revision(conn) do
-    conn = fetch_query_params(conn)
-
-    case conn.query_params["after"] do
-      nil ->
-        {:ok, 0}
-
-      raw ->
-        case Integer.parse(raw) do
-          {value, ""} when value >= 0 -> {:ok, value}
-          _ -> {:error, "after must be a non-negative integer"}
-        end
     end
   end
 

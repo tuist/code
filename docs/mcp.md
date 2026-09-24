@@ -131,7 +131,7 @@ the commit is durable and ordered.
 | Tool | |
 |---|---|
 | `create_issue` | Open an issue with the verified caller as its author |
-| `list_issues` | Current issues in a repository |
+| `list_issues` | Current issues in a repository, optionally paged with `limit` and `cursor` |
 | `get_issue`, `update_issue`, `delete_issue` | Read, change, or tombstone an issue |
 | `add_issue_comment` | Add a verified-author comment |
 | `get_issue_comment`, `update_issue_comment`, `delete_issue_comment` | Read, change, or tombstone a comment |
@@ -145,8 +145,8 @@ authorization details.
 
 | Tool | |
 |---|---|
-| `create_work_run`, `list_work_runs`, `get_work_run` | Create and inspect a durable graph of work |
-| `work_run_events` | Immutable, revision-cursored work-run events |
+| `create_work_run`, `list_work_runs`, `get_work_run` | Create and inspect a durable graph of work; `list_work_runs` pages with `limit` and `cursor` |
+| `work_run_events` | Immutable, revision-cursored work-run events, optionally bounded with `limit` |
 | `claim_work_node`, `complete_work_attempt` | Pull one ready node (replay-safe with an `idempotency_key`) and conditionally accept its evidence |
 | `approve_work_node`, `cancel_work_run`, `expire_work_node` | Control an approval, terminal state, or stale lease |
 | `get_work_attempt` | Claim and result evidence for one attempt |

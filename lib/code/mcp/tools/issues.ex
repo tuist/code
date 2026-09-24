@@ -25,11 +25,17 @@ defmodule Code.MCP.Tools.Issues do
       %{
         name: "list_issues",
         title: "List issues",
-        description: "List the current issues in a repository.",
+        description:
+          "List the current issues in a repository, by number. Pass limit or cursor to page " <>
+            "through them; next_cursor is null on the last page.",
         inputSchema: %{
           type: "object",
           required: ["repository"],
-          properties: %{repository: Support.repository_property()}
+          properties: %{
+            repository: Support.repository_property(),
+            limit: Support.limit_property(),
+            cursor: %{type: "integer", minimum: 0, description: "The next_cursor from the previous page."}
+          }
         }
       },
       %{
@@ -150,7 +156,8 @@ defmodule Code.MCP.Tools.Issues do
   def call("list_issues", args, principal, _opts) do
     repo_id = args["repository"]
 
-    with :ok <- Support.authorize(principal, repo_id, :read), do: Issues.list(repo_id)
+    with :ok <- Support.authorize(principal, repo_id, :read),
+         do: Issues.list(repo_id, limit: args["limit"], cursor: args["cursor"])
   end
 
   def call("get_issue", args, principal, _opts) do
