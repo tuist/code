@@ -13,6 +13,7 @@ defmodule Code.Factory.SecretBackend do
   alias Code.Auth.Principal
   alias Code.Factory.Shared
   alias Code.Factory.VersionedConfig
+  alias Code.ServiceError
 
   @config %VersionedConfig{
     kind: "secret backend",
@@ -23,7 +24,7 @@ defmodule Code.Factory.SecretBackend do
     content_type: "application/vnd.code.factory.secret-backend.v1+json"
   }
 
-  @type result :: {:ok, map()} | {:error, String.t()}
+  @type result :: {:ok, map()} | {:error, ServiceError.t()}
 
   @doc "Create or replace an account secret backend with a new immutable version."
   @spec put(String.t(), String.t(), map(), Principal.t()) :: result()
@@ -32,7 +33,7 @@ defmodule Code.Factory.SecretBackend do
   end
 
   def put(_account, _name, _attrs, _principal),
-    do: {:error, "secret backend update requires an authenticated principal"}
+    do: {:error, ServiceError.invalid("secret backend update requires an authenticated principal")}
 
   @doc "Read the current version of one account secret backend."
   @spec get(String.t(), String.t()) :: result()

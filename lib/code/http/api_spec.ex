@@ -221,9 +221,20 @@ defmodule Code.HTTP.ApiSpec do
           Operation.response("Success", "application/json", schema),
         "401" => Operation.response("Authentication required", "application/json", error_schema()),
         "403" => Operation.response("Permission denied", "application/json", error_schema()),
-        "404" => Operation.response("Repository or issue not found", "application/json", error_schema()),
-        "409" => Operation.response("Concurrent update", "application/json", error_schema()),
-        "422" => Operation.response("Invalid request", "application/json", error_schema())
+        "404" =>
+          Operation.response(
+            "Repository, issue, run, or record not found",
+            "application/json",
+            error_schema()
+          ),
+        "409" =>
+          Operation.response(
+            "The request conflicts with current durable state; re-read before retrying",
+            "application/json",
+            error_schema()
+          ),
+        "422" => Operation.response("Invalid request", "application/json", error_schema()),
+        "503" => temporary_failure_response()
       }
 
     %Operation{
@@ -237,6 +248,24 @@ defmodule Code.HTTP.ApiSpec do
         ),
       responses: responses,
       security: [%{"bearerAuth" => []}]
+    }
+  end
+
+  # Storage failures, an overloaded repository writer, and exhausted optimistic
+  # retries. The same request may succeed after `Retry-After` seconds.
+  defp temporary_failure_response do
+    %{
+      Operation.response(
+        "Temporary failure; retry the same request later",
+        "application/json",
+        error_schema()
+      )
+      | headers: %{
+          "Retry-After" => %OpenApiSpex.Header{
+            description: "Seconds to wait before retrying.",
+            schema: %Schema{type: :integer, minimum: 1}
+          }
+        }
     }
   end
 

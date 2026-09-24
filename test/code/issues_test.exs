@@ -6,6 +6,7 @@ defmodule Code.IssuesTest do
   alias Code.Git
   alias Code.Issues
   alias Code.Replica
+  alias Code.ServiceError
 
   setup %{repo: repo, namespace: namespace} do
     start_replica_runtime()
@@ -60,7 +61,10 @@ defmodule Code.IssuesTest do
     assert {:ok, %{issue: issue}} = Issues.delete_comment(repo, issue.number, comment.id, principal)
     assert issue.comments == []
     assert issue.comment_count == 0
-    assert {:error, message} = Issues.get_comment(repo, issue.number, comment.id)
+
+    assert {:error, %ServiceError{kind: :not_found, message: message}} =
+             Issues.get_comment(repo, issue.number, comment.id)
+
     assert message =~ "not found"
 
     assert {:ok, %{events: events}} = Issues.events(repo, issue.number)
@@ -75,7 +79,7 @@ defmodule Code.IssuesTest do
 
     assert {:ok, %{issue: deleted}} = Issues.delete(repo, issue.number, principal)
     assert deleted.state == "deleted"
-    assert {:error, message} = Issues.get(repo, issue.number)
+    assert {:error, %ServiceError{kind: :not_found, message: message}} = Issues.get(repo, issue.number)
     assert message =~ "not found"
     assert {:ok, %{issues: []}} = Issues.list(repo)
     assert {:ok, %{events: events}} = Issues.events(repo, issue.number)

@@ -7,6 +7,7 @@ defmodule Code.HTTP.SecretBackendsRouter do
 
   alias Code.Factory.SecretBackend
   alias Code.HTTP.AuthPlug
+  alias Code.HTTP.ServiceResponse
   alias Code.Policy
 
   plug(:match)
@@ -55,18 +56,7 @@ defmodule Code.HTTP.SecretBackendsRouter do
     end
   end
 
-  defp respond(conn, {:ok, payload}), do: json(conn, 200, payload)
+  defp respond(conn, result), do: ServiceResponse.send_result(conn, result, 200)
 
-  defp respond(conn, {:error, message}) do
-    status = if String.contains?(message, "not found"), do: 404, else: 422
-    error(conn, status, "code: #{message}")
-  end
-
-  defp error(conn, status, message), do: json(conn, status, %{error: message})
-
-  defp json(conn, status, payload) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, JSON.encode!(payload))
-  end
+  defp error(conn, status, message), do: ServiceResponse.error(conn, status, message)
 end

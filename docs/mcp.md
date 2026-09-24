@@ -166,6 +166,19 @@ An ordinary failure — a branch moved, a file is missing — comes back as a to
 result with `isError: true`, not a JSON-RPC error. The model needs to see it and
 react; aborting the conversation over a missing file would be wrong.
 
+Issue, work-run, and account-configuration tools also return a typed error in
+`structuredContent`:
+
+```json
+{"error": {"kind": "unavailable", "message": "work run changed concurrently; retry later", "retryable": true}}
+```
+
+`kind` is `invalid`, `not_found`, `conflict`, or `unavailable`, with the same
+meaning as the HTTP statuses in [issues.md](issues.md#errors). Only
+`unavailable` is `retryable`: the same call may succeed later. A `conflict`
+needs the agent to re-read state before trying again. Repository and Git tools
+return the text message only.
+
 JSON-RPC errors are reserved for protocol problems: unknown methods, malformed
 requests, unsupported protocol versions.
 

@@ -38,6 +38,12 @@ change, and retries. The repository's existing writer serializes competing
 object-storage compare-and-swap operations, so this requires no separate
 leader or issue database.
 
+Retries are bounded. When every attempt loses, or when the repository writer
+rejects the write as overloaded or unavailable, or the write-ahead log's own
+compare-and-swap retries are exhausted, nothing was recorded and the call
+fails as a temporary error (`503` with `Retry-After` over HTTP). Code does not
+retry those rejections itself; the caller may repeat the same request.
+
 ## Interfaces and authorization
 
 The [Model Context Protocol](https://modelcontextprotocol.io/) exposes issue
@@ -61,3 +67,18 @@ available at `GET /api/openapi.json`. Hypertext Transfer Protocol requests use
 the same bearer-token authentication and per-repository authorization as Git
 and the Model Context Protocol. A caller without read access receives `404` for
 a repository, preserving the existing non-enumeration behavior.
+
+## Errors
+
+A failure has a kind, and each transport reports the kind rather than
+interpreting the wording of its message:
+
+| Kind | Meaning | HTTP |
+|---|---|---|
+| invalid | The request is malformed, for example an empty title | `422` |
+| not found | The repository, issue, or comment does not exist | `404` |
+| conflict | The request conflicts with the current durable state | `409` |
+| unavailable | A temporary failure: storage, an overloaded writer, or exhausted retries | `503`, with `Retry-After` |
+
+The Model Context Protocol tools report the same kind in the error result's
+`structuredContent`; see [mcp.md](mcp.md#errors).

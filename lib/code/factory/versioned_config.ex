@@ -14,6 +14,7 @@ defmodule Code.Factory.VersionedConfig do
 
   alias Code.Factory.Shared
   alias Code.ObjectStore
+  alias Code.ServiceError
 
   @enforce_keys [:kind, :article, :short, :collection, :version_prefix, :content_type]
   defstruct @enforce_keys
@@ -68,7 +69,7 @@ defmodule Code.Factory.VersionedConfig do
         {:ok, nil, nil}
 
       {:error, reason} ->
-        {:error, "could not read #{spec.kind}: #{inspect(reason)}"}
+        {:error, ServiceError.unavailable("could not read #{spec.kind}: #{inspect(reason)}")}
     end
   end
 
@@ -87,8 +88,8 @@ defmodule Code.Factory.VersionedConfig do
          true <- expected == actual do
       :ok
     else
-      false -> {:error, "#{spec.kind} changed concurrently"}
-      {:error, _} -> {:error, "#{spec.kind} pointer is malformed"}
+      false -> {:error, ServiceError.conflict("#{spec.kind} changed concurrently")}
+      {:error, _} -> {:error, ServiceError.unavailable("#{spec.kind} pointer is malformed")}
     end
   end
 
@@ -110,8 +111,11 @@ defmodule Code.Factory.VersionedConfig do
          {:ok, _} <- put_pointer(spec, account, name, version, etag) do
       {:ok, record}
     else
-      {:error, :precondition_failed} -> {:error, "#{spec.kind} changed concurrently"}
-      {:error, reason} -> {:error, "could not store #{spec.kind}: #{inspect(reason)}"}
+      {:error, :precondition_failed} ->
+        {:error, ServiceError.conflict("#{spec.kind} changed concurrently")}
+
+      {:error, reason} ->
+        {:error, ServiceError.unavailable("could not store #{spec.kind}: #{inspect(reason)}")}
     end
   end
 
@@ -125,7 +129,7 @@ defmodule Code.Factory.VersionedConfig do
          {:ok, record} <- Shared.read_json(version_key(spec, account, name, version), spec.kind) do
       {:ok, record}
     else
-      {:error, :not_found} -> {:error, "#{spec.kind} #{name} not found"}
+      {:error, :not_found} -> {:error, ServiceError.not_found("#{spec.kind} #{name} not found")}
       {:error, reason} -> {:error, message(spec, reason)}
     end
   end
@@ -139,8 +143,11 @@ defmodule Code.Factory.VersionedConfig do
          {:ok, record} <- Shared.read_json(version_key(spec, account, name, version), spec.kind) do
       {:ok, record}
     else
-      {:error, :not_found} -> {:error, "#{spec.kind} #{name} version #{version} not found"}
-      {:error, reason} -> {:error, message(spec, reason)}
+      {:error, :not_found} ->
+        {:error, ServiceError.not_found("#{spec.kind} #{name} version #{version} not found")}
+
+      {:error, reason} ->
+        {:error, message(spec, reason)}
     end
   end
 
@@ -164,8 +171,14 @@ defmodule Code.Factory.VersionedConfig do
         error -> error
       end
     else
-      {:error, reason} when is_binary(reason) -> {:error, reason}
-      {:error, reason} -> {:error, "could not list #{spec.kind}s: #{inspect(reason)}"}
+      {:error, reason} when is_binary(reason) ->
+        {:error, reason}
+
+      {:error, %ServiceError{} = error} ->
+        {:error, error}
+
+      {:error, reason} ->
+        {:error, ServiceError.unavailable("could not list #{spec.kind}s: #{inspect(reason)}")}
     end
   end
 
@@ -187,10 +200,14 @@ defmodule Code.Factory.VersionedConfig do
     with :ok <- validate_version(spec, version), do: {:ok, version}
   end
 
-  defp pointer_version(spec, _pointer), do: {:error, "#{spec.kind} pointer is malformed"}
+  defp pointer_version(spec, _pointer),
+    do: {:error, ServiceError.unavailable("#{spec.kind} pointer is malformed")}
 
+  # A validation failure on the caller's input stays a plain message (and so
+  # `:invalid`); anything that went wrong reading storage is temporary.
   defp message(_spec, reason) when is_binary(reason), do: reason
-  defp message(spec, reason), do: "could not read #{spec.kind}: #{inspect(reason)}"
+  defp message(_spec, %ServiceError{} = error), do: error
+  defp message(spec, reason), do: ServiceError.unavailable("could not read #{spec.kind}: #{inspect(reason)}")
 
   defp prefix(spec, account), do: "accounts/#{account}/factory/#{spec.collection}/"
   defp record_prefix(spec, account, name), do: prefix(spec, account) <> name <> "/"

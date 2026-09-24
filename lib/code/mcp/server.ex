@@ -34,6 +34,7 @@ defmodule Code.MCP.Server do
   require Logger
 
   alias Code.MCP.Tools
+  alias Code.ServiceError
 
   # JSON-RPC 2.0 error codes, named because -32601 means nothing on sight.
   @parse_error -32_700
@@ -269,6 +270,18 @@ defmodule Code.MCP.Server do
            content: [%{type: "text", text: render(payload)}],
            structuredContent: payload,
            isError: false
+         }}
+
+      {:error, %ServiceError{} = error} ->
+        # Typed service failures also say whether retrying the same call later
+        # can help, so an agent can back off instead of rewriting its request.
+        {:ok,
+         %{
+           content: [%{type: "text", text: error.message}],
+           structuredContent: %{
+             error: %{kind: error.kind, message: error.message, retryable: ServiceError.retryable?(error)}
+           },
+           isError: true
          }}
 
       {:error, message} ->

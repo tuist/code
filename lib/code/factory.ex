@@ -19,6 +19,7 @@ defmodule Code.Factory do
   alias Code.Factory.Shared
   alias Code.ObjectStore
   alias Code.Policy
+  alias Code.ServiceError
   alias Code.WAL
 
   import Code.Factory.Shared, only: [actor: 1, maybe_put: 3, now: 0, observe: 2, valid_identifier?: 1]
@@ -27,7 +28,7 @@ defmodule Code.Factory do
   @cas_attempts 16
   @default_lease_duration_ms 30 * 60 * 1_000
 
-  @type result :: {:ok, map()} | {:error, String.t()}
+  @type result :: {:ok, map()} | {:error, ServiceError.t()}
   @type node_id :: String.t()
   @type dependency_graph :: %{optional(node_id()) => [node_id()]}
   @type visited_nodes :: %{optional(node_id()) => true}
@@ -78,8 +79,8 @@ defmodule Code.Factory do
            {:ok, _} <- put_immutable(state_key(repo_id, id), state) do
         {:ok, present(manifest, state)}
       else
-        {:error, :precondition_failed} -> {:error, "work run id collision"}
-        {:error, reason} -> {:error, "could not create work run: #{inspect(reason)}"}
+        {:error, :precondition_failed} -> {:error, ServiceError.conflict("work run id collision")}
+        {:error, reason} -> {:error, storage_error("could not create work run", reason)}
       end
     end
   end
@@ -100,8 +101,8 @@ defmodule Code.Factory do
          {:ok, state, _etag} <- read_json_with_etag(state_key(repo_id, run_id)) do
       {:ok, present(manifest, state)}
     else
-      {:error, :not_found} -> {:error, "work run #{run_id} not found"}
-      {:error, reason} -> {:error, "could not read work run: #{inspect(reason)}"}
+      {:error, :not_found} -> {:error, run_not_found(run_id)}
+      {:error, reason} -> {:error, storage_error("could not read work run", reason)}
     end
   end
 
@@ -127,7 +128,7 @@ defmodule Code.Factory do
 
       {:ok, %{repository: repo_id, runs: runs, count: length(runs)}}
     else
-      {:error, reason} -> {:error, "could not list work runs: #{inspect(reason)}"}
+      {:error, reason} -> {:error, storage_error("could not list work runs", reason)}
     end
   end
 
@@ -186,7 +187,7 @@ defmodule Code.Factory do
   end
 
   def approve(_repo_id, _run_id, _node_id, _principal),
-    do: {:error, "approval requires an authenticated principal"}
+    do: {:error, ServiceError.invalid("approval requires an authenticated principal")}
 
   defp do_approve(repo_id, run_id, node_id, %Principal{} = principal) do
     with :ok <- run_id(run_id),
@@ -213,7 +214,8 @@ defmodule Code.Factory do
     observe(:cancel, fn -> do_cancel(repo_id, run_id, principal) end)
   end
 
-  def cancel(_repo_id, _run_id, _principal), do: {:error, "cancellation requires an authenticated principal"}
+  def cancel(_repo_id, _run_id, _principal),
+    do: {:error, ServiceError.invalid("cancellation requires an authenticated principal")}
 
   defp do_cancel(repo_id, run_id, %Principal{} = principal) do
     with :ok <- run_id(run_id) do
@@ -248,8 +250,8 @@ defmodule Code.Factory do
 
       {:ok, %{run_id: run_id, events: events, count: length(events), next_cursor: state["revision"]}}
     else
-      {:error, :not_found} -> {:error, "work run #{run_id} not found"}
-      {:error, reason} -> {:error, "could not read work events: #{inspect(reason)}"}
+      {:error, :not_found} -> {:error, run_not_found(run_id)}
+      {:error, reason} -> {:error, storage_error("could not read work events", reason)}
     end
   end
 
@@ -271,7 +273,7 @@ defmodule Code.Factory do
       case {claim, result} do
         {{:ok, claim}, {:ok, result}} -> {:ok, %{attempt: claim, result: result}}
         {{:ok, claim}, {:error, :not_found}} -> {:ok, %{attempt: claim}}
-        _ -> {:error, "attempt #{attempt_id} not found"}
+        _ -> {:error, ServiceError.not_found("attempt #{attempt_id} not found")}
       end
     end
   end
@@ -387,7 +389,10 @@ defmodule Code.Factory do
   end
 
   defp transition(repo_id, run_id, update, attempts \\ @cas_attempts)
-  defp transition(_repo_id, _run_id, _update, 0), do: {:error, "work run changed concurrently"}
+  # Losing every attempt means sustained contention on this run, not a
+  # conflict with the caller's request: the same request can succeed later.
+  defp transition(_repo_id, _run_id, _update, 0),
+    do: {:error, ServiceError.unavailable("work run changed concurrently; retry later")}
 
   defp transition(repo_id, run_id, update, attempts) do
     with :ok <- repository(repo_id),
@@ -414,7 +419,7 @@ defmodule Code.Factory do
             {:ok, Map.merge(present(manifest, updated), extra)}
           else
             {:error, :precondition_failed} -> transition(repo_id, run_id, update, attempts - 1)
-            {:error, reason} -> {:error, "could not update work run: #{inspect(reason)}"}
+            {:error, reason} -> {:error, storage_error("could not update work run", reason)}
           end
 
         {:already, extra} ->
@@ -424,8 +429,8 @@ defmodule Code.Factory do
           {:error, error_message(reason)}
       end
     else
-      {:error, :not_found} -> {:error, "work run #{run_id} not found"}
-      {:error, reason} -> {:error, "could not read work run: #{inspect(reason)}"}
+      {:error, :not_found} -> {:error, run_not_found(run_id)}
+      {:error, reason} -> {:error, storage_error("could not read work run", reason)}
     end
   end
 
@@ -644,7 +649,7 @@ defmodule Code.Factory do
          |> Enum.filter(&(&1["status"] == "ready"))
          |> Enum.sort_by(& &1["id"]) do
       [node | _] -> {:ok, node["id"], node}
-      [] -> {:error, "no work node is ready"}
+      [] -> {:error, ServiceError.conflict("no work node is ready")}
     end
   end
 
@@ -706,9 +711,9 @@ defmodule Code.Factory do
          true <- claim["claimed_by"] == actor(completion.principal) do
       :ok
     else
-      false -> {:error, "attempt belongs to a different executor identity"}
-      {:error, :not_found} -> {:error, "attempt #{completion.attempt_id} not found"}
-      {:error, reason} -> {:error, "could not read work attempt: #{inspect(reason)}"}
+      false -> {:error, ServiceError.conflict("attempt belongs to a different executor identity")}
+      {:error, :not_found} -> {:error, ServiceError.not_found("attempt #{completion.attempt_id} not found")}
+      {:error, reason} -> {:error, storage_error("could not read work attempt", reason)}
     end
   end
 
@@ -727,7 +732,7 @@ defmodule Code.Factory do
         {:ok, :expired}
 
       true ->
-        {:error, "attempt #{attempt_id} no longer owns node #{node["id"]}"}
+        {:error, ServiceError.conflict("attempt #{attempt_id} no longer owns node #{node["id"]}")}
     end
   end
 
@@ -787,7 +792,7 @@ defmodule Code.Factory do
 
   defp node(state, node_id) do
     case get_in(state, ["nodes", node_id]) do
-      nil -> {:error, "work node #{node_id} not found"}
+      nil -> {:error, ServiceError.not_found("work node #{node_id} not found")}
       node -> {:ok, node}
     end
   end
@@ -799,11 +804,11 @@ defmodule Code.Factory do
     do: Map.update(node, key, [attempt_id], &Enum.uniq(&1 ++ [attempt_id]))
 
   defp active(%{"status" => "active"}), do: :ok
-  defp active(state), do: {:error, "work run is #{state["status"]}"}
+  defp active(state), do: {:error, ServiceError.conflict("work run is #{state["status"]}")}
   defp running(%{"status" => "running"}), do: :ok
-  defp running(_), do: {:error, "work node is not running"}
+  defp running(_), do: {:error, ServiceError.conflict("work node is not running")}
   defp approval_waiting(%{"kind" => "approval", "status" => "waiting"}), do: :ok
-  defp approval_waiting(_), do: {:error, "work node is not awaiting approval"}
+  defp approval_waiting(_), do: {:error, ServiceError.conflict("work node is not awaiting approval")}
 
   defp artifacts(artifacts) do
     if Enum.all?(artifacts, &valid_artifact?/1),
@@ -816,10 +821,20 @@ defmodule Code.Factory do
   defp valid_artifact?(_), do: false
 
   defp error_message(reason) when is_binary(reason), do: reason
-  defp error_message(reason), do: "could not transition work run: #{inspect(reason)}"
+  defp error_message(%ServiceError{} = error), do: error
+  defp error_message(reason), do: storage_error("could not transition work run", reason)
+
+  defp run_not_found(run_id), do: ServiceError.not_found("work run #{run_id} not found")
+
+  # A typed error from a nested service keeps its meaning; any other failure
+  # reading or writing storage is temporary.
+  defp storage_error(_context, %ServiceError{} = error), do: error
+  defp storage_error(context, reason), do: ServiceError.unavailable("#{context}: #{inspect(reason)}")
 
   defp expired(lease_expires_at_ms) when is_integer(lease_expires_at_ms) do
-    if now() >= lease_expires_at_ms, do: :ok, else: {:error, "work attempt lease has not expired"}
+    if now() >= lease_expires_at_ms,
+      do: :ok,
+      else: {:error, ServiceError.conflict("work attempt lease has not expired")}
   end
 
   defp expired(_), do: {:error, "work attempt claim has no lease deadline"}
@@ -857,8 +872,8 @@ defmodule Code.Factory do
       :ok
     else
       false -> {:error, "base_commit is not the current head of a public reference"}
-      {:error, :not_found} -> {:error, "repository #{repo_id} not found"}
-      {:error, reason} -> {:error, "could not validate base_commit: #{inspect(reason)}"}
+      {:error, :not_found} -> {:error, ServiceError.not_found("repository #{repo_id} not found")}
+      {:error, reason} -> {:error, storage_error("could not validate base_commit", reason)}
     end
   end
 
@@ -913,12 +928,12 @@ defmodule Code.Factory do
              true <- same_result?(existing, result) do
           :ok
         else
-          false -> {:error, "attempt #{attempt_id} already has a different result"}
-          {:error, reason} -> {:error, "could not read prior attempt result: #{inspect(reason)}"}
+          false -> {:error, ServiceError.conflict("attempt #{attempt_id} already has a different result")}
+          {:error, reason} -> {:error, storage_error("could not read prior attempt result", reason)}
         end
 
       {:error, reason} ->
-        {:error, "could not record attempt result: #{inspect(reason)}"}
+        {:error, storage_error("could not record attempt result", reason)}
     end
   end
 

@@ -193,6 +193,19 @@ defmodule Code.MCP.ServerTest do
     assert hd(result.content).text == "unknown tool: no_such_tool"
   end
 
+  test "a typed service failure says what kind it is and whether to retry", %{opts: opts, repo: repo} do
+    result = call_tool("get_work_run", %{"repository" => repo, "run" => "rmissing"}, opts)
+
+    assert result.isError
+    assert hd(result.content).text == "work run rmissing not found"
+
+    assert result.structuredContent.error == %{
+             kind: :not_found,
+             message: "work run rmissing not found",
+             retryable: false
+           }
+  end
+
   describe "authorization" do
     test "a repository outside the principal's grants is reported as not found", %{opts: opts} do
       result = call_tool("describe_repository", %{"repository" => "other/secret"}, opts)

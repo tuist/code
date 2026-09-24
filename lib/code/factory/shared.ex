@@ -10,6 +10,7 @@ defmodule Code.Factory.Shared do
 
   alias Code.Auth.Principal
   alias Code.ObjectStore
+  alias Code.ServiceError
   alias Code.Telemetry
 
   @identifier ~r/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
@@ -49,11 +50,11 @@ defmodule Code.Factory.Shared do
     end
   end
 
-  @spec decode(String.t(), binary(), String.t()) :: {:ok, map()} | {:error, String.t()}
+  @spec decode(String.t(), binary(), String.t()) :: {:ok, map()} | {:error, ServiceError.t()}
   def decode(key, body, label) do
     case JSON.decode(body) do
       {:ok, value} when is_map(value) -> {:ok, value}
-      _ -> {:error, "malformed #{label} object #{key}"}
+      _ -> {:error, ServiceError.unavailable("malformed #{label} object #{key}")}
     end
   end
 
@@ -66,6 +67,9 @@ defmodule Code.Factory.Shared do
   Run one factory operation inside a trace span and emit its bounded
   `[:code, :factory, :operation]` event. The operation name is a fixed atom,
   never a tenant-supplied value.
+
+  This is also the service boundary for errors: the result is normalized with
+  `Code.ServiceError.normalize/1`, so callers always receive a typed error.
   """
   @spec observe(atom(), (-> result)) :: result when result: term()
   def observe(operation, fun) when is_atom(operation) do
@@ -75,7 +79,7 @@ defmodule Code.Factory.Shared do
       Telemetry.span(
         "factory.#{operation}",
         %{"code.factory.operation" => Atom.to_string(operation)},
-        fn -> fun.() |> Telemetry.put_span_outcome() end
+        fn -> fun.() |> ServiceError.normalize() |> Telemetry.put_span_outcome() end
       )
 
     :telemetry.execute(

@@ -7,6 +7,7 @@ defmodule Code.HTTP.WorkRunsRouter do
 
   alias Code.Factory
   alias Code.HTTP.AuthPlug
+  alias Code.HTTP.ServiceResponse
 
   plug(:match)
   plug(Plug.Parsers, parsers: [:json], json_decoder: JSON, pass: ["application/json"])
@@ -125,29 +126,7 @@ defmodule Code.HTTP.WorkRunsRouter do
     end
   end
 
-  defp respond(conn, {:ok, payload}, status), do: json(conn, status, payload)
+  defp respond(conn, result, status), do: ServiceResponse.send_result(conn, result, status)
 
-  defp respond(conn, {:error, message}, _status) do
-    status =
-      cond do
-        String.contains?(message, "not found") ->
-          404
-
-        String.contains?(message, "changed concurrently") or String.contains?(message, "no longer owns") ->
-          409
-
-        true ->
-          422
-      end
-
-    error(conn, status, "code: #{message}")
-  end
-
-  defp error(conn, status, message), do: json(conn, status, %{error: message})
-
-  defp json(conn, status, payload) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, JSON.encode!(payload))
-  end
+  defp error(conn, status, message), do: ServiceResponse.error(conn, status, message)
 end

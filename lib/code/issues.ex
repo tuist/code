@@ -17,6 +17,7 @@ defmodule Code.Issues do
   alias Code.Git
   alias Code.Ingest
   alias Code.Replica
+  alias Code.ServiceError
   alias Code.WAL
   alias Code.Wal.V1
 
@@ -24,7 +25,7 @@ defmodule Code.Issues do
   @meta_path "issues/meta.json"
   @write_attempts 12
 
-  @type result :: {:ok, map()} | {:error, String.t()}
+  @type result :: {:ok, map()} | {:error, ServiceError.t()}
 
   @doc "The private Git reference containing issue state."
   @spec ref() :: String.t()
@@ -33,126 +34,150 @@ defmodule Code.Issues do
   @doc "Create an open issue and its first immutable event."
   @spec create(String.t(), String.t(), String.t(), Principal.t()) :: result()
   def create(repo_id, title, body, %Principal{} = principal) do
-    with {:ok, title} <- title(title),
-         :ok <- issue_body(body) do
-      mutate(repo_id, fn view -> create_in_view(repo_id, view, title, body, principal) end)
-    end
+    typed(
+      with {:ok, title} <- title(title),
+           :ok <- issue_body(body) do
+        mutate(repo_id, fn view -> create_in_view(repo_id, view, title, body, principal) end)
+      end
+    )
   end
 
   @doc "Add an immutable comment event and update the issue projection."
   @spec add_comment(String.t(), pos_integer(), String.t(), Principal.t()) :: result()
   def add_comment(repo_id, number, body, %Principal{} = principal) do
-    with :ok <- issue_number(number),
-         {:ok, body} <- comment_body(body) do
-      mutate(repo_id, fn view -> comment_in_view(repo_id, view, number, body, principal) end)
-    end
+    typed(
+      with :ok <- issue_number(number),
+           {:ok, body} <- comment_body(body) do
+        mutate(repo_id, fn view -> comment_in_view(repo_id, view, number, body, principal) end)
+      end
+    )
   end
 
   @doc "Update an issue's title, body, or open and closed state."
   @spec update(String.t(), pos_integer(), map(), Principal.t()) :: result()
   def update(repo_id, number, attrs, %Principal{} = principal) when is_map(attrs) do
-    with :ok <- issue_number(number),
-         {:ok, attrs} <- issue_updates(attrs) do
-      mutate(repo_id, fn view -> update_in_view(repo_id, view, number, attrs, principal) end)
-    end
+    typed(
+      with :ok <- issue_number(number),
+           {:ok, attrs} <- issue_updates(attrs) do
+        mutate(repo_id, fn view -> update_in_view(repo_id, view, number, attrs, principal) end)
+      end
+    )
   end
 
-  def update(_repo_id, _number, _attrs, _principal), do: {:error, "issue changes must be an object"}
+  def update(_repo_id, _number, _attrs, _principal),
+    do: {:error, ServiceError.invalid("issue changes must be an object")}
 
   @doc "Create an immutable deletion event and hide an issue from current views."
   @spec delete(String.t(), pos_integer(), Principal.t()) :: result()
   def delete(repo_id, number, %Principal{} = principal) do
-    with :ok <- issue_number(number) do
-      mutate(repo_id, fn view -> delete_in_view(repo_id, view, number, principal) end)
-    end
+    typed(
+      with :ok <- issue_number(number) do
+        mutate(repo_id, fn view -> delete_in_view(repo_id, view, number, principal) end)
+      end
+    )
   end
 
   @doc "Read one current comment."
   @spec get_comment(String.t(), pos_integer(), String.t()) :: result()
   def get_comment(repo_id, number, id) do
-    with :ok <- issue_number(number),
-         :ok <- comment_id(id) do
-      in_repository(repo_id, fn view ->
-        with {:ok, issue} <- live_issue(view.path, number),
-             {:ok, comment} <- find_live_comment(issue, id) do
-          {:ok, %{issue: number, comment: present_comment(comment)}}
-        else
-          {:error, :not_found} -> {:error, "comment #{id} not found on issue ##{number}"}
-          {:error, reason} -> {:error, "could not read comment #{id}: #{inspect(reason)}"}
-        end
-      end)
-    end
+    typed(
+      with :ok <- issue_number(number),
+           :ok <- comment_id(id) do
+        in_repository(repo_id, fn view ->
+          with {:ok, issue} <- live_issue(view.path, number),
+               {:ok, comment} <- find_live_comment(issue, id) do
+            {:ok, %{issue: number, comment: present_comment(comment)}}
+          else
+            {:error, :not_found} ->
+              {:error, ServiceError.not_found("comment #{id} not found on issue ##{number}")}
+
+            {:error, reason} ->
+              {:error, failure("could not read comment #{id}", reason)}
+          end
+        end)
+      end
+    )
   end
 
   @doc "Replace a comment's current body while retaining its immutable history."
   @spec update_comment(String.t(), pos_integer(), String.t(), String.t(), Principal.t()) :: result()
   def update_comment(repo_id, number, id, body, %Principal{} = principal) do
-    with :ok <- issue_number(number),
-         :ok <- comment_id(id),
-         {:ok, body} <- comment_body(body) do
-      mutate(repo_id, fn view -> update_comment_in_view(repo_id, view, number, id, body, principal) end)
-    end
+    typed(
+      with :ok <- issue_number(number),
+           :ok <- comment_id(id),
+           {:ok, body} <- comment_body(body) do
+        mutate(repo_id, fn view -> update_comment_in_view(repo_id, view, number, id, body, principal) end)
+      end
+    )
   end
 
   @doc "Create a comment tombstone while retaining its immutable history."
   @spec delete_comment(String.t(), pos_integer(), String.t(), Principal.t()) :: result()
   def delete_comment(repo_id, number, id, %Principal{} = principal) do
-    with :ok <- issue_number(number),
-         :ok <- comment_id(id) do
-      mutate(repo_id, fn view -> delete_comment_in_view(repo_id, view, number, id, principal) end)
-    end
+    typed(
+      with :ok <- issue_number(number),
+           :ok <- comment_id(id) do
+        mutate(repo_id, fn view -> delete_comment_in_view(repo_id, view, number, id, principal) end)
+      end
+    )
   end
 
   @doc "Read one issue's current projection."
   @spec get(String.t(), pos_integer()) :: result()
   def get(repo_id, number) do
-    with :ok <- issue_number(number) do
-      in_repository(repo_id, fn view ->
-        with {:ok, head} <- issue_head(view.path),
-             true <- is_binary(head),
-             {:ok, issue} <- read_issue(view.path, head, number),
-             :ok <- active_issue(issue) do
-          {:ok, %{issue: present_issue(issue)}}
-        else
-          false -> {:error, "issue ##{number} not found"}
-          {:error, :not_found} -> {:error, "issue ##{number} not found"}
-          {:error, reason} -> {:error, "could not read issue ##{number}: #{inspect(reason)}"}
-        end
-      end)
-    end
+    typed(
+      with :ok <- issue_number(number) do
+        in_repository(repo_id, fn view ->
+          with {:ok, head} <- issue_head(view.path),
+               true <- is_binary(head),
+               {:ok, issue} <- read_issue(view.path, head, number),
+               :ok <- active_issue(issue) do
+            {:ok, %{issue: present_issue(issue)}}
+          else
+            false -> {:error, issue_not_found(number)}
+            {:error, :not_found} -> {:error, issue_not_found(number)}
+            {:error, reason} -> {:error, failure("could not read issue ##{number}", reason)}
+          end
+        end)
+      end
+    )
   end
 
   @doc "List the current issue projection for every issue in a repository."
   @spec list(String.t()) :: result()
   def list(repo_id) do
-    in_repository(repo_id, fn view ->
-      case issue_head(view.path) do
-        {:ok, head} ->
-          issues = if head, do: list_issues(view.path, head), else: []
-          {:ok, %{issues: issues, count: length(issues)}}
+    typed(
+      in_repository(repo_id, fn view ->
+        case issue_head(view.path) do
+          {:ok, head} ->
+            issues = if head, do: list_issues(view.path, head), else: []
+            {:ok, %{issues: issues, count: length(issues)}}
 
-        {:error, reason} ->
-          {:error, "could not list issues: #{inspect(reason)}"}
-      end
-    end)
+          {:error, reason} ->
+            {:error, failure("could not list issues", reason)}
+        end
+      end)
+    )
   end
 
   @doc "Read the immutable events that make up an issue's audit history."
   @spec events(String.t(), pos_integer()) :: result()
   def events(repo_id, number) do
-    with :ok <- issue_number(number) do
-      in_repository(repo_id, fn view ->
-        with {:ok, head} <- issue_head(view.path),
-             true <- is_binary(head),
-             {:ok, events} <- read_events(view.path, head, number) do
-          {:ok, %{issue: number, events: events, count: length(events)}}
-        else
-          false -> {:error, "issue ##{number} not found"}
-          {:error, :not_found} -> {:error, "issue ##{number} not found"}
-          {:error, reason} -> {:error, "could not read issue ##{number}: #{inspect(reason)}"}
-        end
-      end)
-    end
+    typed(
+      with :ok <- issue_number(number) do
+        in_repository(repo_id, fn view ->
+          with {:ok, head} <- issue_head(view.path),
+               true <- is_binary(head),
+               {:ok, events} <- read_events(view.path, head, number) do
+            {:ok, %{issue: number, events: events, count: length(events)}}
+          else
+            false -> {:error, issue_not_found(number)}
+            {:error, :not_found} -> {:error, issue_not_found(number)}
+            {:error, reason} -> {:error, failure("could not read issue ##{number}", reason)}
+          end
+        end)
+      end
+    )
   end
 
   # ----------------------------------------------------------------------
@@ -219,9 +244,9 @@ defmodule Code.Issues do
 
       persist(repo_id, view, head, number, issue, event, nil, principal)
     else
-      false -> {:error, "issue ##{number} not found"}
-      {:error, :not_found} -> {:error, "issue ##{number} not found"}
-      {:error, reason} -> {:error, "could not add a comment to issue ##{number}: #{inspect(reason)}"}
+      false -> {:error, issue_not_found(number)}
+      {:error, :not_found} -> {:error, issue_not_found(number)}
+      {:error, reason} -> {:error, failure("could not add a comment to issue ##{number}", reason)}
     end
   end
 
@@ -249,9 +274,9 @@ defmodule Code.Issues do
 
       persist(repo_id, view, head, number, issue, event, nil, principal)
     else
-      false -> {:error, "issue ##{number} not found"}
-      {:error, :not_found} -> {:error, "issue ##{number} not found"}
-      {:error, reason} -> {:error, "could not update issue ##{number}: #{inspect(reason)}"}
+      false -> {:error, issue_not_found(number)}
+      {:error, :not_found} -> {:error, issue_not_found(number)}
+      {:error, reason} -> {:error, failure("could not update issue ##{number}", reason)}
     end
   end
 
@@ -280,9 +305,9 @@ defmodule Code.Issues do
 
       persist(repo_id, view, head, number, issue, event, nil, principal)
     else
-      false -> {:error, "issue ##{number} not found"}
-      {:error, :not_found} -> {:error, "issue ##{number} not found"}
-      {:error, reason} -> {:error, "could not delete issue ##{number}: #{inspect(reason)}"}
+      false -> {:error, issue_not_found(number)}
+      {:error, :not_found} -> {:error, issue_not_found(number)}
+      {:error, reason} -> {:error, failure("could not delete issue ##{number}", reason)}
     end
   end
 
@@ -308,9 +333,9 @@ defmodule Code.Issues do
 
       persist(repo_id, view, head, number, issue, event, nil, principal)
     else
-      false -> {:error, "issue ##{number} not found"}
-      {:error, :not_found} -> {:error, "comment #{id} not found on issue ##{number}"}
-      {:error, reason} -> {:error, "could not update comment #{id}: #{inspect(reason)}"}
+      false -> {:error, issue_not_found(number)}
+      {:error, :not_found} -> {:error, ServiceError.not_found("comment #{id} not found on issue ##{number}")}
+      {:error, reason} -> {:error, failure("could not update comment #{id}", reason)}
     end
   end
 
@@ -341,9 +366,9 @@ defmodule Code.Issues do
 
       persist(repo_id, view, head, number, issue, event, nil, principal)
     else
-      false -> {:error, "issue ##{number} not found"}
-      {:error, :not_found} -> {:error, "comment #{id} not found on issue ##{number}"}
-      {:error, reason} -> {:error, "could not delete comment #{id}: #{inspect(reason)}"}
+      false -> {:error, issue_not_found(number)}
+      {:error, :not_found} -> {:error, ServiceError.not_found("comment #{id} not found on issue ##{number}")}
+      {:error, reason} -> {:error, failure("could not delete comment #{id}", reason)}
     end
   end
 
@@ -354,7 +379,11 @@ defmodule Code.Issues do
     in_repository(repo_id, fn _view -> retry_mutation(repo_id, build, @write_attempts) end)
   end
 
-  defp retry_mutation(_repo_id, _build, 0), do: {:error, "issue changed concurrently; please retry"}
+  # Losing every optimistic attempt is sustained contention on the private
+  # reference, not a conflict with the caller's request, so it is a temporary
+  # failure the same request can retry.
+  defp retry_mutation(_repo_id, _build, 0),
+    do: {:error, ServiceError.unavailable("issue changed concurrently; please retry")}
 
   defp retry_mutation(repo_id, build, attempts) do
     case Replica.ensure_fresh(repo_id) do
@@ -364,8 +393,11 @@ defmodule Code.Issues do
           result -> result
         end
 
+      {:error, :no_such_repository} ->
+        {:error, ServiceError.not_found("repository #{repo_id} not found")}
+
       {:error, reason} ->
-        {:error, "repository unavailable: #{inspect(reason)}"}
+        {:error, ServiceError.unavailable("repository unavailable: #{inspect(reason)}")}
     end
   end
 
@@ -389,7 +421,7 @@ defmodule Code.Issues do
        }}
     else
       {:error, {:stale, _ref, _expected, _actual}} -> {:retry, :stale}
-      {:error, reason} -> {:error, "could not persist issue: #{inspect(reason)}"}
+      {:error, reason} -> {:error, persist_error(reason)}
     end
   end
 
@@ -517,14 +549,39 @@ defmodule Code.Issues do
   defp in_repository(repo_id, fun) do
     case Replica.via_owner(repo_id, fn ->
            case Replica.ensure_fresh(repo_id) do
-             {:ok, view} -> fun.(view)
-             {:error, :no_such_repository} -> {:error, "repository #{repo_id} not found"}
-             {:error, reason} -> {:error, "repository unavailable: #{inspect(reason)}"}
+             {:ok, view} ->
+               fun.(view)
+
+             {:error, :no_such_repository} ->
+               {:error, ServiceError.not_found("repository #{repo_id} not found")}
+
+             {:error, reason} ->
+               {:error, ServiceError.unavailable("repository unavailable: #{inspect(reason)}")}
            end
          end) do
       {:ok, result} -> result
     end
   end
+
+  defp typed(result), do: ServiceError.normalize(result)
+
+  defp issue_not_found(number), do: ServiceError.not_found("issue ##{number} not found")
+
+  defp failure(_context, %ServiceError{} = error), do: error
+  defp failure(context, reason), do: ServiceError.unavailable("#{context}: #{inspect(reason)}")
+
+  # The write path's rejections that a later identical request may clear are
+  # reported as temporary, with the same wording a Git push would see.
+  defp persist_error(:writer_overloaded),
+    do: ServiceError.unavailable("the repository writer is overloaded; retry shortly")
+
+  defp persist_error(:writer_unavailable),
+    do: ServiceError.unavailable("the repository writer is unavailable; retry shortly")
+
+  defp persist_error(:cas_exhausted),
+    do: ServiceError.unavailable("the repository log is under heavy contention; retry shortly")
+
+  defp persist_error(reason), do: ServiceError.unavailable("could not persist issue: #{inspect(reason)}")
 
   defp ref_command(nil, commit), do: %V1.RefCommand{ref: @ref, old_oid: WAL.Entry.zero_oid(), new_oid: commit}
   defp ref_command(head, commit), do: %V1.RefCommand{ref: @ref, old_oid: head, new_oid: commit}

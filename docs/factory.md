@@ -204,3 +204,20 @@ Events are revision-cursored immutable records. A client can poll events after
 the most recent `next_cursor`, reconstruct the canonical graph state, and link
 attempt evidence to its corresponding work. Streaming logs, sandbox telemetry,
 and a worker reconciler are not implemented yet.
+
+## Errors
+
+Failures are typed, and the HTTP status follows the type rather than the
+message wording:
+
+| Status | When |
+|---|---|
+| `422` | The request is malformed: an invalid graph, identifier, cursor, or profile attribute, or a graph that names an unknown inference profile |
+| `404` | The repository, run, node, attempt, profile, or backend does not exist |
+| `409` | The request conflicts with durable state: the run is no longer active, no node is ready, the node is not running or not awaiting approval, the lease has not expired, the attempt no longer owns its node or belongs to another identity, or `previous_version` is stale |
+| `503` | A temporary failure, with `Retry-After`: object storage failed, or a run changed on every one of its bounded compare-and-swap attempts |
+
+A `409` means the caller should re-read the run before deciding what to do. A
+`503` means the same request may succeed later. The Model Context Protocol
+tools return the same classification in `structuredContent`; see
+[mcp.md](mcp.md#errors).

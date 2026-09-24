@@ -5,6 +5,7 @@ defmodule Code.FactoryTest do
   alias Code.Factory
   alias Code.Factory.InferenceProfile
   alias Code.Factory.SecretBackend
+  alias Code.ServiceError
   alias Code.WAL
   alias Code.WAL.Entry
 
@@ -194,7 +195,7 @@ defmodule Code.FactoryTest do
     namespace: namespace,
     principal: principal
   } do
-    assert {:error, "inference profile contains an unsupported field"} =
+    assert {:error, %ServiceError{kind: :invalid, message: "inference profile contains an unsupported field"}} =
              InferenceProfile.put(
                namespace,
                "unsafe",
@@ -202,7 +203,7 @@ defmodule Code.FactoryTest do
                principal
              )
 
-    assert {:error, "inference profile contains an unsupported field"} =
+    assert {:error, %ServiceError{kind: :invalid, message: "inference profile contains an unsupported field"}} =
              InferenceProfile.put(
                namespace,
                "unsafe-root",
@@ -293,7 +294,8 @@ defmodule Code.FactoryTest do
 
     other = %{principal | subject: "another-worker"}
 
-    assert {:error, "attempt belongs to a different executor identity"} =
+    assert {:error,
+            %ServiceError{kind: :conflict, message: "attempt belongs to a different executor identity"}} =
              Factory.complete(repo, run.id, "work", claimed.attempt["id"], "succeeded", [], other)
 
     assert {:ok, current} = Factory.get(repo, run.id)
@@ -431,17 +433,25 @@ defmodule Code.FactoryTest do
       ]
     }
 
-    assert {:error, "work graph must not contain a cycle"} =
+    assert {:error, %ServiceError{kind: :invalid, message: "work graph must not contain a cycle"}} =
              Factory.create(repo, cycle, %{base_commit: base_commit()}, principal)
 
     assert {:ok, run} = Factory.create(repo, one_node_graph(), %{base_commit: base_commit()}, principal)
-    assert {:error, "work attempt id is invalid"} = Factory.attempt(repo, run.id, "../../state")
-    assert {:error, "after must be a non-negative integer"} = Factory.events(repo, run.id, "not-a-cursor")
 
-    assert {:error, "issue must be a positive integer"} =
+    assert {:error, %ServiceError{kind: :invalid, message: "work attempt id is invalid"}} =
+             Factory.attempt(repo, run.id, "../../state")
+
+    assert {:error, %ServiceError{kind: :invalid, message: "after must be a non-negative integer"}} =
+             Factory.events(repo, run.id, "not-a-cursor")
+
+    assert {:error, %ServiceError{kind: :invalid, message: "issue must be a positive integer"}} =
              Factory.create(repo, one_node_graph(), %{base_commit: base_commit(), issue: 0}, principal)
 
-    assert {:error, "base_commit is not the current head of a public reference"} =
+    assert {:error,
+            %ServiceError{
+              kind: :invalid,
+              message: "base_commit is not the current head of a public reference"
+            }} =
              Factory.create(repo, one_node_graph(), %{base_commit: String.duplicate("b", 40)}, principal)
   end
 

@@ -14,6 +14,7 @@ defmodule Code.Factory.InferenceProfile do
   alias Code.Factory.SecretBackend
   alias Code.Factory.Shared
   alias Code.Factory.VersionedConfig
+  alias Code.ServiceError
 
   @config %VersionedConfig{
     kind: "inference profile",
@@ -24,7 +25,7 @@ defmodule Code.Factory.InferenceProfile do
     content_type: "application/vnd.code.factory.inference-profile.v2+json"
   }
 
-  @type result :: {:ok, map()} | {:error, String.t()}
+  @type result :: {:ok, map()} | {:error, ServiceError.t()}
 
   @doc "Create or replace an account profile with a new immutable version."
   @spec put(String.t(), String.t(), map(), Principal.t()) :: result()
@@ -33,7 +34,7 @@ defmodule Code.Factory.InferenceProfile do
   end
 
   def put(_account, _name, _attrs, _principal),
-    do: {:error, "profile update requires an authenticated principal"}
+    do: {:error, ServiceError.invalid("profile update requires an authenticated principal")}
 
   @doc "Read the current version of one account profile."
   @spec get(String.t(), String.t()) :: result()
