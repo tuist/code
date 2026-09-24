@@ -89,7 +89,7 @@ defmodule Code.Auth.OIDC do
 
   defp verify_claims(claims, config) do
     now = System.system_time(:second)
-    leeway = Keyword.get(config, :leeway_seconds, 60)
+    leeway = leeway(config)
 
     with :ok <- check_time(claims, now, leeway),
          :ok <- check_issuer(claims, config) do
@@ -176,13 +176,30 @@ defmodule Code.Auth.OIDC do
       account: account_for(subject, claims, config),
       grants: grants_for(subject, claims, config),
       claims: claims,
-      expires_at: expires_at(claims),
+      expires_at: expires_at(claims, config),
       source: :oidc
     }
   end
 
-  defp expires_at(%{"exp" => exp}) when is_number(exp), do: DateTime.from_unix!(trunc(exp))
-  defp expires_at(_claims), do: nil
+  # The principal's expiry is the last moment the token is accepted, leeway
+  # included. `Code.Auth.authenticate/1` re-checks expiry against this value,
+  # so recording the bare `exp` would silently cancel the leeway the claim
+  # check just granted: a token inside the skew window would pass here and be
+  # rejected one call later.
+  defp expires_at(%{"exp" => exp}, config) when is_number(exp) do
+    case DateTime.from_unix(trunc(exp) + leeway(config)) do
+      {:ok, at} -> at
+      # Beyond what a DateTime can represent, and already accepted by the
+      # claim check; the end of representable time is the honest answer.
+      {:error, _} -> ~U[9999-12-31 23:59:59Z]
+    end
+  end
+
+  defp expires_at(_claims, _config), do: nil
+
+  @default_leeway_seconds 60
+
+  defp leeway(config), do: Keyword.get(config, :leeway_seconds, @default_leeway_seconds)
 
   defp account_for(subject, claims, config) do
     case Keyword.get(config, :account_claim) do
