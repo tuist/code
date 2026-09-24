@@ -71,7 +71,9 @@ These are all things that have already cost someone a day.
 - **MuonTrap only for output-free commands.** Capturing output through MuonTrap
   kills the calling process with `:epipe` on Linux, reproducibly. `Code.Git`
   uses it for `repack` and nothing else; everything that reads output goes
-  through `System.cmd` inside `isolated/2`, and streaming goes through a raw Port.
+  through `Git.run/3`, a raw Port inside `isolated/2` that enforces the
+  command's timeout and dies with its caller, and streaming goes through a raw
+  Port too.
 - **Never hand-edit `*.pb.ex`.** Edit `priv/proto/**` and run `mise run proto`.
 - **Helm values that are numbers need `int64`.** A bare large integer renders as
   `2.68435456e+08` in the manifest and Kubernetes rejects it.

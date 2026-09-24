@@ -179,6 +179,10 @@ defmodule Code.RepositoryDeletionTest do
 
     assert {:ok, _, _} = ObjectStore.get(WAL.index_key(repo))
 
+    # Listing does not offer a repository that every read would refuse.
+    assert {:ok, listed} = WAL.list_repositories()
+    refute repo in listed
+
     Mimic.stub(ObjectStore, :delete, fn key -> Mimic.call_original(ObjectStore, :delete, [key]) end)
 
     assert :ok = Control.delete_repository(repo)

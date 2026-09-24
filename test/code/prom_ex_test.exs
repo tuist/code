@@ -21,9 +21,15 @@ defmodule Code.PromExTest do
   @expected ~w(
     code_auth_denied_count
     code_auth_rejected_count
+    code_cluster_observed_disk_used_bytes
+    code_cluster_observed_resident
+    code_cluster_observed_size
+    code_factory_operation_count
+    code_factory_operation_duration
     code_git_aborted_count
     code_git_command_count
     code_git_command_duration
+    code_git_pack_index_count
     code_git_requests_in_flight
     code_git_served_bytes
     code_git_served_duration
@@ -31,11 +37,6 @@ defmodule Code.PromExTest do
     code_http_request_bytes
     code_http_request_count
     code_http_request_duration_seconds
-    code_cluster_observed_disk_used_bytes
-    code_cluster_observed_resident
-    code_cluster_observed_size
-    code_factory_operation_count
-    code_factory_operation_duration
     code_maintenance_job_count
     code_maintenance_job_duration
     code_mcp_request_count
@@ -43,10 +44,16 @@ defmodule Code.PromExTest do
     code_object_store_request_count
     code_object_store_request_duration_seconds
     code_policy_revalidation_failed_count
+    code_push_closure_check_duration
     code_push_committed_count
     code_push_committed_duration
+    code_push_local_apply_failed_count
     code_push_rejected_count
     code_replica_evict_count
+    code_replica_evict_deferred_count
+    code_replica_prune_deferred_packs
+    code_replica_prune_packs
+    code_replica_rematerialize_count
     code_replica_sync_duration
     code_replica_sync_entries_behind
     code_replica_sync_packs_downloaded

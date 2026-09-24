@@ -267,12 +267,18 @@ replicas are doing real catch-up work on the read path, and latency will follow.
 | `code_replica_sync_entries_behind` | How far behind is this node? Persistent non-zero means hints are not arriving, or the store is slow |
 | `code_replica_sync_duration`, `code_replica_sync_packs_downloaded` | Time (seconds) and packs needed to bring a replica into agreement with the log |
 | `code_replica_evict_count` | Cache churn. High values with high sync duration means the working set does not fit |
+| `code_replica_evict_deferred_count` | Evictions postponed because a clone or push still held the repository. They are retried on the reaper's next pass |
+| `code_replica_rematerialize_count` | Replicas rebuilt from the log because their local copy disappeared. Expected after someone clears the cache; otherwise, look for what is deleting it |
+| `code_replica_prune_packs`, `code_replica_prune_deferred_packs` | Superseded packfiles removed from local disk, and those kept for now because the repository was in use |
+| `code_git_pack_index_count{outcome}` | Pack indexes installed; `reused` means the downloaded index was verified and kept; `rebuilt` (none was downloaded) and `rebuilt_invalid` (it did not match the pack) mean `index-pack` had to run |
 | `code_git_requests_in_flight` | Should we scale? See below |
 | `code_git_served_duration{service}`, `code_git_served_bytes{service}` | How long Git protocol requests take (seconds), and how much they send |
 | `code_git_aborted_count{service}` | Clients disconnecting mid-clone |
 | `code_git_command_duration{subcommand,outcome}`, `code_git_command_count{subcommand,outcome}` | Are git plumbing commands slow or failing? `outcome` is `ok`, `error` or `timeout` |
 | `code_push_committed_duration`, `code_push_committed_count` | Time (seconds) from receiving a push to it being durable, and how many landed |
-| `code_push_rejected_count{reason}` | `non_fast_forward` is users; `storage`, `contention` and `overloaded` are yours. `incomplete_push` is a push naming objects it neither carried nor could rely on the log for; `deleted` is a write to a repository being deleted |
+| `code_push_rejected_count{reason}` | `non_fast_forward` is users; `storage`, `contention`, `overloaded` and `timeout` are yours (`timeout` pushes may still have committed). `incomplete_push` is a push naming objects it neither carried nor could rely on the log for; `deleted` is a write to a repository being deleted |
+| `code_push_closure_check_duration{outcome}` | Time spent proving a push carries every object its new refs need. `incomplete` is a push that was refused for it |
+| `code_push_local_apply_failed_count` | Committed pushes this node could not apply to its own cache. The push is durable; the next sync repairs the cache |
 | `code_writer_fallback_count{reason}` | Pushes committed locally because the preferred writer was unreachable. Expected during a rolling deploy; sustained outside one, routing is not taking effect |
 | `code_writer_timeout_count` | Pushes that gave up waiting for the repository writer. Their entries may still have committed |
 | `code_maintenance_job_duration{kind,outcome}`, `code_maintenance_job_count{kind,outcome}` | Is maintenance keeping up, and is any of it failing? Counts every job, including unattended ones; `outcome` is `ok`, `not_due`, `error` or `crashed` |

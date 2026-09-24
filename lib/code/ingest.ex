@@ -474,6 +474,7 @@ defmodule Code.Ingest do
   end
 
   defp classify(:writer_overloaded), do: :overloaded
+  defp classify(:writer_timeout), do: :timeout
   defp classify({:invalid_ref, _}), do: :invalid_ref
   defp classify({:reserved_ref, _}), do: :invalid_ref
   defp classify({:pack_failed, _}), do: :storage
@@ -518,6 +519,14 @@ defmodule Code.Ingest do
 
   defp message(:writer_overloaded) do
     "code: too many pushes are queued for this repository; please retry"
+  end
+
+  # Unlike the other rejections this one is not a refusal: the batch may
+  # still commit after the caller stopped waiting, so "rejected" would be a
+  # lie that invites a blind retry.
+  defp message(:writer_timeout) do
+    "code: timed out waiting for this push to become durable; it may still land. " <>
+      "Fetch to see whether it did before pushing again"
   end
 
   defp message(:cas_exhausted) do

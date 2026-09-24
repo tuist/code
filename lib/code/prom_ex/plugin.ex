@@ -203,6 +203,34 @@ defmodule Code.PromEx.Plugin do
         [:code, :replica, :evict, :count],
         event_name: [:code, :replica, :evict],
         description: "Repositories evicted from local disk."
+      ),
+      counter(
+        [:code, :replica, :evict_deferred, :count],
+        event_name: [:code, :replica, :evict_deferred],
+        description: "Evictions postponed because a clone or push still held the repository."
+      ),
+      counter(
+        [:code, :replica, :rematerialize, :count],
+        event_name: [:code, :replica, :rematerialize],
+        description: "Replicas rebuilt from the log because their local copy had gone missing."
+      ),
+      sum(
+        [:code, :replica, :prune, :packs],
+        event_name: [:code, :replica, :prune],
+        measurement: :packs,
+        description: "Superseded packfiles removed from local disk."
+      ),
+      sum(
+        [:code, :replica, :prune_deferred, :packs],
+        event_name: [:code, :replica, :prune_deferred],
+        measurement: :packs,
+        description: "Superseded packfiles kept because the repository was in use."
+      ),
+      counter(
+        [:code, :git, :pack_index, :count],
+        event_name: [:code, :git, :pack_index],
+        description: "Pack indexes installed, by whether the downloaded index was reused or rebuilt.",
+        tags: [:outcome]
       )
     ])
   end
@@ -227,6 +255,21 @@ defmodule Code.PromEx.Plugin do
         event_name: [:code, :push, :rejected],
         description: "Pushes rejected, by reason.",
         tags: [:reason]
+      ),
+      distribution(
+        [:code, :push, :closure_check, :duration],
+        event_name: [:code, :push, :closure_check],
+        measurement: :duration_us,
+        description: "Time spent proving a push carries every object its new refs need.",
+        unit: {:microsecond, :second},
+        tags: [:outcome],
+        reporter_options: [buckets: [0.005, 0.025, 0.1, 0.5, 1, 5, 30]]
+      ),
+      counter(
+        [:code, :push, :local_apply_failed, :count],
+        event_name: [:code, :push, :local_apply_failed],
+        description:
+          "Committed pushes this node could not apply to its local cache; the next sync repairs it."
       ),
       counter(
         [:code, :writer, :fallback, :count],

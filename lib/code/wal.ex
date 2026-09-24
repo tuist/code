@@ -775,13 +775,18 @@ defmodule Code.WAL do
 
     result =
       with {:ok, index} <- tombstone(repo_id),
+           :ok <- mark_deleting(repo_id),
            {:ok, owned} <- owned_keys(repo_id, index),
            {:ok, extra} <- extra_keys.() do
         keys = Enum.uniq(owned ++ extra)
         failed = delete_keys(keys)
 
+        # The marker goes before the index: an orphaned marker with no index
+        # next to it would hide a repository later created under the same id.
         if failed == [] do
-          with :ok <- ObjectStore.delete(index_key(repo_id)), do: {:ok, length(keys)}
+          with :ok <- ObjectStore.delete(deleting_key(repo_id)),
+               :ok <- ObjectStore.delete(index_key(repo_id)),
+               do: {:ok, length(keys)}
         else
           Logger.error("repository deletion left objects behind",
             repo_id: repo_id,
@@ -813,6 +818,22 @@ defmodule Code.WAL do
       error -> error
     end
   end
+
+  # A listing hint, not state: the tombstone in the index is what refuses
+  # writes and reads. The marker sits beside `index.pb` so the repository walk,
+  # which already sees every key at that level, can leave a repository whose
+  # deletion is in progress (or stopped at partial cleanup) out of the list
+  # without reading its index.
+  defp mark_deleting(repo_id) do
+    case ObjectStore.put(deleting_key(repo_id), "", content_type: "application/octet-stream") do
+      {:ok, _etag} -> :ok
+      error -> error
+    end
+  end
+
+  @doc false
+  @spec deleting_key(repo_id()) :: String.t()
+  def deleting_key(repo_id), do: "repos/#{repo_id}/deleting"
 
   defp deleted_count({:ok, count}), do: count
   defp deleted_count(_), do: 0
@@ -892,7 +913,8 @@ defmodule Code.WAL do
     with {:ok, %{keys: keys, prefixes: children}} <- ObjectStore.list_prefixes(prefix) do
       index = prefix <> "index.pb"
       repository? = Enum.any?(keys, &(&1.key == index))
-      acc = if repository?, do: [repository_id(prefix) | acc], else: acc
+      deleting? = Enum.any?(keys, &(&1.key == prefix <> "deleting"))
+      acc = if repository? and not deleting?, do: [repository_id(prefix) | acc], else: acc
 
       Enum.reduce_while(children, {:ok, acc}, fn child, {:ok, acc} ->
         result =
