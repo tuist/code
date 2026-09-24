@@ -151,7 +151,7 @@ credentials for other hosts:
 ./scripts/configure-code-git --url https://git.example.com
 ```
 
-The script defaults to `https://code.dev`, downloads metadata only over
+`--url` is required. The script downloads metadata only over
 HTTPS without redirects, validates its strict `key=value` document, and writes
 Git configuration scoped to that exact origin. It neither receives nor stores a
 token. For a release

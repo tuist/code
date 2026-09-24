@@ -7,12 +7,14 @@
 
 set -euo pipefail
 
-origin="https://code.dev"
+# No default: there is no canonical deployment, and guessing one would point
+# Git credentials at a host the caller never chose.
+origin=""
 dynamic_registration=false
 
 usage() {
   cat <<'EOF'
-Usage: configure-code-git [--url https://git.example.com] [--dynamic-registration]
+Usage: configure-code-git --url https://git.example.com [--dynamic-registration]
 
 Configures Git Credential Manager for browser login to one Code deployment.
 The deployment must publish /.well-known/code-git-auth.
@@ -44,6 +46,8 @@ while (($#)); do
       ;;
   esac
 done
+
+[ -n "$origin" ] || { echo "--url is required" >&2; usage >&2; exit 2; }
 
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
 command -v git >/dev/null || { echo "Git is required" >&2; exit 1; }

@@ -113,4 +113,10 @@ username=oauth2'
     The stderr should include 'requires --dynamic-registration'
   End
 
+  It 'refuses to guess a deployment when --url is missing'
+    When run script "${SHELLSPEC_PROJECT_ROOT}/scripts/configure-code-git"
+    The status should equal 2
+    The stderr should include '--url is required'
+    The output should equal ''
+  End
 End
