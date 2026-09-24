@@ -71,6 +71,20 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- $preStop := .Values.shutdown.preStopSleepSeconds | int64 }}
+          {{- $drain := div (.Values.shutdown.shutdownTimeoutMs | int64) 1000 }}
+          {{- if gt (add $preStop $drain 5) (.Values.terminationGracePeriodSeconds | int64) }}
+          {{- fail "shutdown.preStopSleepSeconds + shutdown.shutdownTimeoutMs/1000 + 5 must not exceed terminationGracePeriodSeconds, or in-flight requests are cut off by SIGKILL" }}
+          {{- end }}
+          {{- if gt $preStop 0 }}
+          # Keep serving while the pod is removed from Service endpoints, so
+          # requests routed to it in the meantime are not refused. SIGTERM, and
+          # the listeners' drain, follow once this returns.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", {{ $preStop | quote }}]
+          {{- end }}
           ports:
             - name: git
               containerPort: 4000
@@ -132,6 +146,10 @@ spec:
               value: {{ .Values.config.stalenessBudgetMs | int64 | quote }}
             - name: CODE_POLICY_STALENESS_BUDGET_MS
               value: {{ .Values.config.policyStalenessBudgetMs | int64 | quote }}
+            - name: CODE_POLICY_MAX_STALE_MS
+              value: {{ .Values.config.policyMaxStaleMs | int64 | quote }}
+            - name: CODE_SHUTDOWN_TIMEOUT_MS
+              value: {{ .Values.shutdown.shutdownTimeoutMs | int64 | quote }}
             - name: CODE_COMPACTION_ENTRY_THRESHOLD
               value: {{ .Values.config.compactionEntryThreshold | int64 | quote }}
             - name: CODE_COMPACTION_BYTES_THRESHOLD
