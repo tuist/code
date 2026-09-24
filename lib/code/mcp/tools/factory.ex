@@ -72,7 +72,13 @@ defmodule Code.MCP.Tools.Factory do
           properties: %{
             repository: Support.repository_property(),
             run: %{type: "string"},
-            executor: %{type: "string"}
+            executor: %{type: "string"},
+            idempotency_key: %{
+              type: "string",
+              description:
+                "Optional key for this claim. Repeating the call with the same key returns the attempt it " <>
+                  "already claimed instead of claiming another node."
+            }
           }
         }
       },
@@ -180,7 +186,10 @@ defmodule Code.MCP.Tools.Factory do
     repo_id = args["repository"]
 
     with :ok <- Support.authorize(principal, repo_id, :execute),
-         do: Factory.claim(repo_id, args["run"], args["executor"], principal)
+         do:
+           Factory.claim(repo_id, args["run"], args["executor"], principal,
+             idempotency_key: args["idempotency_key"]
+           )
   end
 
   def call("complete_work_attempt", args, principal, _opts) do

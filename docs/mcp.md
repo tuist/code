@@ -147,7 +147,7 @@ authorization details.
 |---|---|
 | `create_work_run`, `list_work_runs`, `get_work_run` | Create and inspect a durable graph of work |
 | `work_run_events` | Immutable, revision-cursored work-run events |
-| `claim_work_node`, `complete_work_attempt` | Pull one ready node and conditionally accept its evidence |
+| `claim_work_node`, `complete_work_attempt` | Pull one ready node (replay-safe with an `idempotency_key`) and conditionally accept its evidence |
 | `approve_work_node`, `cancel_work_run`, `expire_work_node` | Control an approval, terminal state, or stale lease |
 | `get_work_attempt` | Claim and result evidence for one attempt |
 | `configure_secret_backend`, `list_secret_backends`, `get_secret_backend` | Manage non-secret account bindings to the deployment-managed Infisical service |

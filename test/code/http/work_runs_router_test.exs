@@ -261,7 +261,34 @@ defmodule Code.HTTP.WorkRunsRouterTest do
     assert %{"status" => "succeeded"} = JSON.decode!(approved.resp_body)
   end
 
-  defp request(method, path, payload, token) do
+  test "replays a claim sent again with the same Idempotency-Key", %{
+    repo: repo,
+    writer: writer,
+    executor: executor,
+    base_commit: base_commit
+  } do
+    graph = %{"nodes" => [%{"id" => "a", "title" => "A"}, %{"id" => "b", "title" => "B"}]}
+
+    created =
+      request(:post, "/api/work-runs?repository=#{repo}", %{graph: graph, base_commit: base_commit}, writer)
+
+    assert %{"id" => run_id} = JSON.decode!(created.resp_body)
+    path = "/api/work-runs/#{run_id}/claim?repository=#{repo}"
+
+    first = request(:post, path, %{executor: "pod"}, executor, [{"idempotency-key", "worker-7:claim-1"}])
+    again = request(:post, path, %{executor: "pod"}, executor, [{"idempotency-key", "worker-7:claim-1"}])
+    body_key = request(:post, path, %{executor: "pod", idempotency_key: "worker-7:claim-1"}, executor)
+
+    assert [200, 200, 200] == Enum.map([first, again, body_key], & &1.status)
+    attempt_ids = Enum.map([first, again, body_key], &JSON.decode!(&1.resp_body)["attempt"]["id"])
+    assert attempt_ids |> Enum.uniq() |> length() == 1
+    assert %{"replayed" => true} = JSON.decode!(again.resp_body)
+
+    malformed = request(:post, path, %{executor: "pod"}, executor, [{"idempotency-key", "has space"}])
+    assert malformed.status == 422
+  end
+
+  defp request(method, path, payload, token, headers \\ []) do
     conn = conn(method, path, if(payload, do: JSON.encode!(payload), else: ""))
 
     conn =
@@ -272,6 +299,7 @@ defmodule Code.HTTP.WorkRunsRouterTest do
       end
 
     conn = if token, do: put_req_header(conn, "authorization", "Bearer #{token}"), else: conn
+    conn = Enum.reduce(headers, conn, fn {name, value}, conn -> put_req_header(conn, name, value) end)
     Router.call(conn, Router.init([]))
   end
 end

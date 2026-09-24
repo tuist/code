@@ -229,6 +229,20 @@ original accepted or rejected disposition, and the stored result record
 (including its original `recorded_at_ms` and `recorded_by`), without adding
 another event.
 
+Claims can be made replay-safe too. A worker may send an idempotency key with a
+claim: `idempotency_key` in the request body or the `Idempotency-Key` header
+over HTTP, or the `idempotency_key` argument of `claim_work_node`. A key is 1 to
+128 characters of `[A-Za-z0-9._:-]`, starting with a letter or digit. Code
+records the key, the attempt it produced, the executor, and the claiming
+principal in `state.json`, in the same conditional write that makes the claim
+canonical. Repeating the claim with the same key, for example after a lost
+response or a timeout, returns that same attempt, marked `"replayed": true`,
+instead of claiming another node, and adds no event. This holds even after the
+run has become terminal. Keys are scoped to one run. Reusing a key from a
+different principal or with a different executor is a `409` conflict. Without
+a key, a retried claim may claim a second node, and the first attempt is then
+recovered only through lease expiry.
+
 The [Model Context Protocol](https://modelcontextprotocol.io/) exposes the same
 contract through `create_work_run`, `list_work_runs`, `get_work_run`,
 `work_run_events`, `claim_work_node`, `complete_work_attempt`,

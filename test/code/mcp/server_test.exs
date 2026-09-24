@@ -615,6 +615,51 @@ defmodule Code.MCP.ServerTest do
                "attempt_succeeded"
              ]
     end
+
+    test "claim_work_node replays a claim repeated with the same idempotency key", %{opts: opts, repo: repo} do
+      run_id = create_mcp_run(opts, repo, [%{"id" => "a", "title" => "A"}, %{"id" => "b", "title" => "B"}])
+      args = %{"repository" => repo, "run" => run_id, "executor" => "pod", "idempotency_key" => "mcp-claim-1"}
+
+      first = call_tool("claim_work_node", args, opts)
+      again = call_tool("claim_work_node", args, opts)
+
+      refute first[:isError], inspect(first)
+      refute again[:isError], inspect(again)
+      assert again.structuredContent.attempt == first.structuredContent.attempt
+      assert again.structuredContent.replayed
+    end
+  end
+
+  # Seeds a real commit, because a replica must be able to materialize `main`,
+  # and creates a run over it through the tool surface.
+  defp create_mcp_run(opts, repo, nodes) do
+    seeded =
+      call_tool(
+        "commit",
+        %{
+          "repository" => repo,
+          "branch" => "main",
+          "message" => "feat: seed factory work",
+          "changes" => [%{"path" => "README.md", "content" => "# factory fixture\n"}]
+        },
+        opts
+      )
+
+    refute seeded[:isError], inspect(seeded)
+
+    created =
+      call_tool(
+        "create_work_run",
+        %{
+          "repository" => repo,
+          "base_commit" => seeded.structuredContent.commit,
+          "graph" => %{"nodes" => nodes}
+        },
+        opts
+      )
+
+    refute created[:isError], inspect(created)
+    created.structuredContent.id
   end
 
   describe "reading" do

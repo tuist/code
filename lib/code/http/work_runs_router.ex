@@ -44,7 +44,9 @@ defmodule Code.HTTP.WorkRunsRouter do
 
   post "/:run/claim" do
     with_run(conn, run, :execute, fn repo_id, principal ->
-      Factory.claim(repo_id, run, conn.body_params["executor"], principal)
+      Factory.claim(repo_id, run, conn.body_params["executor"], principal,
+        idempotency_key: idempotency_key(conn)
+      )
     end)
   end
 
@@ -108,6 +110,14 @@ defmodule Code.HTTP.WorkRunsRouter do
     case conn.query_params["repository"] do
       repo_id when is_binary(repo_id) and byte_size(repo_id) > 0 -> {:ok, repo_id, conn}
       _ -> {:error, error(conn, 422, "repository query parameter is required")}
+    end
+  end
+
+  # The conventional `Idempotency-Key` header, or the same value in the body.
+  defp idempotency_key(conn) do
+    case get_req_header(conn, "idempotency-key") do
+      [key | _] -> key
+      [] -> conn.body_params["idempotency_key"]
     end
   end
 

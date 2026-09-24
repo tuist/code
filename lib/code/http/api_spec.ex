@@ -525,7 +525,15 @@ defmodule Code.HTTP.ApiSpec do
     %Schema{
       type: :object,
       required: [:executor],
-      properties: %{executor: %Schema{type: :string, minLength: 1}}
+      properties: %{
+        executor: %Schema{type: :string, minLength: 1},
+        idempotency_key: %Schema{
+          type: :string,
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+          description:
+            "Optional; may also be sent as the Idempotency-Key header. Repeating a claim with the same key returns the attempt it already claimed."
+        }
+      }
     }
   end
 

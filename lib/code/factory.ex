@@ -132,18 +132,35 @@ defmodule Code.Factory do
     end
   end
 
-  @doc "Claim one ready non-approval node. A lost race is retried from storage."
-  @spec claim(String.t(), String.t(), String.t(), Principal.t()) :: result()
-  def claim(repo_id, run_id, executor, principal) do
-    observe(:claim, fn -> do_claim(repo_id, run_id, executor, principal) end)
+  @doc """
+  Claim one ready non-approval node. A lost race is retried from storage.
+
+  ## Options
+
+    * `:idempotency_key` - a caller-chosen key for this claim request. The key
+      is recorded in the run's authoritative state together with the attempt
+      it produced, so repeating the request with the same key (after a lost
+      response, a timeout, or a crashed worker) returns that same attempt
+      instead of claiming a second node. A key is scoped to its run and to
+      the principal that first used it; reusing it from another principal, or
+      with a different executor, is a conflict.
+  """
+  @spec claim(String.t(), String.t(), String.t(), Principal.t(), keyword()) :: result()
+  def claim(repo_id, run_id, executor, principal, opts \\ []) do
+    observe(:claim, fn ->
+      do_claim(repo_id, run_id, executor, principal, Keyword.get(opts, :idempotency_key))
+    end)
   end
 
-  defp do_claim(repo_id, run_id, executor, %Principal{} = principal)
+  defp do_claim(repo_id, run_id, executor, %Principal{} = principal, key)
        when is_binary(executor) and executor != "" do
-    transition(repo_id, run_id, &claim_update(repo_id, run_id, executor, principal, &1, &2))
+    with :ok <- idempotency_key(key) do
+      transition(repo_id, run_id, &claim_update(repo_id, run_id, executor, principal, key, &1, &2))
+    end
   end
 
-  defp do_claim(_repo_id, _run_id, _executor, _principal), do: {:error, "executor must be a non-empty string"}
+  defp do_claim(_repo_id, _run_id, _executor, _principal, _key),
+    do: {:error, "executor must be a non-empty string"}
 
   @doc "Record an attempt result and conditionally make it the node's accepted result."
   @spec complete(String.t(), String.t(), String.t(), String.t(), String.t(), [map()], Principal.t()) ::
@@ -319,7 +336,51 @@ defmodule Code.Factory do
 
   # ----------------------------------------------------------------------
 
-  defp claim_update(repo_id, run_id, executor, principal, manifest, state) do
+  # A keyed claim first looks for the attempt its key already produced. The
+  # lookup happens before the run's status is checked: a claim that succeeded
+  # before the run ended is still the answer to that request.
+  defp claim_update(repo_id, run_id, executor, principal, key, manifest, state) do
+    case get_in(state, ["claim_keys", key]) do
+      nil -> new_claim(repo_id, run_id, executor, principal, key, manifest, state)
+      recorded -> replay_claim(repo_id, run_id, executor, principal, recorded, manifest)
+    end
+  end
+
+  defp replay_claim(repo_id, run_id, executor, principal, recorded, manifest) do
+    with :ok <- same_claimant(recorded, executor, principal),
+         {:ok, claim} <- read_json(claim_key(repo_id, run_id, recorded["attempt_id"])),
+         {:ok, work} <- work(repo_id, manifest, graph_node(manifest, claim["node"])) do
+      {:already,
+       %{
+         attempt: claim,
+         attempt_id: claim["id"],
+         lease_duration_ms: manifest["lease_duration_ms"],
+         work: work,
+         replayed: true
+       }}
+    else
+      {:error, :not_found} ->
+        {:error, ServiceError.unavailable("claimed attempt #{recorded["attempt_id"]} is missing")}
+
+      error ->
+        error
+    end
+  end
+
+  defp same_claimant(recorded, executor, principal) do
+    cond do
+      recorded["claimed_by"] != actor(principal) ->
+        {:error, ServiceError.conflict("idempotency key was already used by a different principal")}
+
+      recorded["executor"] != executor ->
+        {:error, ServiceError.conflict("idempotency key was already used with a different executor")}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp new_claim(repo_id, run_id, executor, principal, key, manifest, state) do
     with :ok <- active(state),
          {:ok, node_id, node} <- ready_node(state),
          definition = graph_node(manifest, node_id),
@@ -328,17 +389,19 @@ defmodule Code.Factory do
       number = node["attempts"] + 1
       claimed_at_ms = now()
 
-      claim = %{
-        "version" => 1,
-        "id" => attempt_id,
-        "run_id" => run_id,
-        "node" => node_id,
-        "number" => number,
-        "executor" => executor,
-        "claimed_by" => actor(principal),
-        "claimed_at_ms" => claimed_at_ms,
-        "lease_expires_at_ms" => claimed_at_ms + manifest["lease_duration_ms"]
-      }
+      claim =
+        %{
+          "version" => 1,
+          "id" => attempt_id,
+          "run_id" => run_id,
+          "node" => node_id,
+          "number" => number,
+          "executor" => executor,
+          "claimed_by" => actor(principal),
+          "claimed_at_ms" => claimed_at_ms,
+          "lease_expires_at_ms" => claimed_at_ms + manifest["lease_duration_ms"]
+        }
+        |> maybe_put("idempotency_key", key)
 
       case put_immutable(claim_key(repo_id, run_id, attempt_id), claim) do
         {:ok, _etag} ->
@@ -350,7 +413,10 @@ defmodule Code.Factory do
             |> Map.put("executor", executor)
             |> Map.put("claimed_by", actor(principal))
 
-          updated = put_node(state, node_id, updated_node)
+          updated =
+            state
+            |> put_node(node_id, updated_node)
+            |> record_claim_key(key, attempt_id, executor, principal)
 
           {:ok, updated,
            {"node_claimed", actor(principal),
@@ -813,6 +879,17 @@ defmodule Code.Factory do
   end
 
   defp put_node(state, node_id, node), do: put_in(state, ["nodes", node_id], node)
+
+  # Recorded in `state.json`, the run's only authoritative mutable object, in
+  # the same conditional write that makes the claim canonical. A claim object
+  # alone proves nothing: a losing writer may have left it behind.
+  defp record_claim_key(state, nil, _attempt_id, _executor, _principal), do: state
+
+  defp record_claim_key(state, key, attempt_id, executor, principal) do
+    entry = %{"attempt_id" => attempt_id, "executor" => executor, "claimed_by" => actor(principal)}
+    Map.update(state, "claim_keys", %{key => entry}, &Map.put(&1, key, entry))
+  end
+
   defp attempt_ids(node, key), do: Map.get(node, key, [])
 
   defp append_attempt(node, key, attempt_id),
@@ -895,6 +972,14 @@ defmodule Code.Factory do
   defp issue(nil), do: {:ok, nil}
   defp issue(number) when is_integer(number) and number > 0, do: {:ok, number}
   defp issue(_), do: {:error, "issue must be a positive integer"}
+
+  defp idempotency_key(nil), do: :ok
+
+  defp idempotency_key(key) do
+    if is_binary(key) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/, key),
+      do: :ok,
+      else: {:error, "idempotency_key must be 1 to 128 characters of [A-Za-z0-9._:-], starting alphanumeric"}
+  end
 
   defp lease_duration(nil), do: {:ok, @default_lease_duration_ms}
   defp lease_duration(ms) when is_integer(ms) and ms in 1_000..86_400_000, do: {:ok, ms}

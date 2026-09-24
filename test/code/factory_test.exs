@@ -353,6 +353,101 @@ defmodule Code.FactoryTest do
     assert Enum.count(events, &(&1["type"] == "node_claimed")) == 1
   end
 
+  describe "idempotent claims" do
+    setup %{repo: repo, principal: principal} do
+      graph = %{"nodes" => [%{"id" => "first", "title" => "First"}, %{"id" => "second", "title" => "Second"}]}
+      assert {:ok, run} = Factory.create(repo, graph, %{base_commit: base_commit()}, principal)
+      {:ok, run: run}
+    end
+
+    test "a repeated claim with the same key returns the same attempt", %{
+      repo: repo,
+      run: run,
+      principal: principal
+    } do
+      assert {:ok, first} = Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "claim-1")
+      refute Map.get(first, :replayed)
+
+      # The response was lost; the worker retries with the same key. Another
+      # node is still ready, so a non-idempotent retry would claim it.
+      assert {:ok, again} = Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "claim-1")
+      assert again.replayed
+      assert again.attempt == first.attempt
+      assert again.work == first.work
+      assert first.attempt["idempotency_key"] == "claim-1"
+
+      assert {:ok, current} = Factory.get(repo, run.id)
+      assert Enum.map(current.nodes, & &1["status"]) == ["running", "ready"]
+
+      assert {:ok, %{events: events}} = Factory.events(repo, run.id)
+      assert Enum.count(events, &(&1["type"] == "node_claimed")) == 1
+
+      # A different key is a different request.
+      assert {:ok, other} = Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "claim-2")
+      assert other.attempt["node"] == "second"
+    end
+
+    test "concurrent claims with one key produce exactly one attempt", %{
+      repo: repo,
+      run: run,
+      principal: principal
+    } do
+      results =
+        1..10
+        |> Task.async_stream(
+          fn _ -> Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "shared") end,
+          max_concurrency: 10,
+          timeout: 30_000
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert Enum.all?(results, &match?({:ok, _}, &1)), inspect(results)
+      assert results |> Enum.map(fn {:ok, claim} -> claim.attempt["id"] end) |> Enum.uniq() |> length() == 1
+
+      assert {:ok, %{events: events}} = Factory.events(repo, run.id)
+      assert Enum.count(events, &(&1["type"] == "node_claimed")) == 1
+    end
+
+    test "still answers with the claimed attempt after the run is cancelled", %{
+      repo: repo,
+      run: run,
+      principal: principal
+    } do
+      assert {:ok, first} = Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "before-cancel")
+      assert {:ok, _} = Factory.cancel(repo, run.id, principal)
+
+      assert {:ok, %{replayed: true, attempt: attempt}} =
+               Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "before-cancel")
+
+      assert attempt == first.attempt
+
+      assert {:error, %ServiceError{kind: :conflict, message: "work run is cancelled"}} =
+               Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "after-cancel")
+    end
+
+    test "refuses a key reused by another principal or executor, and a malformed key", %{
+      repo: repo,
+      run: run,
+      principal: principal
+    } do
+      assert {:ok, _} = Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: "mine")
+
+      assert {:error, %ServiceError{kind: :conflict}} =
+               Factory.claim(repo, run.id, "pod-a", %{principal | subject: "someone-else"},
+                 idempotency_key: "mine"
+               )
+
+      assert {:error, %ServiceError{kind: :conflict}} =
+               Factory.claim(repo, run.id, "pod-b", principal, idempotency_key: "mine")
+
+      for key <- ["", "-leading", "has space", String.duplicate("k", 129), 42] do
+        assert {:error, %ServiceError{kind: :invalid}} =
+                 Factory.claim(repo, run.id, "pod-a", principal, idempotency_key: key),
+               inspect(key)
+      end
+    end
+  end
+
   test "does not lose either result when independent attempts complete together", %{
     repo: repo,
     principal: principal
