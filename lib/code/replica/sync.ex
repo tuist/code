@@ -9,7 +9,8 @@ defmodule Code.Replica.Sync do
     1. download the packs named by the index that we do not already hold,
     2. install them,
     3. set refs to exactly the index's ref map, and
-    4. drop any pack the index no longer names.
+    4. drop any pack the index does not require, once nothing is using the
+       repository (see `Code.Replica.Lease`).
 
   That is the same amount of work whether the replica is one push behind or ten
   thousand, and it is the same code path as materializing a repository from
@@ -29,6 +30,7 @@ defmodule Code.Replica.Sync do
   require Logger
 
   alias Code.Git
+  alias Code.Replica.Lease
   alias Code.Telemetry
   alias Code.WAL
   alias Code.WAL.Index
@@ -66,9 +68,9 @@ defmodule Code.Replica.Sync do
 
     with :ok <- ensure_repository(path, index),
          {:ok, downloaded} <- install_packs(repo_id, path, required),
-         :ok <- maybe_prune(path, index, epoch),
          :ok <- Git.reset_refs(path, Index.refs(index)),
-         :ok <- apply_symrefs(path, index) do
+         :ok <- apply_symrefs(path, index),
+         :ok <- prune(repo_id, path, required) do
       duration = System.monotonic_time(:millisecond) - started
 
       if index.seq != seq or index.epoch != epoch do
@@ -105,14 +107,36 @@ defmodule Code.Replica.Sync do
     end
   end
 
-  # Only on an epoch change, because that is the only time packs stop being
-  # needed. Pruning on every sync would delete packs belonging to entries that
-  # a concurrent push added between our read and our write.
-  defp maybe_prune(_path, %{epoch: epoch}, epoch), do: :ok
+  # Drop every local pack the index does not require, whatever produced it: a
+  # previous epoch's base, a compaction on this node that lost its
+  # compare-and-swap, a pack from an agent write the log refused. Keying this
+  # on an epoch change missed the last two, and a pack nobody names is never
+  # read again.
+  #
+  # The one pack that is legitimately absent from the index is one being
+  # written right now — a push in quarantine, an agent write between packing
+  # and its compare-and-swap, a compaction between repack and publication.
+  # Those hold a lease on the repository while they run, so pruning waits for
+  # a sync with none outstanding. Deferring costs disk for a while, never
+  # correctness.
+  defp prune(repo_id, path, required) do
+    keep = MapSet.new(required, &Path.basename(&1.key))
+    stale = path |> Git.packs() |> Enum.reject(&MapSet.member?(keep, Path.basename(&1)))
 
-  defp maybe_prune(path, index, _epoch) do
-    keep = index |> Index.required_packs() |> Enum.map(&Path.basename(&1.key))
-    Git.prune_packs(path, keep)
+    cond do
+      stale == [] ->
+        :ok
+
+      Lease.active?(path) ->
+        :telemetry.execute([:code, :replica, :prune_deferred], %{packs: length(stale)}, %{repo_id: repo_id})
+        :ok
+
+      true ->
+        Git.prune_packs(path, Enum.to_list(keep))
+        :telemetry.execute([:code, :replica, :prune], %{packs: length(stale)}, %{repo_id: repo_id})
+        Logger.info("pruned packs the log no longer requires", repo_id: repo_id, packs: length(stale))
+        :ok
+    end
   end
 
   defp apply_symrefs(path, index) do
@@ -130,13 +154,15 @@ defmodule Code.Replica.Sync do
     with {:ok, _} <- Git.run(path, ["symbolic-ref", name, target]), do: :ok
   end
 
-  # Packs already present are skipped by name. They are content-addressed, so a
-  # matching name means matching contents; re-downloading one would be pure
-  # waste on a repository under active use.
+  # Packs already installed are skipped by name. They are content-addressed, so
+  # a matching name means matching contents; re-downloading one would be pure
+  # waste on a repository under active use. "Installed" means the pack and its
+  # `.idx` are both in place: `Code.Git.install_pack/2` publishes the index
+  # last, so a pack without one is an interrupted install and is fetched again.
   defp install_packs(_repo_id, _path, []), do: {:ok, 0}
 
   defp install_packs(repo_id, path, packs) do
-    present = path |> Git.packs() |> MapSet.new(&Path.basename/1)
+    present = path |> Git.installed_packs() |> MapSet.new(&Path.basename/1)
     missing = Enum.reject(packs, &MapSet.member?(present, Path.basename(&1.key)))
 
     if missing == [] do

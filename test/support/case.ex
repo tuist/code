@@ -80,6 +80,7 @@ defmodule Code.Case do
   """
   def start_replica_runtime do
     ensure_started({Registry, keys: :unique, name: Code.ReplicaRegistry}, Code.ReplicaRegistry)
+    ensure_started({Registry, keys: :duplicate, name: Code.LeaseRegistry}, Code.LeaseRegistry)
 
     ensure_started(
       {DynamicSupervisor, strategy: :one_for_one, name: Code.ReplicaSupervisor},

@@ -104,6 +104,12 @@ message Base {
   // The sequence number this base is equivalent to having replayed up to.
   uint64 seq = 4;
   int64 at_ms = 5;
+  // Object key of the snapshot of the index this base replaced. The key is
+  // content-addressed, so it names exactly that index version: two
+  // compactions racing from the same epoch write different snapshots, and
+  // the one that wins the compare-and-swap is the one referenced here. Empty
+  // for the initial base and for bases written before this field existed.
+  string history_key = 6;
 }
 
 // The single mutable object per repository, and the only one under CAS.
@@ -138,4 +144,19 @@ message Index {
   // compare-and-swap, which is what makes "reject non-fast-forwards" mean
   // something across nodes rather than only locally.
   map<string, string> refs = 11;
+
+  // Random identifier assigned when the repository is created. A repository
+  // deleted and created again under the same id gets a new one, so work
+  // prepared against the old repository (a push whose objects were computed
+  // against its refs) can be recognised and refused rather than landing in
+  // the new one. Empty for indexes written before this field existed.
+  string incarnation = 12;
+
+  // Non-zero once deletion has begun: Unix milliseconds of the tombstone.
+  // A tombstoned index is still the object under compare-and-swap, which is
+  // what stops a writer that read the live index from committing after the
+  // deletion started: its conditional write loses, and the re-read finds the
+  // tombstone. It is removed only after every object the repository owns has
+  // been deleted.
+  int64 deleted_at_ms = 13;
 }

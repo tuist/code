@@ -216,11 +216,13 @@ service's trace tree.
 
 When tracing is enabled, logs emitted inside Code's explicit spans include
 `otel_trace_id` and `otel_span_id`. Operational logs use fields such as
-`repo_id`, `seq`, `epoch`, `reason`, `service`, `kind`, `outcome`, and
-`duration_ms`; configure the log collector to retain those fields. Every
-maintenance job that fails or crashes is logged with its `repo_id`, `kind`,
-`mode` and `reason` and traced as `code.maintenance.job`, including jobs a
-sweep started without anyone waiting for the result. Credentials, object keys, and request
+`repo_id`, `seq`, `epoch`, `reason`, `service`, `kind`, `outcome`,
+`duration_ms`, `subcommand` and `stderr` (bounded Git diagnostics, kept out
+of protocol output); configure the log collector to retain those fields.
+Every maintenance job that fails or crashes is logged with its `repo_id`,
+`kind`, `mode` and `reason` and traced as `code.maintenance.job`, including
+jobs a sweep started without anyone waiting for the result. Credentials,
+object keys, and request
 bodies are never logged.
 
 ## Ports
@@ -270,7 +272,7 @@ replicas are doing real catch-up work on the read path, and latency will follow.
 | `code_git_aborted_count{service}` | Clients disconnecting mid-clone |
 | `code_git_command_duration{subcommand,outcome}`, `code_git_command_count{subcommand,outcome}` | Are git plumbing commands slow or failing? `outcome` is `ok`, `error` or `timeout` |
 | `code_push_committed_duration`, `code_push_committed_count` | Time (seconds) from receiving a push to it being durable, and how many landed |
-| `code_push_rejected_count{reason}` | `non_fast_forward` is users; `storage`, `contention` and `overloaded` are yours |
+| `code_push_rejected_count{reason}` | `non_fast_forward` is users; `storage`, `contention` and `overloaded` are yours. `incomplete_push` is a push naming objects it neither carried nor could rely on the log for; `deleted` is a write to a repository being deleted |
 | `code_writer_fallback_count{reason}` | Pushes committed locally because the preferred writer was unreachable. Expected during a rolling deploy; sustained outside one, routing is not taking effect |
 | `code_writer_timeout_count` | Pushes that gave up waiting for the repository writer. Their entries may still have committed |
 | `code_maintenance_job_duration{kind,outcome}`, `code_maintenance_job_count{kind,outcome}` | Is maintenance keeping up, and is any of it failing? Counts every job, including unattended ones; `outcome` is `ok`, `not_due`, `error` or `crashed` |
@@ -298,6 +300,26 @@ failures `reason` with `operation=webhook_authenticate`.
 
 The BEAM and application metrics from PromEx's standard plugins are exported
 alongside these.
+
+These storage-core [telemetry](https://hexdocs.pm/telemetry) events are
+emitted with bounded metadata (`repo_id` is metadata for traces and logs, never
+a metric label) and have no Prometheus metric yet:
+
+| Event | Meaning |
+|---|---|
+| `[:code, :wal, :ambiguous_commit]` | A write whose response was lost was found committed; `cause` is `precondition_failed` or `transport_error` |
+| `[:code, :wal, :basis_compacted]` | A write's objects were computed before a compaction that may have dropped them; it is redone |
+| `[:code, :wal, :destroy]` | A deletion finished; `outcome` is `ok`, `partial`, `not_found` or `error` |
+| `[:code, :push, :closure_check]` | Duration and `outcome` (`closed`, `incomplete`, `error`) of proving a push's objects are provided |
+| `[:code, :push, :local_apply_failed]` | A committed agent write could not be applied locally; the node converges on its next read |
+| `[:code, :replica, :prune]`, `[:code, :replica, :prune_deferred]` | Packs the log no longer requires were removed, or left because the repository was in use |
+| `[:code, :replica, :evict_deferred]` | The reaper left a repository in use for a later sweep |
+| `[:code, :replica, :rematerialize]` | A cache was missing on disk although the log had not moved, and was rebuilt |
+| `[:code, :git, :pack_index]` | A pack's `.idx` was `reused`, `rebuilt`, or `rebuilt_invalid` because the downloaded one did not match |
+| `[:code, :compaction, :incomplete_repack]` | A repack did not contain everything its refs reach, and was not published |
+
+Git commands report `status` `timeout` on `[:code, :git, :command]` when they
+exceed their time limit (30 minutes unless the caller sets one).
 
 ### What to autoscale on
 
@@ -409,6 +431,14 @@ intended: another push landed first, possibly on another node. The client should
 fetch and retry. If it happens constantly on one repository, that repository is
 a write hotspot.
 
+**A push is rejected with "compacted while this push was in flight".** A
+compaction landed between the push being checked and being committed, and may
+have dropped objects the push relied on. Rare, and retrying the push is enough.
+
+**A push is rejected with "did not include".** The push refers to objects it
+did not carry and that no pack in the log provides, even though this node's
+cache happened to hold them. Fetching first and pushing again sends them.
+
 **`cas_exhausted`.** Too many concurrent writers on one repository for the retry
 budget. Bounded by object store latency, not by Code.
 
@@ -419,7 +449,12 @@ logs; the repository is intact in the
 log, so evicting the replica and letting it rebuild is safe and usually enough.
 
 **Disk fills.** Lower `CODE_IDLE_EVICTION_MS` or add nodes. The cache tracks
-the working set, so this means the working set grew.
+the working set, so this means the working set grew. Eviction and pack pruning
+both wait while a repository is in use (a clone streaming, a push in flight),
+so a repository that is never idle holds superseded packs until it is (the
+`[:code, :replica, :prune_deferred]` event). Caches are one directory per repository directly under the
+data directory (`acme/app` is `acme~app`); directories left in the older nested
+layout by earlier releases are no longer used and can be deleted.
 
 ## Capacity
 
@@ -437,7 +472,11 @@ the working set, so this means the working set grew.
 ## Storage growth, and what is safe to delete
 
 Object storage only grows. Nothing in Code deletes an object except
-`DELETE /repositories/<id>`, which removes that repository's prefix entirely.
+`DELETE /repositories/<id>`, which tombstones the repository and then removes
+exactly the objects it owns — never a nested repository's, which share its
+prefix (see `docs/architecture.md`, *Deleting a repository*). If some deletions
+fail it reports `partial_cleanup` with the number left, keeps refusing writes,
+and resumes when called again.
 That is a deliberate consequence of the provenance guarantee — every state a
 repository has been in stays reconstructible — but it is a cost, and it is
 worth understanding before it surprises you.
@@ -448,7 +487,7 @@ Per repository:
 |---|---|---|
 | `packs/` | every push, plus one full set per compaction | The dominant cost. Compaction writes a fresh full set and the superseded packs stay |
 | `wal/` | every push | Small: a few hundred bytes per entry |
-| `history/` | every compaction | One index snapshot per epoch |
+| `history/` | every compaction | One index snapshot per compaction attempt, keyed by epoch and digest; the base names the one it replaced |
 | `index.pb` | nothing | One object, overwritten under CAS |
 
 A repository pushed to constantly will therefore accumulate roughly one full

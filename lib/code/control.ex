@@ -46,19 +46,65 @@ defmodule Code.Control do
     end
   end
 
-  @doc "Delete a repository and everything belonging to it. Irreversible."
-  @spec delete_repository(String.t()) :: :ok | {:error, term()}
-  def delete_repository(repo_id) do
-    with :ok <- WAL.destroy(repo_id) do
-      # Evict everywhere rather than waiting for the reaper, so the bytes stop
-      # existing when the caller was told they would.
-      Cluster.members()
-      |> Enum.each(fn node ->
-        :erpc.cast(node, Replica, :evict, [repo_id])
-      end)
+  @doc """
+  Delete a repository and everything belonging to it. Irreversible.
 
-      Logger.info("deleted repository", repo_id: repo_id)
-      :ok
+  Only an existing repository can be deleted: an id that names no repository
+  — an account, say, which is a prefix of every repository in it — is
+  `:not_found`, never a prefix to sweep. Deletion goes through a tombstone in
+  the index (see `Code.WAL.destroy/2`), so concurrent writers are refused
+  rather than racing it, and a nested repository such as `acme/app/tools` is
+  untouched by deleting `acme/app`.
+
+  `{:error, {:partial_cleanup, failed}}` means the repository no longer exists
+  for anyone but some of its objects could not be removed; calling this again
+  resumes the cleanup.
+  """
+  @spec delete_repository(String.t()) ::
+          :ok | {:error, :not_found | {:invalid_repo_id, term()} | {:partial_cleanup, pos_integer()} | term()}
+  def delete_repository(repo_id) do
+    if WAL.valid_id?(repo_id) do
+      result = WAL.destroy(repo_id, fn -> factory_keys(repo_id) end)
+
+      if result == :ok or match?({:error, {:partial_cleanup, _}}, result) do
+        # Evict everywhere rather than waiting for the reaper, so the bytes stop
+        # existing when the caller was told they would. A partial cleanup has
+        # still tombstoned the repository, so its caches are just as dead.
+        Cluster.members()
+        |> Enum.each(fn node ->
+          :erpc.cast(node, Replica, :evict, [repo_id])
+        end)
+      end
+
+      case result do
+        :ok ->
+          Logger.info("deleted repository", repo_id: repo_id)
+
+        {:error, reason} ->
+          Logger.warning("repository deletion failed", repo_id: repo_id, reason: inspect(reason))
+      end
+
+      result
+    else
+      {:error, {:invalid_repo_id, repo_id}}
+    end
+  end
+
+  # Work-run records are kept beside the log rather than in it, under
+  # `factory/<repo_id>/runs/<run_id>/`. A nested repository's runs live under
+  # the same prefix one level down (`factory/acme/app/tools/runs/...` sits
+  # inside `factory/acme/app/...`), so keys are matched against the exact
+  # shape `Code.Factory` writes rather than deleted by prefix.
+  @run_file ~r"^r[A-Za-z0-9_\-]{24}/(specification\.json|state\.json|events/[^/]+\.json|attempts/[^/]+/(claim|result)\.json)$"
+
+  defp factory_keys(repo_id) do
+    prefix = "factory/#{repo_id}/runs/"
+
+    with {:ok, entries} <- Code.ObjectStore.list(prefix) do
+      {:ok,
+       entries
+       |> Enum.map(& &1.key)
+       |> Enum.filter(&Regex.match?(@run_file, String.replace_prefix(&1, prefix, "")))}
     end
   end
 

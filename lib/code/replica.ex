@@ -38,6 +38,7 @@ defmodule Code.Replica do
   alias Code.Cluster
   alias Code.Config
   alias Code.Git
+  alias Code.Replica.Lease
   alias Code.Replica.Sync
   alias Code.WAL
   alias Code.WAL.Index
@@ -188,14 +189,28 @@ defmodule Code.Replica do
   log, so this is a cache eviction rather than a deletion.
   """
   @spec evict(String.t()) :: :ok
-  def evict(repo_id) do
+  def evict(repo_id), do: evict(repo_id, :force)
+
+  @doc """
+  Drop a repository from local disk, optionally only when nothing is using it.
+
+  `:if_unused` is what housekeeping passes: a clone streaming from this
+  directory, or a push held in quarantine against it, runs outside the replica
+  process, and removing its files underneath it breaks it midway. With
+  `:if_unused` a repository with a `Code.Replica.Lease` outstanding is left
+  alone and `{:error, :in_use}` returned; the next sweep tries again. The check
+  happens inside the replica process, so it is ordered with every other
+  operation on the replica.
+  """
+  @spec evict(String.t(), :force | :if_unused) :: :ok | {:error, :in_use}
+  def evict(repo_id, mode) do
     case whereis(repo_id) do
       nil ->
         :ok
 
       pid ->
         try do
-          GenServer.call(pid, :evict, :timer.seconds(30))
+          GenServer.call(pid, {:evict, mode}, :timer.seconds(30))
         catch
           # Already gone — because the reaper got there first, or another
           # caller did. The goal is that it is not resident, and it is not.
@@ -204,12 +219,53 @@ defmodule Code.Replica do
     end
   end
 
-  @doc "Local path of a repository, whether or not it is currently resident."
+  @doc """
+  The most recent index this replica read from the log, if any.
+
+  It is a real version of the index, not one advanced locally, and the local
+  repository holds every object its refs reach. That makes it a sound basis for
+  deciding which of a push's objects the repository already provides.
+  """
+  @spec cached_index(String.t()) :: {:ok, Index.t()} | :error
+  def cached_index(repo_id) do
+    case whereis(repo_id) do
+      nil ->
+        :error
+
+      pid ->
+        try do
+          GenServer.call(pid, :cached_index, :timer.seconds(5))
+        catch
+          :exit, _reason -> :error
+        end
+    end
+  end
+
+  @doc """
+  Local path of a repository, whether or not it is currently resident.
+
+  One directory per repository directly under the data directory, never nested.
+  Repository ids nest (`acme/app` and `acme/app/tools` are both valid), and
+  mirroring that on disk put one repository's cache inside another's, so
+  evicting the parent deleted the child's files from under a live replica.
+  `/` cannot appear in a directory name and `~` cannot appear in an id, so
+  `acme/app` becomes `acme~app` and the mapping stays one-to-one. An id too
+  long to be a file name is stored under the hash of the id instead, prefixed
+  with `~`, which no readable name can start with.
+  """
   @spec path(String.t()) :: Path.t()
-  def path(repo_id) do
-    # Repository ids may contain slashes; keep them as directories so the tree
-    # on disk mirrors the namespace in object storage.
-    Path.join(Config.data_dir(), repo_id)
+  def path(repo_id), do: Path.join(Config.data_dir(), directory_name(repo_id))
+
+  @max_directory_name 200
+
+  defp directory_name(repo_id) do
+    readable = String.replace(repo_id, "/", "~")
+
+    if byte_size(readable) <= @max_directory_name do
+      readable
+    else
+      "~" <> Base.encode16(:crypto.hash(:sha256, repo_id), case: :lower)
+    end
   end
 
   @spec ensure_started(String.t()) :: {:ok, pid()} | {:error, term()}
@@ -333,22 +389,36 @@ defmodule Code.Replica do
     {:reply, {:ok, info}, state}
   end
 
-  def handle_call(:evict, _from, state) do
+  def handle_call({:evict, :if_unused}, from, state) do
+    if Lease.active?(state.path) do
+      :telemetry.execute([:code, :replica, :evict_deferred], %{}, %{repo_id: state.repo_id})
+      Logger.debug("eviction deferred: repository in use", repo_id: state.repo_id)
+      {:reply, {:error, :in_use}, state}
+    else
+      handle_call({:evict, :force}, from, state)
+    end
+  end
+
+  def handle_call({:evict, :force}, _from, state) do
     File.rm_rf(state.path)
     :telemetry.execute([:code, :replica, :evict], %{}, %{repo_id: state.repo_id})
     Logger.info("evicted replica from local disk", repo_id: state.repo_id)
     {:stop, :normal, :ok, state}
   end
 
+  def handle_call(:evict, from, state), do: handle_call({:evict, :force}, from, state)
+
+  def handle_call(:cached_index, _from, %{index: nil} = state), do: {:reply, :error, state}
+  def handle_call(:cached_index, _from, state), do: {:reply, {:ok, state.index}, state}
+
   @impl true
   def handle_cast({:record_local_push, epoch, seq}, state) do
     # The stored object changed, so the cached ETag is stale by definition.
     # Clearing it keeps the next read honest: it re-reads the index, which is
     # cheap, rather than trusting an ETag we never observed. The cached index
-    # is advanced rather than dropped, because this node performed the write
-    # and therefore does know the sequence number it produced.
-    index = state.index && %{state.index | epoch: epoch, seq: seq}
-    {:noreply, %{state | epoch: epoch, seq: seq, index: index, etag: nil, verified_at: nil}}
+    # itself is kept as the version it is: relabelling it with the new epoch
+    # and sequence number would describe refs and packs it does not have.
+    {:noreply, %{state | epoch: epoch, seq: seq, etag: nil, verified_at: nil}}
   end
 
   def handle_cast({:hint, epoch, seq}, state) do
@@ -388,7 +458,18 @@ defmodule Code.Replica do
   defp refresh(state) do
     case WAL.read(state.repo_id, state.etag) do
       {:ok, :not_modified} ->
-        {:ok, %{state | verified_at: System.monotonic_time(:millisecond)}}
+        if materialized?(state.path) do
+          {:ok, %{state | verified_at: System.monotonic_time(:millisecond)}}
+        else
+          # The log has not moved, but the cache has gone: removed by an
+          # operator, a volume swap, or anything else outside this process. A
+          # `304` only says our idea of the log is current, not that the disk
+          # still reflects it, so rebuild from the log rather than serve a
+          # directory that is not there.
+          :telemetry.execute([:code, :replica, :rematerialize], %{}, %{repo_id: state.repo_id})
+          Logger.warning("replica cache missing on disk; rebuilding from the log", repo_id: state.repo_id)
+          refresh(%{state | etag: nil, epoch: 0, seq: 0})
+        end
 
       {:ok, index, etag} ->
         sync(state, index, etag)
@@ -417,6 +498,10 @@ defmodule Code.Replica do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp materialized?(path) do
+    File.regular?(Path.join(path, "HEAD")) and File.dir?(Path.join(path, "objects/pack"))
   end
 
   defp age(nil), do: nil

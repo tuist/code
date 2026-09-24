@@ -25,6 +25,13 @@ config :logger, :console,
     :account,
     :age_ms,
     :auth_backend,
+    :subcommand,
+    :stderr,
+    :pack,
+    :entries,
+    :failed,
+    :deleted,
+    :missing,
     :otel_trace_id,
     :otel_span_id
   ]

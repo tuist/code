@@ -4,11 +4,11 @@ defmodule Code.WAL do
 
   ## Layout
 
-      repos/<repo_id>/index.pb            the only mutable object, under CAS
-      repos/<repo_id>/wal/<digest>.pb     entries, immutable, content-addressed
-      repos/<repo_id>/packs/<name>.pack   packfiles, immutable
+      repos/<repo_id>/index.pb                     the only mutable object, under CAS
+      repos/<repo_id>/wal/<digest>.pb              entries, immutable, content-addressed
+      repos/<repo_id>/packs/<name>.pack            packfiles, immutable
       repos/<repo_id>/packs/<name>.idx
-      repos/<repo_id>/history/<epoch>.pb  index snapshots kept for provenance
+      repos/<repo_id>/history/<epoch>-<digest>.pb  index snapshots kept for provenance
 
   Everything but the packfiles is protobuf (`priv/proto/code/wal/v1`). The
   log outlives any single version of this code, so its encoding is a schema
@@ -28,9 +28,11 @@ defmodule Code.WAL do
        back with `If-Match` on the ETag we read. Exactly one writer can win.
 
   Nothing is acknowledged to the client until step 3 succeeds. A push that is
-  in the log is durable and ordered; a push that is not is as if it never
-  happened. There is no third state, and no window in which a client is told
-  "yes" and the log says otherwise.
+  in the log is durable and ordered. When the store's answer to step 3 is lost
+  — a precondition failure on a write that actually landed, or a transport
+  error after the store accepted it — the index is re-read and the entry's
+  content address looked up, so a write that landed is reported as the success
+  it was.
 
   ## Why there is no consensus protocol here
 
@@ -40,6 +42,8 @@ defmodule Code.WAL do
   failure: it means someone else's push landed first, so we re-read and try
   again against the state they left behind.
   """
+
+  require Logger
 
   alias Code.Config
   alias Code.ObjectStore
@@ -53,18 +57,32 @@ defmodule Code.WAL do
   @content_type "application/vnd.code.wal.v1+protobuf"
 
   @typedoc """
+  What a prepared entry's objects were computed against.
+
+  A writer that leaves objects out of its pack because the repository already
+  has them — the agent API excluding everything reachable from the current
+  refs, or a Git client omitting what the server advertised — is only correct
+  if the index it finally lands in still provides those objects. `tips` are
+  the object ids the omission was relative to, `epoch` and `incarnation` the
+  index they came from. See `check_basis/2` for how it is judged.
+  """
+  @type basis :: %{incarnation: String.t(), epoch: non_neg_integer(), tips: [String.t()]}
+
+  @typedoc """
   An entry whose object is already stored, ready to be installed in the index.
 
   `validate` is re-run against the live index on every compare-and-swap
   attempt, so a check like "this ref must still be where the client thought"
-  is evaluated against the state that actually won, not a stale read.
+  is evaluated against the state that actually won, not a stale read. `basis`,
+  when present, is checked the same way.
   """
   @type prepared :: %{
-          entry: Entry.t(),
-          key: String.t(),
-          size: non_neg_integer(),
-          digest: String.t(),
-          validate: (Index.t() -> :ok | {:error, term()})
+          required(:entry) => Entry.t(),
+          required(:key) => String.t(),
+          required(:size) => non_neg_integer(),
+          required(:digest) => String.t(),
+          required(:validate) => (Index.t() -> :ok | {:error, term()}),
+          optional(:basis) => basis() | nil
         }
 
   @doc "Validate a repository identifier, which is also an object-store key prefix."
@@ -86,8 +104,16 @@ defmodule Code.WAL do
   @spec pack_key(repo_id(), String.t()) :: String.t()
   def pack_key(repo_id, name), do: "repos/#{repo_id}/packs/#{name}"
 
-  @spec history_key(repo_id(), non_neg_integer()) :: String.t()
-  def history_key(repo_id, epoch), do: "repos/#{repo_id}/history/#{epoch}.pb"
+  @doc """
+  Where the snapshot of one exact index version is kept.
+
+  Keyed by the digest of the snapshot's bytes as well as its epoch. Two
+  compactions racing from the same epoch but different sequence numbers write
+  two different snapshots rather than one silently standing in for the other,
+  and the base that wins records which one it replaced.
+  """
+  @spec history_key(repo_id(), non_neg_integer(), String.t()) :: String.t()
+  def history_key(repo_id, epoch, digest), do: "repos/#{repo_id}/history/#{epoch}-#{digest}.pb"
 
   @doc """
   Create the log for a new repository.
@@ -95,8 +121,13 @@ defmodule Code.WAL do
   Uses `If-None-Match: *`, so if two nodes create the same repository at the
   same moment exactly one wins and the other is told `:already_exists`. No
   locking, no coordination.
+
+  Every repository gets a fresh `incarnation`, so one created under the id of a
+  deleted repository is distinguishable from it: work prepared against the old
+  one cannot land in the new one.
   """
-  @spec create(repo_id(), keyword()) :: {:ok, Index.t()} | {:error, :already_exists | term()}
+  @spec create(repo_id(), keyword()) ::
+          {:ok, Index.t()} | {:error, :already_exists | :deletion_in_progress | term()}
   def create(repo_id, opts \\ []) do
     unless valid_id?(repo_id), do: throw({:invalid_repo_id, repo_id})
 
@@ -107,11 +138,23 @@ defmodule Code.WAL do
            content_type: @content_type
          ) do
       {:ok, _etag} -> {:ok, index}
-      {:error, :precondition_failed} -> {:error, :already_exists}
+      {:error, :precondition_failed} -> existing(repo_id)
       {:error, reason} -> {:error, reason}
     end
   catch
     {:invalid_repo_id, id} -> {:error, {:invalid_repo_id, id}}
+  end
+
+  # The name is taken. A tombstone still holds it until its cleanup finishes,
+  # and saying so is more useful than claiming the repository exists.
+  defp existing(repo_id) do
+    case read_raw(repo_id, nil) do
+      {:ok, index, _etag} ->
+        if Index.deleted?(index), do: {:error, :deletion_in_progress}, else: {:error, :already_exists}
+
+      _ ->
+        {:error, :already_exists}
+    end
   end
 
   @doc """
@@ -120,9 +163,22 @@ defmodule Code.WAL do
   Passing the ETag from a previous read turns this into the cheap path that the
   whole consistency story rests on: a `304` is a metadata-only round trip and
   means the replica may serve immediately.
+
+  A repository whose deletion has begun reads as `:not_found`: from the moment
+  the tombstone is written it no longer exists for anyone but the cleanup.
   """
   @spec read(repo_id(), ObjectStore.etag() | nil) :: read_result()
   def read(repo_id, etag \\ nil) do
+    case read_raw(repo_id, etag) do
+      {:ok, index, new_etag} ->
+        if Index.deleted?(index), do: {:error, :not_found}, else: {:ok, index, new_etag}
+
+      other ->
+        other
+    end
+  end
+
+  defp read_raw(repo_id, etag) do
     started = System.monotonic_time(:microsecond)
     result = ObjectStore.get(index_key(repo_id), etag: etag)
     duration = System.monotonic_time(:microsecond) - started
@@ -154,6 +210,21 @@ defmodule Code.WAL do
     end
   end
 
+  # What every writer reads. Unlike `fetch/1` it names a tombstone for what it
+  # is, so a push racing a deletion is told why it was refused.
+  defp fetch_live(repo_id) do
+    case read_raw(repo_id, nil) do
+      {:ok, :not_modified} ->
+        {:error, :unexpected_not_modified}
+
+      {:ok, index, etag} ->
+        if Index.deleted?(index), do: {:error, :repository_deleted}, else: {:ok, index, etag}
+
+      other ->
+        other
+    end
+  end
+
   @doc """
   Append an entry to the log, retrying until the compare-and-swap wins.
 
@@ -173,7 +244,7 @@ defmodule Code.WAL do
   defp append(_repo_id, _build, 0), do: {:error, :cas_exhausted}
 
   defp append(repo_id, build, attempts) do
-    with {:ok, index, etag} <- fetch(repo_id),
+    with {:ok, index, etag} <- fetch_live(repo_id),
          {:ok, entry} <- build.(index),
          {:ok, key, size, digest} <- put_entry(repo_id, entry) do
       updated = Index.append(index, entry, key, size, digest, Config.node_id())
@@ -206,10 +277,7 @@ defmodule Code.WAL do
 
           case already_committed(repo_id, digest) do
             {:ok, position} ->
-              :telemetry.execute([:code, :wal, :ambiguous_commit], %{seq: position.seq}, %{
-                repo_id: repo_id
-              })
-
+              emit_ambiguous(repo_id, position.seq, :precondition_failed)
               {:ok, position}
 
             :no ->
@@ -218,7 +286,17 @@ defmodule Code.WAL do
           end
 
         {:error, reason} ->
-          {:error, reason}
+          # A transport error or a server error is no more a rejection than a
+          # precondition failure is: the store may have applied the write and
+          # lost the response. The same content-address check answers it.
+          case already_committed(repo_id, digest) do
+            {:ok, position} ->
+              emit_ambiguous(repo_id, position.seq, :transport_error)
+              {:ok, position}
+
+            :no ->
+              {:error, reason}
+          end
       end
     end
   end
@@ -246,7 +324,7 @@ defmodule Code.WAL do
   defp append_batch(_repo_id, _prepared, 0), do: {:error, :cas_exhausted}
 
   defp append_batch(repo_id, prepared, attempts) do
-    with {:ok, index, etag} <- fetch(repo_id) do
+    with {:ok, index, etag} <- fetch_live(repo_id) do
       {updated, results} = apply_batch(index, prepared)
 
       if updated == index do
@@ -267,14 +345,52 @@ defmodule Code.WAL do
             {:ok, results}
 
           {:error, :precondition_failed} ->
+            # The retry folds the batch again against the index that won, and
+            # `apply_batch/2` recognises entries of ours that are already in it.
             :telemetry.execute([:code, :wal, :cas_retry], %{attempts: 1}, %{repo_id: repo_id})
             backoff(@cas_attempts - attempts)
             append_batch(repo_id, prepared, attempts - 1)
 
           {:error, reason} ->
-            {:error, reason}
+            reconcile_batch(repo_id, prepared, results, reason)
         end
       end
+    end
+  end
+
+  # The conditional write failed without a precondition answer, so it may or
+  # may not have landed. Every entry this attempt tried to install is looked up
+  # by content address in the index as it now stands: found means committed,
+  # whatever the transport said. Entries the batch had already rejected keep
+  # their own reasons.
+  defp reconcile_batch(repo_id, prepared, results, reason) do
+    case fetch_live(repo_id) do
+      {:ok, index, _etag} ->
+        committed = Enum.reduce(index.entries, %{}, &Map.put_new(&2, &1.digest, &1.seq))
+
+        reconciled =
+          prepared
+          |> Enum.zip(results)
+          |> Enum.map(fn
+            {item, {:ok, _position}} ->
+              case Map.fetch(committed, item.digest) do
+                {:ok, seq} -> {:committed, {:ok, %{seq: seq, epoch: index.epoch}}}
+                :error -> {:unknown, {:error, reason}}
+              end
+
+            {_item, rejected} ->
+              {:rejected, rejected}
+          end)
+
+        if Enum.any?(reconciled, &match?({:committed, _}, &1)) do
+          emit_ambiguous(repo_id, index.seq, :transport_error)
+          {:ok, Enum.map(reconciled, &elem(&1, 1))}
+        else
+          {:error, reason}
+        end
+
+      {:error, _unreadable} ->
+        {:error, reason}
     end
   end
 
@@ -284,7 +400,7 @@ defmodule Code.WAL do
   # therefore unique to one proposed change: finding it means this attempt
   # already succeeded, not that someone else made the same change.
   defp already_committed(repo_id, digest) do
-    with {:ok, index, _etag} <- fetch(repo_id),
+    with {:ok, index, _etag} <- fetch_live(repo_id),
          pointer when not is_nil(pointer) <- Enum.find(index.entries, &(&1.digest == digest)) do
       {:ok, %{seq: pointer.seq, epoch: index.epoch, index: index}}
     else
@@ -308,7 +424,7 @@ defmodule Code.WAL do
       Enum.reduce(prepared, {index, committed, []}, fn item, {index, committed, results} ->
         case Map.fetch(committed, item.digest) do
           :error ->
-            case item.validate.(index) do
+            case validate(index, item) do
               :ok ->
                 updated = Index.append(index, item.entry, item.key, item.size, item.digest, Config.node_id())
 
@@ -330,31 +446,93 @@ defmodule Code.WAL do
     {index, Enum.reverse(results)}
   end
 
+  defp validate(index, item) do
+    with :ok <- check_basis(index, Map.get(item, :basis)), do: item.validate.(index)
+  end
+
+  @doc """
+  Whether objects omitted relative to `basis` are still provided by `index`.
+
+  Packs only ever accumulate within an epoch, so an index in the basis's epoch
+  still requires every pack the basis did, and everything reachable from the
+  basis tips is still there. Compaction replaces the pack set with a repack of
+  the base refs, so across an epoch the omission is safe only if every tip it
+  was relative to is still a tip of `index`: those are exactly the objects the
+  new pack set is known to contain (see `Code.WAL.Index.tips/1`). Anything
+  else is refused as `:basis_compacted`, and the writer recomputes against a
+  fresh index rather than committing a ref to an object no pack provides.
+
+  A basis from a different incarnation belongs to a repository that was
+  deleted, and is refused whatever its objects.
+  """
+  @spec check_basis(Index.t(), basis() | nil) ::
+          :ok | {:error, :basis_compacted | :repository_replaced}
+  def check_basis(_index, nil), do: :ok
+
+  def check_basis(%{incarnation: current}, %{incarnation: basis}) when current != basis,
+    do: {:error, :repository_replaced}
+
+  def check_basis(%{epoch: epoch}, %{epoch: epoch}), do: :ok
+
+  def check_basis(index, %{tips: tips}) do
+    live = Index.tips(index)
+
+    if Enum.all?(tips, &MapSet.member?(live, &1)) do
+      :ok
+    else
+      :telemetry.execute([:code, :wal, :basis_compacted], %{count: 1}, %{repo_id: index.repo_id})
+      {:error, :basis_compacted}
+    end
+  end
+
+  @doc """
+  The basis a writer records when it computes a pack against `index`,
+  omitting everything reachable from `tips`.
+  """
+  @spec basis(Index.t(), Enumerable.t()) :: basis()
+  def basis(index, tips) do
+    %{incarnation: index.incarnation, epoch: index.epoch, tips: Enum.uniq(tips)}
+  end
+
   @doc """
   Upload an entry object and return what `append_batch/2` needs to install it.
 
   Separated from the append so the expensive, contention-free part — writing
   content-addressed objects — happens on whichever node received the push,
   while only the index update is funnelled through one writer.
+
+  Pass `basis:` when the entry's packs omit objects the repository already
+  has; it is checked against the index that wins the compare-and-swap.
   """
-  @spec prepare(repo_id(), Entry.t(), (Index.t() -> :ok | {:error, term()})) ::
+  @spec prepare(repo_id(), Entry.t(), (Index.t() -> :ok | {:error, term()}), keyword()) ::
           {:ok, prepared()} | {:error, term()}
-  def prepare(repo_id, entry, validate) do
+  def prepare(repo_id, entry, validate, opts \\ []) do
     body = Entry.encode(entry)
     digest = digest(body)
     key = entry_key(repo_id, digest)
 
     with {:ok, _} <- write_immutable(key, body) do
-      {:ok, %{entry: entry, key: key, size: byte_size(body), digest: digest, validate: validate}}
+      {:ok,
+       %{
+         entry: entry,
+         key: key,
+         size: byte_size(body),
+         digest: digest,
+         validate: validate,
+         basis: Keyword.get(opts, :basis)
+       }}
     end
   end
 
   @doc """
   Replace the log's base with a compaction result.
 
-  The previous index is snapshotted under `history/<epoch>.json` first, so the
-  full sequence of states a repository has been in stays reconstructible even
-  though the active index no longer lists the replayed entries.
+  The previous index is snapshotted first, under a key derived from its own
+  bytes, so the full sequence of states a repository has been in stays
+  reconstructible even though the active index no longer lists the replayed
+  entries. The new base records that key, which binds it to the exact index
+  version it replaced rather than to whichever snapshot happened to be written
+  first for the epoch.
 
   Compaction is itself a compare-and-swap, so a push racing a compaction cannot
   be lost: whichever lands second sees the other's result and retries.
@@ -362,30 +540,32 @@ defmodule Code.WAL do
   @spec compact(repo_id(), [Entry.pack()], map(), map(), Index.t(), ObjectStore.etag()) ::
           {:ok, Index.t()} | {:error, term()}
   def compact(repo_id, packs, refs, symrefs, index, etag) do
-    with {:ok, _} <-
-           ObjectStore.put(history_key(repo_id, index.epoch), Index.encode(index),
-             if_none_match: "*",
-             content_type: @content_type
-           )
-           |> allow_already_present() do
-      compacted = Index.rebase(index, packs, refs, symrefs, Config.node_id())
+    snapshot = Index.encode(index)
+    history = history_key(repo_id, index.epoch, digest(snapshot))
 
-      case ObjectStore.put(index_key(repo_id), Index.encode(compacted),
-             if_match: etag,
-             content_type: @content_type
-           ) do
-        {:ok, _etag} ->
-          :telemetry.execute([:code, :wal, :compact], %{epoch: compacted.epoch, packs: length(packs)}, %{
-            repo_id: repo_id
-          })
+    if Index.deleted?(index) do
+      {:error, :repository_deleted}
+    else
+      with {:ok, _} <- write_immutable(history, snapshot) do
+        compacted = Index.rebase(index, packs, refs, symrefs, Config.node_id(), history)
 
-          {:ok, compacted}
+        case ObjectStore.put(index_key(repo_id), Index.encode(compacted),
+               if_match: etag,
+               content_type: @content_type
+             ) do
+          {:ok, _etag} ->
+            :telemetry.execute([:code, :wal, :compact], %{epoch: compacted.epoch, packs: length(packs)}, %{
+              repo_id: repo_id
+            })
 
-        {:error, :precondition_failed} ->
-          {:error, :raced}
+            {:ok, compacted}
 
-        {:error, reason} ->
-          {:error, reason}
+          {:error, :precondition_failed} ->
+            {:error, :raced}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
       end
     end
   end
@@ -448,32 +628,39 @@ defmodule Code.WAL do
   @doc """
   Download a pack (and its index when present) into `dir`.
 
-  The pack is written straight to disk and then verified against the digest the
-  log recorded, so a truncated or corrupted transfer fails here rather than
-  surfacing as a mysterious repository error later. A pack that fails
-  verification is deleted; a caller must never find a half-written file where a
+  The pack is written to a temporary name, verified against the digest the log
+  recorded, and only then renamed to its real name, so a truncated or
+  corrupted transfer fails here rather than surfacing as a mysterious
+  repository error later, and a caller never finds a half-written file where a
   verified one is expected.
+
+  The pack's `.idx` is downloaded beside it when the store has one. It carries
+  no digest in the log, so it is a hint: `Code.Git.install_pack/2` checks it
+  against the pack and rebuilds it when it does not match.
   """
   @spec get_pack(repo_id(), Entry.pack(), Path.t()) :: {:ok, Path.t()} | {:error, term()}
   def get_pack(repo_id, pack, dir) do
     File.mkdir_p!(dir)
     name = Path.basename(pack.key)
     destination = Path.join(dir, name)
+    partial = destination <> ".part"
 
-    case ObjectStore.get_file(pack.key, destination) do
+    case ObjectStore.get_file(pack.key, partial) do
       {:ok, size} ->
-        case verify_pack(destination, pack) do
+        case verify_pack(partial, pack) do
           :ok ->
+            File.rename!(partial, destination)
             :telemetry.execute([:code, :wal, :pack_download], %{bytes: size}, %{repo_id: repo_id})
-            fetch_pack_index(repo_id, pack, dir, name)
+            fetch_pack_index(pack, dir, name)
             {:ok, destination}
 
           {:error, reason} ->
-            File.rm(destination)
+            File.rm(partial)
             {:error, reason}
         end
 
       {:error, reason} ->
+        File.rm(partial)
         {:error, reason}
     end
   end
@@ -490,22 +677,193 @@ defmodule Code.WAL do
     end
   end
 
-  defp fetch_pack_index(_repo_id, pack, dir, name) do
+  defp fetch_pack_index(pack, dir, name) do
     idx_key = Path.rootname(pack.key) <> ".idx"
     destination = Path.join(dir, Path.rootname(name) <> ".idx")
+    partial = destination <> ".part"
 
-    case ObjectStore.get_file(idx_key, destination) do
-      {:ok, _size} -> :ok
-      _ -> :ok
+    case ObjectStore.get_file(idx_key, partial) do
+      {:ok, _size} -> File.rename(partial, destination)
+      _ -> File.rm(partial)
+    end
+
+    :ok
+  end
+
+  # ----------------------------------------------------------------------
+  # Deletion
+  # ----------------------------------------------------------------------
+
+  @doc """
+  Begin deleting a repository by tombstoning its index.
+
+  From the moment this returns the repository reads as not found, and every
+  writer is refused with `:repository_deleted`, including one that read the
+  live index before the tombstone: its conditional write loses and its re-read
+  finds the tombstone. Idempotent: a repository already tombstoned returns
+  its tombstone, so an interrupted deletion can be resumed.
+  """
+  @spec tombstone(repo_id()) :: {:ok, Index.t()} | {:error, :not_found | {:invalid_repo_id, term()} | term()}
+  def tombstone(repo_id), do: tombstone(repo_id, @cas_attempts)
+
+  defp tombstone(_repo_id, 0), do: {:error, :cas_exhausted}
+
+  defp tombstone(repo_id, attempts) do
+    with :ok <- check_id(repo_id),
+         {:ok, index, etag} <- fetch_raw(repo_id) do
+      if Index.deleted?(index), do: {:ok, index}, else: write_tombstone(repo_id, index, etag, attempts)
     end
   end
 
-  @doc "Delete every object belonging to a repository. Irreversible."
-  @spec destroy(repo_id()) :: :ok | {:error, term()}
-  def destroy(repo_id) do
-    with {:ok, entries} <- ObjectStore.list("repos/#{repo_id}/") do
-      Enum.each(entries, &ObjectStore.delete(&1.key))
-      ObjectStore.delete(index_key(repo_id))
+  defp write_tombstone(repo_id, index, etag, attempts) do
+    tombstoned = Index.tombstone(index, Config.node_id())
+
+    case ObjectStore.put(index_key(repo_id), Index.encode(tombstoned),
+           if_match: etag,
+           content_type: @content_type
+         ) do
+      {:ok, _etag} ->
+        {:ok, tombstoned}
+
+      {:error, :precondition_failed} ->
+        backoff(@cas_attempts - attempts)
+        tombstone(repo_id, attempts - 1)
+
+      # Possibly written: the next attempt reads it back and, finding the
+      # tombstone, returns it.
+      {:error, _reason} when attempts > 1 ->
+        tombstone(repo_id, attempts - 1)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp check_id(repo_id), do: if(valid_id?(repo_id), do: :ok, else: {:error, {:invalid_repo_id, repo_id}})
+
+  defp fetch_raw(repo_id) do
+    case read_raw(repo_id, nil) do
+      {:ok, :not_modified} -> {:error, :unexpected_not_modified}
+      other -> other
+    end
+  end
+
+  @doc """
+  Delete every object belonging to a repository. Irreversible.
+
+  Repository ids nest — `acme/app` and `acme/app/tools` are both valid — so
+  this never deletes by prefix. It tombstones the index, then deletes exactly
+  the keys the repository's own layout produces: those its index names, and
+  anything else under its `wal/`, `packs/` and `history/` directories whose
+  name has the shape this module writes there. A nested repository's objects
+  always sit at least one directory deeper and never match.
+
+  `extra_keys` lists further keys the caller owns on the repository's behalf
+  (the factory's run records). It is called only after the tombstone is in
+  place, so nothing created through a live index can appear after it looked,
+  and its keys are deleted in the same pass.
+
+  The tombstone is removed only once every other deletion has succeeded, so a
+  partial failure leaves the repository refusing writes and the deletion
+  resumable; it is reported as `{:error, {:partial_cleanup, failed}}` with the
+  number of keys that could not be removed.
+  """
+  @spec destroy(repo_id(), (-> {:ok, [String.t()]} | {:error, term()})) ::
+          :ok | {:error, :not_found | {:partial_cleanup, pos_integer()} | term()}
+  def destroy(repo_id, extra_keys \\ fn -> {:ok, []} end) do
+    started = System.monotonic_time(:millisecond)
+
+    result =
+      with {:ok, index} <- tombstone(repo_id),
+           {:ok, owned} <- owned_keys(repo_id, index),
+           {:ok, extra} <- extra_keys.() do
+        keys = Enum.uniq(owned ++ extra)
+        failed = delete_keys(keys)
+
+        if failed == [] do
+          with :ok <- ObjectStore.delete(index_key(repo_id)), do: {:ok, length(keys)}
+        else
+          Logger.error("repository deletion left objects behind",
+            repo_id: repo_id,
+            failed: length(failed),
+            deleted: length(keys) - length(failed),
+            reason: inspect(hd(failed))
+          )
+
+          {:error, {:partial_cleanup, length(failed)}}
+        end
+      end
+
+    outcome =
+      case result do
+        {:ok, _} -> :ok
+        {:error, {:partial_cleanup, _}} -> :partial
+        {:error, :not_found} -> :not_found
+        {:error, _} -> :error
+      end
+
+    :telemetry.execute(
+      [:code, :wal, :destroy],
+      %{duration_ms: System.monotonic_time(:millisecond) - started, objects: deleted_count(result)},
+      %{repo_id: repo_id, outcome: outcome}
+    )
+
+    case result do
+      {:ok, _count} -> :ok
+      error -> error
+    end
+  end
+
+  defp deleted_count({:ok, count}), do: count
+  defp deleted_count(_), do: 0
+
+  defp delete_keys(keys) do
+    keys
+    |> Task.async_stream(fn key -> {key, ObjectStore.delete(key)} end,
+      max_concurrency: 16,
+      timeout: :timer.minutes(2),
+      on_timeout: :kill_task
+    )
+    |> Enum.flat_map(fn
+      {:ok, {_key, :ok}} -> []
+      {:ok, {key, {:error, reason}}} -> [{key, reason}]
+      {:exit, reason} -> [{:unknown, reason}]
+    end)
+  end
+
+  @owned_patterns [
+    {"wal/", ~r"^wal/[0-9a-f]{64}\.pb$"},
+    {"packs/", ~r"^packs/pack-[0-9a-f]{40,64}\.(pack|idx|rev|bitmap)$"},
+    {"history/", ~r"^history/[0-9]+(-[0-9a-f]{64})?\.pb$"}
+  ]
+
+  @doc false
+  @spec owned_keys(repo_id(), Index.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def owned_keys(repo_id, index) do
+    prefix = "repos/#{repo_id}/"
+
+    named =
+      Enum.flat_map(index.entries, &[&1.key]) ++
+        Enum.flat_map(Index.required_packs(index), &[&1.key, Path.rootname(&1.key) <> ".idx"]) ++
+        if(index.base.history_key != "", do: [index.base.history_key], else: [])
+
+    Enum.reduce_while(@owned_patterns, {:ok, named}, fn {dir, pattern}, {:ok, acc} ->
+      case ObjectStore.list(prefix <> dir) do
+        {:ok, entries} ->
+          owned =
+            entries
+            |> Enum.map(& &1.key)
+            |> Enum.filter(&Regex.match?(pattern, String.replace_prefix(&1, prefix, "")))
+
+          {:cont, {:ok, acc ++ owned}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, keys} -> {:ok, keys |> Enum.filter(&String.starts_with?(&1, prefix)) |> Enum.uniq()}
+      error -> error
     end
   end
 
@@ -591,6 +949,10 @@ defmodule Code.WAL do
     # Jitter so that a burst of concurrent pushers spreads out instead of
     # colliding on the same retry instant.
     Process.sleep(min(200, trunc(:math.pow(2, attempt))) + :rand.uniform(25))
+  end
+
+  defp emit_ambiguous(repo_id, seq, cause) do
+    :telemetry.execute([:code, :wal, :ambiguous_commit], %{seq: seq}, %{repo_id: repo_id, cause: cause})
   end
 
   defp emit_read(outcome, duration, repo_id) do

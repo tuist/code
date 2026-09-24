@@ -43,6 +43,9 @@ defmodule Code.Application do
         {Task.Supervisor, name: Code.TaskSupervisor},
         object_store_children(),
         {Registry, keys: :unique, name: Code.ReplicaRegistry},
+        # Work running against a local repository outside its replica process,
+        # so eviction and pack pruning can wait for it. See Code.Replica.Lease.
+        {Registry, keys: :duplicate, name: Code.LeaseRegistry},
         {DynamicSupervisor, strategy: :one_for_one, name: Code.ReplicaSupervisor},
         # One writer per repository, batching its index updates.
         {Registry, keys: :unique, name: Code.WriterRegistry},

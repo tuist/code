@@ -192,11 +192,40 @@ defmodule Code.WALTest do
     test "snapshots the previous index for provenance", %{repo: repo} do
       {:ok, _} = WAL.create(repo)
       {:ok, index, etag} = WAL.fetch(repo)
-      {:ok, _} = WAL.compact(repo, [], %{}, index.base.symrefs, index, etag)
+      {:ok, compacted} = WAL.compact(repo, [], %{}, index.base.symrefs, index, etag)
 
-      assert {:ok, body, _} = Code.ObjectStore.get(WAL.history_key(repo, index.epoch))
+      assert {:ok, body, _} = Code.ObjectStore.get(compacted.base.history_key)
       assert {:ok, snapshot} = Index.decode(body)
-      assert snapshot.epoch == index.epoch
+      assert snapshot == index
+    end
+
+    test "binds the new base to the exact index version it replaced", %{repo: repo} do
+      # Two compactions planned from the same epoch but different sequence
+      # numbers. The first plans against seq 1 and loses its compare-and-swap
+      # to a push; the second plans against seq 2 and wins. Snapshots keyed by
+      # epoch alone would leave the loser's seq-1 snapshot standing in for the
+      # seq-2 index the winner actually replaced, missing the second push.
+      {:ok, _} = WAL.create(repo)
+
+      {:ok, _} =
+        WAL.append(repo, fn _ -> {:ok, push_entry("refs/heads/a", zero(), String.duplicate("a", 40))} end)
+
+      {:ok, stale, stale_etag} = WAL.fetch(repo)
+
+      {:ok, _} =
+        WAL.append(repo, fn _ -> {:ok, push_entry("refs/heads/b", zero(), String.duplicate("b", 40))} end)
+
+      assert {:error, :raced} = WAL.compact(repo, [], stale.refs, stale.base.symrefs, stale, stale_etag)
+
+      {:ok, current, etag} = WAL.fetch(repo)
+      assert current.epoch == stale.epoch
+      assert {:ok, compacted} = WAL.compact(repo, [], current.refs, current.base.symrefs, current, etag)
+
+      assert {:ok, body, _} = Code.ObjectStore.get(compacted.base.history_key)
+      assert {:ok, snapshot} = Index.decode(body)
+      assert snapshot.seq == current.seq
+      assert snapshot == current
+      assert length(snapshot.entries) == 2
     end
   end
 

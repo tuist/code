@@ -39,6 +39,7 @@ defmodule Code.Replica.Compactor do
   alias Code.Config
   alias Code.Git
   alias Code.Replica
+  alias Code.Replica.Lease
   alias Code.WAL
   alias Code.WAL.Index
 
@@ -96,30 +97,68 @@ defmodule Code.Replica.Compactor do
   # not "merged" into the repack: the conditional write rejects the stale
   # snapshot, and the scheduler later plans a fresh job. That keeps a
   # partition or a duplicated job to wasted compute rather than lost history.
+  #
+  # What is published is the snapshot's own ref state, `index.refs` and
+  # `index.base.symrefs`, never the local repository's. Local refs are a cache
+  # that can lag or, after a delayed local update, even move backwards;
+  # publishing them would let a compaction silently revert a push the index
+  # already holds, under an ETag that has not changed.
   defp compact_snapshot(repo_id, index, etag) do
     started = System.monotonic_time(:millisecond)
+    refs = Index.refs(index)
 
     # Compact from a repository that is already caught up, otherwise the repack
     # would produce a base missing the most recent pushes.
-    with {:ok, view} <- Replica.ensure_fresh(repo_id),
-         :ok <- ensure_caught_up(view, index),
-         {:ok, packs} <- Git.repack(view.path),
-         {:ok, refs} <- Git.refs(view.path),
-         {:ok, descriptors} <- upload_packs(repo_id, packs),
-         {:ok, compacted} <- WAL.compact(repo_id, descriptors, refs, index.base.symrefs, index, etag) do
-      Replica.record_local_push(repo_id, compacted.epoch, compacted.seq)
-      Cluster.announce(repo_id, compacted.epoch, compacted.seq)
+    result =
+      with {:ok, view} <- Replica.ensure_fresh(repo_id),
+           :ok <- ensure_caught_up(view, index) do
+        # The lease stops a concurrent sync on this node from pruning the new
+        # packs, which no index names until the compare-and-swap below lands.
+        Lease.hold(view.path, fn ->
+          # Converge the local refs on the snapshot so the repack is taken over
+          # exactly the refs being published, then check the result rather than
+          # trusting that it is so.
+          with :ok <- Git.reset_refs(view.path, refs),
+               {:ok, packs} <- Git.repack(view.path),
+               :ok <- Git.verify_packs_closed(view.path, packs, Enum.uniq(Map.values(refs))),
+               {:ok, descriptors} <- upload_packs(repo_id, packs),
+               {:ok, compacted} <- WAL.compact(repo_id, descriptors, refs, index.base.symrefs, index, etag) do
+            Replica.record_local_push(repo_id, compacted.epoch, compacted.seq)
+            Cluster.announce(repo_id, compacted.epoch, compacted.seq)
 
-      duration = System.monotonic_time(:millisecond) - started
+            duration = System.monotonic_time(:millisecond) - started
 
-      Logger.info(
-        "compacted #{repo_id}: #{length(index.entries)} entries -> epoch #{compacted.epoch} " <>
-          "(#{length(descriptors)} pack(s), #{duration}ms)"
-      )
+            Logger.info("compacted repository",
+              repo_id: repo_id,
+              entries: length(index.entries),
+              epoch: compacted.epoch,
+              packs: length(descriptors),
+              duration_ms: duration
+            )
 
-      {:ok, %{epoch: compacted.epoch, seq: compacted.seq, packs: length(descriptors), duration_ms: duration}}
-    end
+            {:ok,
+             %{epoch: compacted.epoch, seq: compacted.seq, packs: length(descriptors), duration_ms: duration}}
+          end
+        end)
+      end
+
+    report(repo_id, result)
+    result
   end
+
+  defp report(_repo_id, {:ok, _}), do: :ok
+  defp report(_repo_id, {:error, reason}) when reason in [:raced, :stale_replica], do: :ok
+
+  defp report(repo_id, {:error, {:repack_incomplete, missing}}) do
+    :telemetry.execute([:code, :compaction, :incomplete_repack], %{missing: missing}, %{repo_id: repo_id})
+
+    Logger.error("compaction refused: the repack does not contain everything its refs reach",
+      repo_id: repo_id,
+      missing: missing
+    )
+  end
+
+  defp report(_repo_id, _other), do: :ok
 
   # A repack of a stale working copy would silently drop pushes that landed
   # while we were behind, so refuse rather than publish an incomplete base.
@@ -162,7 +201,7 @@ defmodule Code.Replica.Compactor do
         case maybe_compact(repo_id) do
           {:ok, _result} -> :ok
           :not_due -> :ok
-          {:error, reason} -> Logger.debug("compaction skipped for #{repo_id}: #{inspect(reason)}")
+          {:error, reason} -> Logger.debug("compaction skipped", repo_id: repo_id, reason: inspect(reason))
         end
       end)
     end
