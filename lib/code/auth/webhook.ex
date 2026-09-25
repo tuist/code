@@ -58,8 +58,13 @@ defmodule Code.Auth.Webhook do
     key = cache_key(token, config)
 
     case cached(key, config) do
-      {:ok, principal} -> {:ok, principal}
-      :miss -> resolve(key, token, config)
+      {:ok, principal} ->
+        :telemetry.execute([:code, :auth, :webhook, :cache], %{}, %{outcome: :hit})
+        {:ok, principal}
+
+      :miss ->
+        :telemetry.execute([:code, :auth, :webhook, :cache], %{}, %{outcome: :miss})
+        resolve(key, token, config)
     end
   end
 
@@ -125,43 +130,72 @@ defmodule Code.Auth.Webhook do
       {"content-type", "application/json"}
     ]
 
-    case Req.post(endpoint, headers: headers, json: %{credential: token, node: Code.Config.node_id()}) do
-      {:ok, %{status: 200, body: body}} ->
-        case build(body) do
-          {:ok, principal} ->
-            if :ets.whereis(@table) != :undefined do
-              evict_expired(config)
-              :ets.insert(@table, {key, principal, System.monotonic_time(:millisecond)})
-            end
+    # Time only the network round trip. Body parsing, cache sweeps and ETS
+    # inserts that follow are local work; folding them in would let the
+    # authority look slow when the node itself was the bottleneck.
+    started = System.monotonic_time()
 
-            {:ok, principal}
+    response =
+      Code.Telemetry.span("code.auth.webhook.call", %{}, fn ->
+        Req.post(endpoint, headers: headers, json: %{credential: token, node: Code.Config.node_id()})
+      end)
 
-          {:error, reason} ->
-            # The body is the authority's, and may echo the credential, so
-            # only the shape of the problem is logged.
-            Logger.warning("authorization authority returned an unusable response",
-              reason: inspect(reason),
-              operation: "webhook_authenticate"
-            )
+    duration_us = System.convert_time_unit(System.monotonic_time() - started, :native, :microsecond)
 
-            {:error, :invalid_authority_response}
+    {result, outcome} = interpret(response, key, config)
+
+    :telemetry.execute([:code, :auth, :webhook, :call], %{duration_us: duration_us}, %{outcome: outcome})
+
+    result
+  end
+
+  defp interpret({:ok, %{status: 200, body: body}}, key, config) do
+    case build(body) do
+      {:ok, principal} ->
+        if :ets.whereis(@table) != :undefined do
+          evict_expired(config)
+          :ets.insert(@table, {key, principal, System.monotonic_time(:millisecond)})
         end
 
-      {:ok, %{status: status}} when status in [401, 403] ->
-        {:error, :invalid_credential}
-
-      {:ok, %{status: status}} ->
-        {:error, {:authority_status, status}}
+        {{:ok, principal}, :ok}
 
       {:error, reason} ->
-        Logger.warning("authorization authority unreachable",
+        # The body is the authority's, and may echo the credential, so
+        # only the shape of the problem is logged.
+        Logger.warning("authorization authority returned an unusable response",
           reason: inspect(reason),
           operation: "webhook_authenticate"
         )
 
-        {:error, :authority_unreachable}
+        {{:error, :invalid_authority_response}, :error}
     end
   end
+
+  defp interpret({:ok, %{status: status}}, _key, _config) when status in [401, 403] do
+    {{:error, :invalid_credential}, :denied}
+  end
+
+  defp interpret({:ok, %{status: status}}, _key, _config) do
+    # Only the status; the body is the authority's and may echo the credential.
+    Logger.warning("authorization authority returned an unexpected status",
+      status: status,
+      operation: "webhook_authenticate"
+    )
+
+    {{:error, {:authority_status, status}}, :error}
+  end
+
+  defp interpret({:error, reason}, _key, _config) do
+    Logger.warning("authorization authority unreachable",
+      reason: inspect(reason),
+      operation: "webhook_authenticate"
+    )
+
+    {{:error, :authority_unreachable}, classify_transport(reason)}
+  end
+
+  defp classify_transport(%{reason: :timeout}), do: :timeout
+  defp classify_transport(_reason), do: :error
 
   # The authority is trusted to decide, not to be well-formed. Anything that
   # does not fit the documented shape is refused as a whole rather than

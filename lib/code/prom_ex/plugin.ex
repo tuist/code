@@ -423,6 +423,54 @@ defmodule Code.PromEx.Plugin do
         description:
           "Policy revalidations that could not reach object storage, by outcome: served_stale or failed_closed.",
         tags: [:outcome]
+      ),
+      distribution(
+        [:code, :auth, :jwks, :refresh, :duration],
+        event_name: [:code, :auth, :jwks, :refresh],
+        measurement: :duration_us,
+        description:
+          "Duration of a background signing-key refresh, by outcome. `error` covers any failure the fetch caught — connection refusal, timeout, non-200 status, unparseable body, missing configuration. `crashed` means the refresh task itself died. Neither fails already-cached kids: stale keys keep serving.",
+        unit: {:microsecond, :second},
+        tags: [:outcome],
+        reporter_options: [buckets: [0.005, 0.025, 0.1, 0.5, 1, 5]]
+      ),
+      counter(
+        [:code, :auth, :jwks, :refresh, :count],
+        event_name: [:code, :auth, :jwks, :refresh],
+        description:
+          "Background signing-key refreshes, by outcome (`ok`, `error`, `crashed`). `error` is any failure the fetch caught (connection, timeout, status, parse, local misconfiguration); `crashed` is the task itself dying. Non-`ok` means the node did not refresh — the underlying cause is in the logs, not this label.",
+        tags: [:outcome]
+      ),
+      counter(
+        [:code, :auth, :jwks, :lookup, :count],
+        event_name: [:code, :auth, :jwks, :lookup],
+        description:
+          "Signing-key lookups, by source: `cache_fresh` (served from cache, no refresh due), `cache_stale` (served, refresh triggered), `call_path` (fell through the fast in-ETS path into the GenServer, which may then wait on a fetch).",
+        tags: [:source]
+      ),
+      counter(
+        [:code, :auth, :webhook, :cache, :count],
+        event_name: [:code, :auth, :webhook, :cache],
+        description:
+          "Webhook authentication cache lookups, by outcome: `hit` (served from local ETS) or `miss` (had to call the authority).",
+        tags: [:outcome]
+      ),
+      distribution(
+        [:code, :auth, :webhook, :call, :duration],
+        event_name: [:code, :auth, :webhook, :call],
+        measurement: :duration_us,
+        description:
+          "Duration of a call to the external authorization authority, by outcome: `ok`, `denied` (401 or 403), `timeout`, `error`.",
+        unit: {:microsecond, :second},
+        tags: [:outcome],
+        reporter_options: [buckets: [0.005, 0.025, 0.1, 0.5, 1, 5]]
+      ),
+      counter(
+        [:code, :auth, :webhook, :call, :count],
+        event_name: [:code, :auth, :webhook, :call],
+        description:
+          "Calls to the external authorization authority, by outcome. Rising `denied` is a token problem; rising `error` or `timeout` is the authority's own health.",
+        tags: [:outcome]
       )
     ])
   end

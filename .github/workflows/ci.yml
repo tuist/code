@@ -146,15 +146,23 @@ jobs:
       - name: Smoke test the image
         run: |
           docker network create code-ci
-          docker run -d --name minio --network code-ci \
-            -e MINIO_ROOT_USER=code -e MINIO_ROOT_PASSWORD=code-secret \
-            quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
-          docker run --rm --network code-ci --entrypoint sh quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z -c \
-            'until mc alias set local http://minio:9000 code code-secret; do sleep 1; done; mc mb --ignore-existing local/code'
+          # RustFS speaks the S3 API on 9000, drop-in for MinIO here. MinIO's
+          # OSS images stopped being served by public registries, and RustFS
+          # is anonymously pullable from Docker Hub.
+          docker run -d --name storage --network code-ci \
+            -e RUSTFS_ACCESS_KEY=code -e RUSTFS_SECRET_KEY=code-secret \
+            rustfs/rustfs:v1.0.0-rc.5
+          docker run --rm --network code-ci \
+            -e AWS_ACCESS_KEY_ID=code -e AWS_SECRET_ACCESS_KEY=code-secret \
+            -e AWS_DEFAULT_REGION=us-east-1 \
+            --entrypoint sh amazon/aws-cli:2.37.3 -c \
+            'until aws --endpoint-url http://storage:9000 s3api list-buckets >/dev/null 2>&1; do sleep 1; done
+             aws --endpoint-url http://storage:9000 s3api create-bucket --bucket code 2>/dev/null || true
+             aws --endpoint-url http://storage:9000 s3api head-bucket --bucket code'
 
           docker run -d --name code --network code-ci \
             -e CODE_S3_BUCKET=code \
-            -e CODE_S3_ENDPOINT=http://minio:9000 \
+            -e CODE_S3_ENDPOINT=http://storage:9000 \
             -e CODE_S3_ACCESS_KEY_ID=code \
             -e CODE_S3_SECRET_ACCESS_KEY=code-secret \
             -e CODE_S3_REGION=us-east-1 \
@@ -190,11 +198,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
-      - run: helm lint charts/code --set objectStore.endpoint=http://minio:9000 --set auth.oidc.audience=code
+      - run: helm lint charts/code --set objectStore.endpoint=http://storage:9000 --set auth.oidc.audience=code
       - name: Render with autoscaling and ingress enabled
         run: |
           helm template code charts/code \
-            --set objectStore.endpoint=http://minio:9000 \
+            --set objectStore.endpoint=http://storage:9000 \
             --set auth.oidc.audience=code \
             --set autoscaling.enabled=true \
             --set ingress.enabled=true \
@@ -225,40 +233,47 @@ jobs:
           docker build -t code:ci .
           kind load docker-image code:ci --name code
 
-      - name: Deploy MinIO
+      - name: Deploy the object store
         run: |
           kubectl create namespace code
+          # RustFS in place of MinIO: its OSS images stopped being served by
+          # public registries. Service and Deployment are named "storage" so
+          # the chart's objectStore.endpoint stays vendor neutral.
           kubectl -n code apply -f - <<'MANIFEST'
           apiVersion: apps/v1
           kind: Deployment
-          metadata: {name: minio}
+          metadata: {name: storage}
           spec:
             replicas: 1
-            selector: {matchLabels: {app: minio}}
+            selector: {matchLabels: {app: storage}}
             template:
-              metadata: {labels: {app: minio}}
+              metadata: {labels: {app: storage}}
               spec:
                 containers:
-                  - name: minio
-                    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
-                    args: ["server", "/data"]
+                  - name: storage
+                    image: rustfs/rustfs:v1.0.0-rc.5
                     env:
-                      - {name: MINIO_ROOT_USER, value: code}
-                      - {name: MINIO_ROOT_PASSWORD, value: code-secret}
+                      - {name: RUSTFS_ACCESS_KEY, value: code}
+                      - {name: RUSTFS_SECRET_KEY, value: code-secret}
                     ports: [{containerPort: 9000}]
           ---
           apiVersion: v1
           kind: Service
-          metadata: {name: minio}
+          metadata: {name: storage}
           spec:
-            selector: {app: minio}
+            selector: {app: storage}
             ports: [{port: 9000, targetPort: 9000}]
           MANIFEST
-          kubectl -n code wait --for=condition=available deployment/minio --timeout=180s
-          kubectl -n code run mc --rm -i --restart=Never \
-            --image=quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z \
-            --env=MC_HOST_local="http://code:code-secret@minio:9000" \
-            -- mb --ignore-existing local/code
+          kubectl -n code wait --for=condition=available deployment/storage --timeout=180s
+          kubectl -n code run createbucket --rm -i --restart=Never \
+            --image=amazon/aws-cli:2.37.3 \
+            --env=AWS_ACCESS_KEY_ID=code \
+            --env=AWS_SECRET_ACCESS_KEY=code-secret \
+            --env=AWS_DEFAULT_REGION=us-east-1 \
+            --command -- sh -c '
+              until aws --endpoint-url http://storage:9000 s3api list-buckets >/dev/null 2>&1; do sleep 1; done
+              aws --endpoint-url http://storage:9000 s3api create-bucket --bucket code 2>/dev/null || true
+              aws --endpoint-url http://storage:9000 s3api head-bucket --bucket code'
 
       - name: Install the chart
         run: |
@@ -269,7 +284,7 @@ jobs:
           helm install code charts/code -n code \
             --set image.repository=code --set image.tag=ci --set image.pullPolicy=IfNotPresent \
             --set replicaCount=3 \
-            --set objectStore.endpoint=http://minio:9000 \
+            --set objectStore.endpoint=http://storage:9000 \
             --set objectStore.bucket=code \
             --set objectStore.region=us-east-1 \
             --set objectStore.existingSecret=code-s3 \

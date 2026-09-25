@@ -85,10 +85,26 @@ defmodule Code.Auth.JWKS do
 
     with {:ok, keys, fetched_at} <- cached_keys(server, config),
          jwk when not is_nil(jwk) <- lookup(keys, kid) do
-      if elapsed?(fetched_at, now(), refresh_interval(config)), do: GenServer.cast(server, {:refresh, config})
+      source =
+        if elapsed?(fetched_at, now(), refresh_interval(config)) do
+          GenServer.cast(server, {:refresh, config})
+          :cache_stale
+        else
+          :cache_fresh
+        end
+
+      :telemetry.execute([:code, :auth, :jwks, :lookup], %{}, %{source: source})
       {:ok, jwk}
     else
-      _ -> call(server, {:fetch, kid, config}, config)
+      _ ->
+        # Fell through the fast in-ETS path into the GenServer. That path may
+        # or may not block on I/O — cooldown, a fetch already in flight, or a
+        # missing server can all short-circuit it. `:call_path` is the honest
+        # signal; correlate with `refresh{outcome}` to distinguish a cache
+        # miss from an issuer outage.
+        result = call(server, {:fetch, kid, config}, config)
+        :telemetry.execute([:code, :auth, :jwks, :lookup], %{}, %{source: :call_path})
+        result
     end
   end
 
@@ -177,13 +193,14 @@ defmodule Code.Auth.JWKS do
   end
 
   @impl true
-  def handle_info({ref, result}, %{task: {ref, config}} = state) do
+  def handle_info({ref, result}, %{task: {ref, config, started_at}} = state) do
     Process.demonitor(ref, [:flush])
-    {:noreply, complete(state, config, result)}
+    {:noreply, complete(state, config, started_at, result)}
   end
 
-  def handle_info({:DOWN, ref, :process, _pid, reason}, %{task: {ref, config}} = state) do
-    {:noreply, complete(state, config, %{document: nil, keys: {:error, {:refresh_crashed, reason}}})}
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{task: {ref, config, started_at}} = state) do
+    {:noreply,
+     complete(state, config, started_at, %{document: nil, keys: {:error, {:refresh_crashed, reason}}})}
   end
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -210,8 +227,14 @@ defmodule Code.Auth.JWKS do
           :miss -> nil
         end
 
-      task = Task.Supervisor.async_nolink(task_supervisor(), fn -> load(config, document) end)
-      %{state | task: {task.ref, config}, last_attempt: now}
+      started_at = System.monotonic_time()
+
+      task =
+        Task.Supervisor.async_nolink(task_supervisor(), fn ->
+          Code.Telemetry.span("code.auth.jwks.refresh", %{}, fn -> load(config, document) end)
+        end)
+
+      %{state | task: {task.ref, config, started_at}, last_attempt: now}
     else
       state
     end
@@ -229,23 +252,33 @@ defmodule Code.Auth.JWKS do
     pid
   end
 
-  defp complete(state, config, %{document: document, keys: keys}) do
+  defp complete(state, config, started_at, %{document: document, keys: keys}) do
     signature = config_signature(config)
     if document, do: :ets.insert(state.table, {{:document, signature}, document})
 
-    state =
+    {state, outcome} =
       case keys do
         {:ok, keys} ->
           :ets.insert(state.table, {{:keys, signature}, keys, now()})
           Logger.debug("code: loaded #{map_size(keys)} signing key(s)")
-          %{state | last_error: nil}
+          {%{state | last_error: nil}, :ok}
+
+        {:error, {:refresh_crashed, _} = reason} ->
+          Logger.warning("could not refresh signing keys", reason: inspect(reason), operation: "jwks_refresh")
+          {%{state | last_error: reason}, :crashed}
 
         {:error, reason} ->
           # Keep serving with what we have. Losing the issuer, or the issuer
           # publishing garbage, should not take the Git server down with it.
           Logger.warning("could not refresh signing keys", reason: inspect(reason), operation: "jwks_refresh")
-          %{state | last_error: reason}
+          {%{state | last_error: reason}, :error}
       end
+
+    :telemetry.execute(
+      [:code, :auth, :jwks, :refresh],
+      %{duration_us: System.convert_time_unit(System.monotonic_time() - started_at, :native, :microsecond)},
+      %{outcome: outcome}
+    )
 
     for {from, request} <- Enum.reverse(state.waiters), do: GenServer.reply(from, answer(request, state))
 

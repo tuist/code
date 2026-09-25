@@ -20,7 +20,13 @@ defmodule Code.PromExTest do
   # observable contract: update docs/operations.md in the same commit.
   @expected ~w(
     code_auth_denied_count
+    code_auth_jwks_lookup_count
+    code_auth_jwks_refresh_count
+    code_auth_jwks_refresh_duration
     code_auth_rejected_count
+    code_auth_webhook_cache_count
+    code_auth_webhook_call_count
+    code_auth_webhook_call_duration
     code_cluster_observed_disk_used_bytes
     code_cluster_observed_resident
     code_cluster_observed_size
@@ -113,7 +119,8 @@ defmodule Code.PromExTest do
         permission: :read,
         kind: :compact,
         mode: :force,
-        repo_id: "acme/app"
+        repo_id: "acme/app",
+        source: :cache_fresh
       }
 
       :telemetry.execute(event, measurements, meta)

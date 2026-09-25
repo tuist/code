@@ -291,6 +291,10 @@ replicas are doing real catch-up work on the read path, and latency will follow.
 | `code_factory_operation_duration{operation,outcome}` | Are durable graph-run or account configuration operations slow (seconds) or failing? |
 | `code_factory_operation_count{operation,outcome}` | Which durable graph-run or account configuration operations are succeeding or failing? |
 | `code_auth_denied_count{permission}` | Authorization denials |
+| `code_auth_jwks_refresh_duration{outcome}`, `code_auth_jwks_refresh_count{outcome}` | Duration (seconds) and count of the background signing-key refresh, by outcome (`ok`, `error`, `crashed`). A failing refresh does not fail requests: stale keys keep serving |
+| `code_auth_jwks_lookup_count{source}` | Signing-key lookups by path: `cache_fresh` (served from cache, no refresh due), `cache_stale` (served, refresh triggered), `call_path` (fell through the fast in-ETS path into the GenServer, which may then wait on a fetch). `call_path` rising with `refresh{outcome="error"}` is an issuer outage; rising alone is unknown key ids arriving |
+| `code_auth_webhook_cache_count{outcome}` | Webhook authentication cache lookups: `hit` avoids a call to the authority, `miss` triggers one. The ratio reveals the effective cache TTL |
+| `code_auth_webhook_call_duration{outcome}`, `code_auth_webhook_call_count{outcome}` | Duration (seconds) and count of the external authority call, by outcome (`ok`, `denied`, `timeout`, `error`). Separate from cache-served traffic so authority latency stays legible |
 | `code_cluster_observed_size`, `code_cluster_observed_resident` | Cluster members, and repositories materialized on this node |
 | `code_cluster_observed_disk_used_bytes` | Bytes the local cache occupies. Measured in the background at most every five minutes, so it lags by up to that much and reads `0` until the first measurement |
 | `code_auth_rejected_count{reason}` | Are credentials failing, and whose problem is it? `reason` is one of a fixed set: caller-side values such as `invalid_credential`, `expired`, `audience_mismatch`, `issuer_mismatch`, `unknown_key`; operator-side values `misconfigured`, `key_source_unavailable`, `authority_unavailable`; and `other`. Anonymous requests, which `git` always sends first, are not counted |
@@ -437,6 +441,41 @@ revoke everybody's access. Past that, policy grants fail closed until the store
 answers again, so a grant revoked during a long outage cannot keep working on a
 node that cannot see the revocation. Grants carried in tokens are unaffected.
 Watch `code_policy_revalidation_failed_count{outcome="failed_closed"}`.
+
+**Clients are being rejected as unauthenticated.** Look at
+`code_auth_rejected_count{reason}` first — the reason label separates a caller
+who sent a bad or expired token (`invalid_credential`, `expired`,
+`unknown_key`, `issuer_mismatch`, `audience_mismatch`, ...) from an operator
+problem the caller cannot fix (`key_source_unavailable`, `misconfigured`,
+`authority_unavailable`, `other`). For the OIDC backend
+`key_source_unavailable` maps onto the signing-key fetch. Each completed
+refresh attempt increments `code_auth_jwks_refresh_count{outcome}` with
+`ok`, `error` or `crashed`; a refresh that hangs and never completes emits
+no sample at all, so a flat series over time can be either a working cache
+that never needed to refresh or a task that is not making progress. Read
+`error` broadly: it fires for connection failures, timeouts, non-200 status,
+unparseable bodies and missing local configuration, so the underlying cause
+is in the logs (`operation=jwks_refresh`), not the counter alone. `crashed`
+surfaces to callers as the `other` reason bucket rather than
+`key_source_unavailable`. `code_auth_jwks_lookup_count{source="call_path"}`
+counts requests that fell through the fast in-ETS path into the GenServer —
+those may or may not have blocked on I/O, and can also reflect unknown key
+ids or a cold cache, so correlate with `refresh{outcome}` rather than
+reading `call_path` on its own. Stale keys keep serving already-known kids
+while a refresh is failing; on a cold cache the lookup goes through the
+GenServer, which either starts a fetch or joins one already in flight — the
+caller's wait is capped at `2 * :fetch_timeout_ms + 1s`, while individual
+requests use `:fetch_timeout_ms` for connection and response but can
+overshoot in wall-clock terms. It can also short-circuit without starting a
+fetch when a recent attempt is still inside its `:refetch_cooldown_ms`, in
+which case the reply is whatever is cached, or the last error. A cold-cache lookup succeeds only if that path delivers the
+requested kid inside the budget. For the
+webhook backend the split between `code_auth_webhook_cache_count{outcome}`
+and `code_auth_webhook_call_duration{outcome}` isolates the authority call
+from cache-served traffic; `denied` is a token the authority rejected, and
+`error` or `timeout` is any failure of the call itself — network path, TLS,
+timeout waiting on a response, or a response the node could not use — with
+the underlying cause in the logs (`operation=webhook_authenticate`).
 
 **A git command hangs with no output on macOS.** Not Code. The `osxkeychain`
 credential helper blocks storing a credential for a host and port it has not
