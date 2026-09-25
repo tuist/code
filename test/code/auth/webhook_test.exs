@@ -257,4 +257,91 @@ defmodule Code.Auth.WebhookTest do
       assert :counters.get(counter, 1) == 2
     end
   end
+
+  describe "telemetry" do
+    test "a cache miss followed by a call reports miss then ok", %{config: config} do
+      config = Keyword.put(config, :cache_ttl_ms, 60_000)
+      token = "telemetry-miss-#{:erlang.unique_integer([:positive])}"
+      respond(200, %{"subject" => "alice"})
+
+      attach = attach_events([[:code, :auth, :webhook, :cache], [:code, :auth, :webhook, :call]])
+
+      assert {:ok, _} = Webhook.authenticate({:bearer, token}, config)
+
+      assert_receive {:telemetry, [:code, :auth, :webhook, :cache], %{}, %{outcome: :miss}}
+
+      assert_receive {:telemetry, [:code, :auth, :webhook, :call], %{duration_us: duration_us},
+                      %{outcome: :ok}}
+
+      assert duration_us >= 0
+
+      :telemetry.detach(attach)
+    end
+
+    test "a second lookup within the TTL reports a cache hit and no call", %{config: config} do
+      config = Keyword.put(config, :cache_ttl_ms, 60_000)
+      token = "telemetry-hit-#{:erlang.unique_integer([:positive])}"
+      respond(200, %{"subject" => "alice"})
+
+      assert {:ok, _} = Webhook.authenticate({:bearer, token}, config)
+
+      attach = attach_events([[:code, :auth, :webhook, :cache], [:code, :auth, :webhook, :call]])
+      assert {:ok, _} = Webhook.authenticate({:bearer, token}, config)
+
+      assert_receive {:telemetry, [:code, :auth, :webhook, :cache], %{}, %{outcome: :hit}}
+      refute_received {:telemetry, [:code, :auth, :webhook, :call], _, _}
+
+      :telemetry.detach(attach)
+    end
+
+    test "a 401 from the authority reports outcome=denied", %{config: config} do
+      respond(401, "")
+      attach = attach_events([[:code, :auth, :webhook, :call]])
+
+      assert {:error, :invalid_credential} = Webhook.authenticate({:bearer, "denied-token"}, config)
+
+      assert_receive {:telemetry, [:code, :auth, :webhook, :call], %{}, %{outcome: :denied}}
+
+      :telemetry.detach(attach)
+    end
+
+    test "a transport failure reports outcome=error", %{config: config} do
+      stub(Req, :post, fn _url, _opts -> {:error, %Mint.TransportError{reason: :econnrefused}} end)
+      attach = attach_events([[:code, :auth, :webhook, :call]])
+
+      assert {:error, :authority_unreachable} = Webhook.authenticate({:bearer, "unreachable"}, config)
+
+      assert_receive {:telemetry, [:code, :auth, :webhook, :call], %{}, %{outcome: :error}}
+
+      :telemetry.detach(attach)
+    end
+
+    test "a transport timeout reports outcome=timeout", %{config: config} do
+      stub(Req, :post, fn _url, _opts -> {:error, %Mint.TransportError{reason: :timeout}} end)
+      attach = attach_events([[:code, :auth, :webhook, :call]])
+
+      assert {:error, :authority_unreachable} = Webhook.authenticate({:bearer, "timeout"}, config)
+
+      assert_receive {:telemetry, [:code, :auth, :webhook, :call], %{}, %{outcome: :timeout}}
+
+      :telemetry.detach(attach)
+    end
+  end
+
+  defp attach_events(events) do
+    test_process = self()
+    id = "webhook-telemetry-#{:erlang.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach_many(
+        id,
+        events,
+        fn event, measurements, meta, _ ->
+          send(test_process, {:telemetry, event, measurements, meta})
+        end,
+        nil
+      )
+
+    id
+  end
 end

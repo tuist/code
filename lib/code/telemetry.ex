@@ -49,6 +49,19 @@ defmodule Code.Telemetry do
     * `[:code, :factory, :operation]` — `duration_us`, meta `operation`,
       `outcome`; durable graph-run and account-configuration coordination
     * `[:code, :auth, :authorized]` / `[:code, :auth, :denied]`
+    * `[:code, :auth, :jwks, :refresh]` — `duration_us`, meta `outcome` (`ok`,
+      `error`, `crashed`); the background signing-key refresh completed. A
+      failing refresh does not fail requests: stale keys keep serving.
+    * `[:code, :auth, :jwks, :lookup]` — meta `source` (`cache_fresh`,
+      `cache_stale`, `call_path`); which path a signing-key lookup took.
+      `call_path` fell through the fast in-ETS path into the GenServer and
+      may or may not have blocked on I/O — correlate with `:refresh` to tell
+      "issuer down" from "unknown kid".
+    * `[:code, :auth, :webhook, :cache]` — meta `outcome` (`hit`, `miss`); a
+      hit avoids a call to the external authority.
+    * `[:code, :auth, :webhook, :call]` — `duration_us`, meta `outcome`
+      (`ok`, `denied`, `timeout`, `error`); the authority itself, distinct
+      from cache-served traffic.
     * `[:code, :cluster, :nodeup]` / `[:code, :cluster, :nodedown]`
     * `[:code, :repository, :created]`
   """

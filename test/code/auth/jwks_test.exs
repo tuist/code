@@ -105,4 +105,87 @@ defmodule Code.Auth.JWKSTest do
     moved = Keyword.put(config, :issuer, "https://elsewhere.example.com")
     assert {:ok, "https://elsewhere.example.com"} = JWKS.issuer(moved)
   end
+
+  describe "telemetry" do
+    test "a successful refresh emits a duration and outcome=ok", %{config: config} do
+      attach = attach_events([[:code, :auth, :jwks, :refresh]])
+
+      assert {:ok, _} = JWKS.fetch("test-key", config)
+
+      assert_receive {:telemetry, [:code, :auth, :jwks, :refresh], %{duration_us: duration_us},
+                      %{outcome: :ok}}
+
+      assert duration_us > 0
+
+      :telemetry.detach(attach)
+    end
+
+    test "an unreachable issuer emits outcome=error", %{config: config} do
+      attach = attach_events([[:code, :auth, :jwks, :refresh]])
+
+      unreachable = Keyword.put(config, :issuer, "http://127.0.0.1:1")
+      assert {:error, _} = JWKS.fetch("test-key", unreachable)
+
+      assert_receive {:telemetry, [:code, :auth, :jwks, :refresh], %{}, %{outcome: :error}}, 2_000
+
+      :telemetry.detach(attach)
+    end
+
+    test "a lookup served from a fresh cache reports source=cache_fresh", %{config: config} do
+      # Prime the cache.
+      assert {:ok, _} = JWKS.fetch("test-key", config)
+
+      attach = attach_events([[:code, :auth, :jwks, :lookup]])
+      assert {:ok, _} = JWKS.fetch("test-key", config)
+      assert_receive {:telemetry, [:code, :auth, :jwks, :lookup], %{}, %{source: :cache_fresh}}
+
+      :telemetry.detach(attach)
+    end
+
+    test "a lookup served from a stale cache reports source=cache_stale", %{config: config} do
+      config = Keyword.put(config, :refresh_interval_ms, 1)
+      assert {:ok, _} = JWKS.fetch("test-key", config)
+
+      # `elapsed?` compares `now - fetched_at > interval`, so a same-millisecond
+      # follow-up sees a fresh cache. Wait past the interval to see the stale path.
+      Process.sleep(5)
+
+      attach = attach_events([[:code, :auth, :jwks, :lookup]])
+      assert {:ok, _} = JWKS.fetch("test-key", config)
+      assert_receive {:telemetry, [:code, :auth, :jwks, :lookup], %{}, %{source: :cache_stale}}
+
+      :telemetry.detach(attach)
+    end
+
+    test "a lookup that falls through the fast path reports source=call_path", %{config: config} do
+      # A cold cache is the simplest way to force the fallback; the GenServer
+      # then blocks on a fetch. `call_path` also covers same-path lookups
+      # that do not block (cooldown, in-flight fetch), which is the honest
+      # signal: the operator has to correlate with `:refresh` to tell them
+      # apart.
+      attach = attach_events([[:code, :auth, :jwks, :lookup]])
+
+      assert {:ok, _} = JWKS.fetch("test-key", config)
+      assert_receive {:telemetry, [:code, :auth, :jwks, :lookup], %{}, %{source: :call_path}}
+
+      :telemetry.detach(attach)
+    end
+  end
+
+  defp attach_events(events) do
+    test_process = self()
+    id = "jwks-telemetry-#{:erlang.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach_many(
+        id,
+        events,
+        fn event, measurements, meta, _ ->
+          send(test_process, {:telemetry, event, measurements, meta})
+        end,
+        nil
+      )
+
+    id
+  end
 end
