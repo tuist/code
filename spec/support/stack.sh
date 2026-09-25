@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Bring up the stack the end-to-end suite runs against: MinIO, and two Code
-# nodes clustered with each other.
+# Bring up the stack the end-to-end suite runs against: an S3-compatible
+# object store (RustFS in place of the withdrawn MinIO OSS images), and two
+# Code nodes clustered with each other.
 #
 # Two nodes rather than one, because most of what is interesting here happens
 # between replicas. A single node cannot demonstrate that a push to A is
@@ -12,7 +13,7 @@
 CODE_ROOT="${CODE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 STACK_DIR="${CODE_ROOT}/tmp/e2e"
 
-# A high port on purpose. MinIO's own default of 9000, and the range around
+# A high port on purpose. The S3 API default of 9000, and the range around
 # it, is the most contended real estate on a developer machine — ClickHouse in
 # particular listens across it. Set E2E_S3_ENDPOINT to use an existing store.
 export E2E_S3_PORT="${E2E_S3_PORT:-19010}"
@@ -49,27 +50,29 @@ export NODE2_URL="http://127.0.0.1:${NODE2_GIT}"
 export NODE1_ADMIN_URL="http://127.0.0.1:${NODE1_ADMIN}"
 export NODE2_ADMIN_URL="http://127.0.0.1:${NODE2_ADMIN}"
 
-stack::minio_up() {
-  if docker ps --filter name=code-e2e-minio --format '{{.Names}}' 2>/dev/null | grep -q code-e2e-minio; then
-    echo "minio: already running at ${E2E_S3_ENDPOINT}"
+stack::storage_up() {
+  if docker ps --filter name=code-e2e-storage --format '{{.Names}}' 2>/dev/null | grep -q code-e2e-storage; then
+    echo "storage: already running at ${E2E_S3_ENDPOINT}"
     return 0
   fi
 
-  # A healthy endpoint alone is not proof it is *ours*: another stack may have
-  # taken the port, and quietly using its storage is worse than failing.
-  if curl -fsS "${E2E_S3_ENDPOINT}/minio/health/live" >/dev/null 2>&1; then
+  # A responsive endpoint alone is not proof it is *ours*: another stack may
+  # have taken the port, and quietly using its storage is worse than failing.
+  # RustFS answers 403 to an unauthenticated GET on `/`, which is still proof
+  # of an S3-compatible service.
+  if curl -sS -o /dev/null "${E2E_S3_ENDPOINT}/" 2>/dev/null; then
     if [ -n "${E2E_S3_EXTERNAL:-}" ]; then
-      echo "minio: using the store already at ${E2E_S3_ENDPOINT}"
+      echo "storage: using the store already at ${E2E_S3_ENDPOINT}"
       return 0
     fi
 
-    echo "something is already serving ${E2E_S3_ENDPOINT}, but it is not our MinIO." >&2
+    echo "something is already serving ${E2E_S3_ENDPOINT}, but it is not our RustFS." >&2
     echo "Set E2E_S3_PORT to a free port, or E2E_S3_EXTERNAL=1 to use it deliberately." >&2
     return 1
   fi
 
   if ! command -v docker >/dev/null 2>&1; then
-    echo "docker is required to run the end-to-end suite (it provides MinIO)." >&2
+    echo "docker is required to run the end-to-end suite (it provides the object store)." >&2
     echo "Set E2E_S3_ENDPOINT to point at an existing S3-compatible store instead." >&2
     return 1
   fi
@@ -77,19 +80,25 @@ stack::minio_up() {
   # Fail early and legibly rather than spending sixty seconds discovering that
   # something else already answers on this port.
   if lsof -nP -iTCP:"${E2E_S3_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "port ${E2E_S3_PORT} is already in use by something that is not our MinIO." >&2
+    echo "port ${E2E_S3_PORT} is already in use by something that is not our RustFS." >&2
     echo "Set E2E_S3_PORT to a free port, or E2E_S3_ENDPOINT to an existing store." >&2
     return 1
   fi
 
-  echo "minio: starting on :${E2E_S3_PORT}"
-  docker run -d --rm --name code-e2e-minio \
+  echo "storage: starting on :${E2E_S3_PORT}"
+  # RustFS speaks the S3 API on 9000. It replaced MinIO here after MinIO's
+  # OSS `minio/minio` and `minio/mc` images stopped being served by public
+  # registries. Pinned rather than a floating tag because the suite asserts
+  # on conditional-write behaviour that shifts between releases.
+  docker run -d --rm --name code-e2e-storage \
     -p "${E2E_S3_PORT}:9000" \
-    -e MINIO_ROOT_USER="${E2E_S3_KEY}" \
-    -e MINIO_ROOT_PASSWORD="${E2E_S3_SECRET}" \
-    quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z server /data >/dev/null
+    -e RUSTFS_ACCESS_KEY="${E2E_S3_KEY}" \
+    -e RUSTFS_SECRET_KEY="${E2E_S3_SECRET}" \
+    rustfs/rustfs:v1.0.0-rc.5 >/dev/null
 
-  stack::wait_for "${E2E_S3_ENDPOINT}/minio/health/live" 60 "minio"
+  # Any HTTP response is proof the S3 service is answering; connection errors
+  # fail with a non-zero exit and the loop keeps waiting.
+  stack::wait_for_http "${E2E_S3_ENDPOINT}/" 60 "storage"
 }
 
 stack::bucket() {
@@ -99,24 +108,26 @@ stack::bucket() {
   # Verified rather than best-effort. A silently missing bucket does not fail
   # here; it fails much later as a repository that cannot be created, which is
   # a considerably worse place to find out.
-  stack::mc mb --ignore-existing "local/${E2E_S3_BUCKET}" || {
-    echo "could not create the bucket ${E2E_S3_BUCKET} at ${E2E_S3_ENDPOINT}" >&2
-    return 1
-  }
+  stack::aws s3api create-bucket --bucket "${E2E_S3_BUCKET}" 2>/dev/null || true
 
-  stack::mc ls "local/${E2E_S3_BUCKET}" || {
+  stack::aws s3api head-bucket --bucket "${E2E_S3_BUCKET}" || {
     echo "bucket ${E2E_S3_BUCKET} is not readable after creation" >&2
     return 1
   }
 
-  echo "minio: bucket ${E2E_S3_BUCKET} ready"
+  echo "storage: bucket ${E2E_S3_BUCKET} ready"
 }
 
-stack::mc() {
+stack::aws() {
+  # The vanilla AWS CLI works against RustFS and against real S3 and is
+  # anonymously pullable, unlike MinIO's `mc`.
   docker run --rm \
     --add-host=host.docker.internal:host-gateway \
-    -e MC_HOST_local="http://${E2E_S3_KEY}:${E2E_S3_SECRET}@host.docker.internal:${E2E_S3_PORT}" \
-    quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z \
+    -e AWS_ACCESS_KEY_ID="${E2E_S3_KEY}" \
+    -e AWS_SECRET_ACCESS_KEY="${E2E_S3_SECRET}" \
+    -e AWS_DEFAULT_REGION=us-east-1 \
+    amazon/aws-cli:2.37.3 \
+    --endpoint-url "http://host.docker.internal:${E2E_S3_PORT}" \
     "$@" >/dev/null 2>&1
 }
 
@@ -243,6 +254,25 @@ stack::wait_for() {
   return 1
 }
 
+# Like stack::wait_for but treats any HTTP response as "up". Used for S3
+# services that reply 4xx to an unauthenticated probe: the response proves
+# the service is answering; only connection errors count as not ready.
+stack::wait_for_http() {
+  local url=$1 attempts=${2:-60} what=${3:-service}
+  local i=0
+
+  while [ "$i" -lt "$attempts" ]; do
+    if curl -sS -o /dev/null "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    i=$((i + 1))
+    sleep 1
+  done
+
+  echo "${what}: did not become ready at ${url} after ${attempts}s" >&2
+  return 1
+}
+
 stack::gitconfig() {
   mkdir -p "$(dirname "$E2E_GITCONFIG")"
 
@@ -280,7 +310,7 @@ stack::up() {
   mkdir -p "${STACK_DIR}"
   stack::gitconfig
   stack::credential_manager
-  stack::minio_up
+  stack::storage_up
   stack::bucket
 
   MISE_PREFIX="$(stack::mise_prefix)"
@@ -310,8 +340,8 @@ stack::down() {
   # Erlang nodes spawn a child beam.smp that outlives the launcher.
   pkill -f "code-e2e-[12]@127.0.0.1" 2>/dev/null || true
 
-  if [ "${E2E_KEEP_MINIO:-0}" != "1" ]; then
-    docker rm -f code-e2e-minio >/dev/null 2>&1 || true
+  if [ "${E2E_KEEP_STORAGE:-${E2E_KEEP_MINIO:-0}}" != "1" ]; then
+    docker rm -f code-e2e-storage >/dev/null 2>&1 || true
   fi
 }
 

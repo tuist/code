@@ -1,6 +1,6 @@
 # The whole system, locally.
 #
-# MinIO stands in for S3, and two Code nodes cluster with each other. Two
+# RustFS stands in for S3, and two Code nodes cluster with each other. Two
 # rather than one on purpose: almost everything interesting here happens
 # *between* replicas, and a single node cannot show you a push to one node
 # being immediately visible on another, which is the central claim.
@@ -28,43 +28,56 @@
 #   curl -H 'Authorization: Bearer local-admin-token' localhost:14002/cluster
 #   curl -H 'Authorization: Bearer local-admin-token' localhost:14002/repositories/acme/app
 #
-# Ports are deliberately unusual: 9000 is MinIO's default and one of the most
-# contended ports on a developer machine, and 4000 is Phoenix's.
+# Ports are deliberately unusual: 9000 is the S3 API port RustFS inherits from
+# MinIO's convention and is one of the most contended ports on a developer
+# machine, and 4000 is Phoenix's.
 name: code
 
 services:
-  minio:
-    # Pinned rather than :latest, because the end-to-end suite asserts on
-    # conditional-write behaviour and that is exactly the kind of thing that
-    # changes between releases.
-    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
-    command: server /data --console-address ":9001"
+  storage:
+    # RustFS speaks the S3 API on 9000, the same interface Code targets in
+    # production against actual S3. Pinned rather than a floating tag because
+    # the end-to-end suite asserts on conditional-write behaviour and that is
+    # exactly the kind of thing that shifts between releases. MinIO used to
+    # sit here; its OSS `minio/minio` and `minio/mc` images stopped being
+    # served by public registries.
+    image: rustfs/rustfs:v1.0.0-rc.5
     environment:
-      MINIO_ROOT_USER: code
-      MINIO_ROOT_PASSWORD: code-secret
+      RUSTFS_ACCESS_KEY: code
+      RUSTFS_SECRET_KEY: code-secret
     ports:
       # Deliberately not the port spec/support/stack.sh uses: the end-to-end
-      # stack runs its own MinIO, and two stacks sharing a port means one
-      # silently talks to the other's storage.
+      # stack runs its own storage node, and two stacks sharing a port means
+      # one silently talks to the other's storage.
       - "19020:9000"
       - "19021:9001"
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      # Busybox `nc` in the RustFS image; a TCP-level check because RustFS
+      # replies 403 to an unauthenticated GET on `/`, which would fail
+      # `curl -f`.
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9000"]
       interval: 3s
       timeout: 3s
       retries: 30
     volumes:
-      - minio:/data
+      - storage:/data
 
   createbucket:
-    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    # The vanilla AWS CLI works against RustFS and against real S3 and is
+    # anonymously pullable, unlike MinIO's `mc`.
+    image: amazon/aws-cli:2.37.3
     depends_on:
-      minio:
+      storage:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: code
+      AWS_SECRET_ACCESS_KEY: code-secret
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 code code-secret &&
-      mc mb --ignore-existing local/code &&
+      until aws --endpoint-url http://storage:9000 s3api list-buckets >/dev/null 2>&1; do sleep 1; done &&
+      aws --endpoint-url http://storage:9000 s3api create-bucket --bucket code 2>/dev/null || true &&
+      aws --endpoint-url http://storage:9000 s3api head-bucket --bucket code &&
       echo 'bucket ready'
       "
 
@@ -82,7 +95,7 @@ services:
           - code-node
     environment: &code-env
       CODE_S3_BUCKET: code
-      CODE_S3_ENDPOINT: http://minio:9000
+      CODE_S3_ENDPOINT: http://storage:9000
       CODE_S3_ACCESS_KEY_ID: code
       CODE_S3_SECRET_ACCESS_KEY: code-secret
       CODE_S3_REGION: us-east-1
@@ -118,4 +131,4 @@ services:
       - "14012:4002"
 
 volumes:
-  minio:
+  storage:
