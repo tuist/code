@@ -98,6 +98,27 @@ defmodule Code.PromEx.Plugin do
         event_name: [:code, :object_store, :request],
         description: "Object-store requests, by operation and bounded outcome.",
         tags: [:operation, :outcome]
+      ),
+      counter(
+        [:code, :object_store, :multipart_upload, :count],
+        event_name: [:code, :object_store, :multipart_upload],
+        description:
+          "Files uploaded through S3 multipart. Zero means every pack fits in a single PUT; " <>
+            "a rising rate means repositories are producing packs above the multipart threshold."
+      ),
+      sum(
+        [:code, :object_store, :multipart_upload, :bytes],
+        event_name: [:code, :object_store, :multipart_upload],
+        measurement: :bytes,
+        unit: :byte,
+        description: "Bytes streamed through S3 multipart uploads."
+      ),
+      distribution(
+        [:code, :object_store, :multipart_upload, :parts],
+        event_name: [:code, :object_store, :multipart_upload],
+        measurement: :parts,
+        description: "Parts per S3 multipart upload. Bounded above by S3's 10,000-part limit.",
+        reporter_options: [buckets: [1, 2, 4, 8, 16, 64, 256, 1000, 5000]]
       )
     ])
   end

@@ -97,10 +97,19 @@ against the pack (its own checksum, the pack checksum it records, its object
 count) and rebuilt with `git index-pack` otherwise; it carries no digest in the
 log, so it is a hint rather than something to trust.
 
-The remaining ceiling is S3's: a single `PUT` cannot exceed **5 GiB**, and
-multipart upload is not implemented. A repository whose pack exceeds that fails
-at upload rather than silently truncating. Compaction keeps the base pack at
-the size of the current tree rather than of all history, so reaching this needs
+A single `PUT` cannot exceed **5 GiB** on S3, so packs above the configured
+multipart threshold (100 MiB by default) are uploaded through S3 multipart
+instead. Each part is streamed off disk in the same 1 MiB sub-chunks a single
+`PUT` uses, so a multipart upload never buffers a whole part in memory either.
+Create-only still holds: the upload is completed with `If-None-Match: *`, so a
+second writer racing for the same pack loses at completion exactly as it would
+on a single `PUT`, and its parts are aborted.
+The multipart ceiling is `part_size × 10 000` — a few hundred gibibytes at the
+default 64 MiB part size, and adjustable through `CODE_S3_MULTIPART_PART_SIZE_BYTES`
+if a single repository ever needs more. A pack whose size exceeds even that
+fails loudly at upload with the effective limit named in the error, rather
+than being silently truncated. Compaction keeps the base pack at the size of
+the current tree rather than of all history, so reaching either ceiling needs
 a genuinely enormous single repository.
 
 ### Entries

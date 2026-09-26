@@ -22,11 +22,50 @@ unchanged to every node. The only per-node value is `CODE_NODE_ID`.
 | `CODE_S3_REGION` | `auto` | |
 | `CODE_S3_PREFIX` | | Key prefix, for sharing a bucket |
 | `CODE_S3_PATH_STYLE` | `true` | `false` for virtual-hosted AWS buckets |
+| `CODE_S3_MULTIPART_THRESHOLD_BYTES` | `104857600` | Packs above this size are uploaded through S3 multipart instead of a single `PUT`. Default is 100 MiB. Clamped internally to 5 GiB (the single-`PUT` ceiling), so raising it above that has no effect |
+| `CODE_S3_MULTIPART_PART_SIZE_BYTES` | `67108864` | Bytes per multipart part. Default 64 MiB. Must be between 5 MiB and 5 GiB, the part sizes S3 accepts; anything else stops the node from booting. S3 allows at most 10 000 parts, so the largest object is `part_size × 10 000` |
 
 The store **must** support conditional writes (`If-Match`, `If-None-Match`) and
 conditional reads (`If-None-Match`). AWS S3, MinIO, Tigris, Cloudflare R2 and
 Ceph all do. Without them the compare-and-swap that orders pushes does not
 exist, and Code will not be safe.
+
+Packs above the multipart threshold are completed with `If-None-Match: *` on
+`CompleteMultipartUpload`, so the store must honour that header there too.
+AWS S3 documents it, and RustFS, which the end-to-end suite runs against,
+answers `412` to it; support on MinIO, Cloudflare R2, Ceph and Tigris has not
+been verified. A store that ignores the header degrades that one step to
+last-writer-wins, which is harmless for packs because two writers of the same
+pack key write the same bytes; a store that rejects it fails every pack above
+the threshold, so check before raising a deployment's pack sizes past it.
+
+A `409` from the store on a pack upload means a concurrent write or delete of
+the same key, not that the pack is there. Code checks whether it is, and
+fails the push, for the client to retry, when it is not. Before starting one, Code sends a `HEAD` for the pack so that a
+pack already stored is not uploaded again; a `403` to that request, which is
+what AWS answers credentials without `s3:ListBucket`, is treated as "unknown"
+rather than as a failure.
+
+A node that dies in the middle of a multipart upload leaves its parts behind.
+Code aborts an upload on every failure it survives, but not on one it does
+not, so add an incomplete-upload rule to the bucket's lifecycle policy:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "code-incomplete-multipart",
+      "Filter": {"Prefix": ""},
+      "Status": "Enabled",
+      "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
+    }
+  ]
+}
+```
+
+An abort that itself fails is logged as a warning with
+`operation=multipart_abort`, the object key and the upload identifier, and
+leaves those parts to the same rule.
 
 ### Behaviour
 
