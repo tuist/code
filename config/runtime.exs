@@ -43,19 +43,49 @@ if config_env() == :prod or System.get_env("CODE_S3_BUCKET") do
       """
   end
 
+  # Multipart tuning is left absent unless explicitly set, so the S3 backend
+  # falls back to its own defaults (100 MiB threshold, 64 MiB parts) rather
+  # than pinning them here.
+  pos_int_opt = fn env, key ->
+    case System.get_env(env) do
+      nil ->
+        []
+
+      value ->
+        case Integer.parse(String.trim(value)) do
+          {n, ""} when n > 0 -> [{key, n}]
+          _ -> raise ArgumentError, "#{env} must be a positive integer, got #{inspect(value)}"
+        end
+    end
+  end
+
   object_store =
     {
       Code.ObjectStore.S3,
-      # Path style is what MinIO, Tigris and Ceph expect. Set to "false" for
-      # virtual-hosted-style buckets on AWS proper.
-      bucket: require_env.("CODE_S3_BUCKET"),
-      endpoint: require_env.("CODE_S3_ENDPOINT"),
-      region: get.("CODE_S3_REGION", "auto"),
-      access_key_id: require_env.("CODE_S3_ACCESS_KEY_ID"),
-      secret_access_key: require_env.("CODE_S3_SECRET_ACCESS_KEY"),
-      prefix: get.("CODE_S3_PREFIX", ""),
-      path_style: get.("CODE_S3_PATH_STYLE", "true") == "true"
+      [
+        # Path style is what MinIO, Tigris and Ceph expect. Set to "false" for
+        # virtual-hosted-style buckets on AWS proper.
+        bucket: require_env.("CODE_S3_BUCKET"),
+        endpoint: require_env.("CODE_S3_ENDPOINT"),
+        region: get.("CODE_S3_REGION", "auto"),
+        access_key_id: require_env.("CODE_S3_ACCESS_KEY_ID"),
+        secret_access_key: require_env.("CODE_S3_SECRET_ACCESS_KEY"),
+        prefix: get.("CODE_S3_PREFIX", ""),
+        path_style: get.("CODE_S3_PATH_STYLE", "true") == "true"
+      ] ++
+        pos_int_opt.("CODE_S3_MULTIPART_THRESHOLD_BYTES", :multipart_threshold) ++
+        pos_int_opt.("CODE_S3_MULTIPART_PART_SIZE_BYTES", :multipart_part_size)
     }
+
+  # S3 only rejects an out-of-range part size after the whole object has been
+  # sent, so refuse it at boot instead.
+  with {_, opts} <- object_store,
+       {:ok, part_size} <- Keyword.fetch(opts, :multipart_part_size),
+       false <- Code.ObjectStore.S3.valid_part_size?(part_size) do
+    raise ArgumentError,
+          "CODE_S3_MULTIPART_PART_SIZE_BYTES must be between 5242880 (5 MiB) and " <>
+            "5368709120 (5 GiB), the part sizes S3 accepts; got #{part_size}"
+  end
 
   auth_backend = get.("CODE_AUTH_BACKEND", "webhook")
   # Refuses `none` in production and names the valid choices for a typo,

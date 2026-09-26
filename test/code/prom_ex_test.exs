@@ -47,6 +47,9 @@ defmodule Code.PromExTest do
     code_maintenance_job_duration
     code_mcp_request_count
     code_mcp_request_duration
+    code_object_store_multipart_upload_bytes
+    code_object_store_multipart_upload_count
+    code_object_store_multipart_upload_parts
     code_object_store_request_count
     code_object_store_request_duration_seconds
     code_policy_revalidation_failed_count
@@ -101,6 +104,7 @@ defmodule Code.PromExTest do
         seq: 1,
         epoch: 1,
         packs: 1,
+        parts: 1,
         count: 1,
         resident: 0,
         in_flight: 0,
