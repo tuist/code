@@ -569,6 +569,9 @@ remain compressed bytes in the listener metrics. Encoding failures emit
 `invalid_encoding`, `unsupported_encoding`, or `too_large`, and structured warnings.
 Decoded volume emits `code_git_request_decoded_bytes` per compressed request.
 
+See [Git verification](git-verification.md) for compatibility checks and the
+full-history Tuist migration rehearsal.
+
 ## Capacity
 
 - **Read throughput** scales linearly with replicas. Add pods.
