@@ -108,11 +108,23 @@ defmodule Code.HTTP.GitRouter do
 
     with {:ok, conn} <- AuthPlug.authorize(conn, repo_id, permission),
          :ok <- check_content_type(conn, service),
+         :ok <- check_encoding(conn, repo_id, service),
          {:ok, view} <- fresh(conn, repo_id) do
       run(conn, view, repo_id, service)
     else
       {:halt, conn} -> conn
       {:error, conn} -> conn
+    end
+  end
+
+  defp check_encoding(conn, repo_id, service) do
+    case GitBackend.request_encoding(conn, service) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        GitBackend.reject_encoding([repo_id: repo_id, service: service], reason)
+        {:error, send_resp(conn, 415, "code: unsupported request content encoding\n")}
     end
   end
 

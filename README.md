@@ -151,6 +151,7 @@ docker compose up --build -d
 | | |
 |---|---|
 | [Architecture](docs/architecture.md) | How the log works, and why there is no consensus protocol |
+| [Git verification](docs/git-verification.md) | Compatibility coverage and a full-history Tuist migration rehearsal |
 | [Operations](docs/operations.md) | Configuration, metrics, failure modes, capacity |
 | [Kubernetes](docs/kubernetes.md) | Deploying, autoscaling, and authenticating pods |
 | [MCP](docs/mcp.md) | The agent-facing surface |

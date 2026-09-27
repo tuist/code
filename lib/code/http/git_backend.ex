@@ -66,6 +66,56 @@ defmodule Code.HTTP.GitBackend do
   """
   @spec run(Plug.Conn.t(), Path.t(), [String.t()], keyword()) :: Plug.Conn.t()
   def run(conn, repo_path, args, opts \\ []) do
+    service = Keyword.get(opts, :service)
+
+    case request_encoding(conn, service) do
+      {:ok, :identity} ->
+        run_stream(conn, repo_path, args, opts)
+
+      {:ok, :gzip} ->
+        decoder = :zlib.open()
+        counter = :counters.new(1, [])
+
+        try do
+          :ok = :zlib.inflateInit(decoder, 31, :error)
+
+          conn
+          |> put_private(
+            :git_request_decoder,
+            {decoder, counter, Code.Config.git_max_decoded_request_bytes()}
+          )
+          |> run_stream(repo_path, args, opts)
+        after
+          :telemetry.execute([:code, :git, :request_decoded], %{bytes: :counters.get(counter, 1)}, %{
+            service: service
+          })
+
+          :zlib.close(decoder)
+        end
+
+      {:error, :unsupported_encoding} ->
+        reject_encoding(opts, :unsupported_encoding)
+        send_resp(conn, 415, "code: unsupported request content encoding\n")
+    end
+  end
+
+  @doc "Validate request encoding before materializing a repository."
+  def request_encoding(conn, service) do
+    case Enum.map(get_req_header(conn, "content-encoding"), &(String.trim(&1) |> String.downcase())) do
+      encoding when encoding in [[], ["identity"]] -> {:ok, :identity}
+      [encoding] when encoding in ["gzip", "x-gzip"] and service == "git-upload-pack" -> {:ok, :gzip}
+      _ -> {:error, :unsupported_encoding}
+    end
+  end
+
+  @doc false
+  def reject_encoding(opts, reason) do
+    metadata = %{service: Keyword.get(opts, :service), repo_id: Keyword.get(opts, :repo_id), reason: reason}
+    :telemetry.execute([:code, :git, :encoding_rejected], %{count: 1}, metadata)
+    Logger.warning("Git request encoding rejected", Map.to_list(metadata))
+  end
+
+  defp run_stream(conn, repo_path, args, opts) do
     content_type = Keyword.fetch!(opts, :content_type)
     env = Keyword.get(opts, :env, [])
     started = System.monotonic_time(:millisecond)
@@ -98,6 +148,8 @@ defmodule Code.HTTP.GitBackend do
     finish(result, port, started, opts)
   end
 
+  defp refuse(conn, :too_large), do: send_resp(conn, 413, "code: decoded request is too large\n")
+
   defp refuse(conn, _reason) do
     send_resp(conn, 400, "code: the request could not be read\n")
   end
@@ -113,6 +165,7 @@ defmodule Code.HTTP.GitBackend do
 
   defp finish({:aborted, conn, reason}, port, started, opts) do
     Git.terminate(port)
+    if reason in [:invalid_encoding, :too_large], do: reject_encoding(opts, reason)
 
     :telemetry.execute(
       [:code, :git, :aborted],
@@ -135,6 +188,7 @@ defmodule Code.HTTP.GitBackend do
 
   defp finish({:error, conn, reason}, port, started, opts) do
     close(port)
+    if reason in [:invalid_encoding, :too_large], do: reject_encoding(opts, reason)
 
     :telemetry.execute(
       [:code, :git, :aborted],
@@ -155,12 +209,15 @@ defmodule Code.HTTP.GitBackend do
   defp pump_request(conn, port, acc) do
     case read_body(conn, length: @read_chunk, read_length: @read_chunk) do
       {:more, chunk, conn} ->
-        case feed(port, chunk) do
+        case feed(conn, port, chunk) do
           :ok ->
             case collect_available(port, acc) do
               {:cont, acc} -> pump_request(conn, port, acc)
               {:full, acc} -> {:full, conn, acc}
             end
+
+          reason when reason in [:invalid_encoding, :too_large] ->
+            {:error, conn, reason}
 
           :closed ->
             # The process has exited; what it wrote is in the mailbox and its
@@ -169,15 +226,23 @@ defmodule Code.HTTP.GitBackend do
         end
 
       {:ok, chunk, conn} ->
-        _ = feed(port, chunk)
-        # `--stateless-rpc` frames a request with a flush packet, which the
-        # client has now sent, so the process can proceed without seeing EOF —
-        # which a port cannot signal anyway.
-        {_state, acc} = collect_available(port, acc)
-        {:done, conn, acc}
+        finish_request(conn, port, chunk, acc)
 
       {:error, reason} ->
         {:error, conn, {:request_body, reason}}
+    end
+  end
+
+  defp finish_request(conn, port, chunk, acc) do
+    # Stateless requests carry their own flush packet; the process can finish
+    # without the EOF that an Erlang port cannot signal.
+    case finish_feed(conn, port, chunk) do
+      reason when reason in [:invalid_encoding, :too_large] ->
+        {:error, conn, reason}
+
+      _ ->
+        {_state, acc} = collect_available(port, acc)
+        {:done, conn, acc}
     end
   end
 
@@ -194,17 +259,20 @@ defmodule Code.HTTP.GitBackend do
   defp stream_request(conn, port, bytes) do
     case read_body(conn, length: @read_chunk, read_length: @read_chunk) do
       {:more, chunk, conn} ->
-        with :ok <- feed(port, chunk),
+        with :ok <- feed(conn, port, chunk),
              {:ok, conn, bytes} <- forward_available(conn, port, bytes) do
           stream_request(conn, port, bytes)
         else
           :closed -> {:ok, conn, bytes}
+          reason when reason in [:invalid_encoding, :too_large] -> {:error, conn, reason}
           {:error, conn, reason} -> {:error, conn, reason}
         end
 
       {:ok, chunk, conn} ->
-        _ = feed(port, chunk)
-        {:ok, conn, bytes}
+        case finish_feed(conn, port, chunk) do
+          reason when reason in [:invalid_encoding, :too_large] -> {:error, conn, reason}
+          _ -> {:ok, conn, bytes}
+        end
 
       {:error, reason} ->
         {:error, conn, {:request_body, reason}}
@@ -227,9 +295,48 @@ defmodule Code.HTTP.GitBackend do
 
   # Writing to a port whose process has exited raises; that is not an error
   # here, only the end of anyone listening.
-  defp feed(_port, ""), do: :ok
+  defp finish_feed(conn, port, chunk) do
+    with :ok <- feed(conn, port, chunk) do
+      case conn.private[:git_request_decoder] do
+        nil -> :ok
+        {decoder, _counter, _limit} -> :zlib.inflateEnd(decoder)
+      end
+    end
+  rescue
+    ErlangError -> :invalid_encoding
+  end
 
-  defp feed(port, chunk) do
+  defp feed(_conn, _port, ""), do: :ok
+
+  defp feed(conn, port, chunk) do
+    case conn.private[:git_request_decoder] do
+      nil -> write(port, chunk)
+      decoder -> inflate(port, decoder, chunk)
+    end
+  end
+
+  # safeInflate bounds each output buffer even when a small wire chunk expands
+  # enormously. Feed each buffer directly rather than assembling the body.
+  defp inflate(port, decoder, chunk) do
+    inflate_loop(port, decoder, chunk)
+  rescue
+    ErlangError -> :invalid_encoding
+  end
+
+  defp inflate_loop(port, {decoder, counter, limit} = state, chunk) do
+    {status, output} = :zlib.safeInflate(decoder, chunk)
+    :counters.add(counter, 1, IO.iodata_length(output))
+
+    if :counters.get(counter, 1) > limit do
+      :too_large
+    else
+      with :ok <- write(port, output) do
+        if status == :continue, do: inflate_loop(port, state, <<>>), else: :ok
+      end
+    end
+  end
+
+  defp write(port, chunk) do
     Port.command(port, chunk)
     :ok
   rescue

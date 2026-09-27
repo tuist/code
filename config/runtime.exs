@@ -174,6 +174,13 @@ if config_env() == :prod or System.get_env("CODE_S3_BUCKET") do
         "CODE_POLICY_MAX_STALE_MS",
         get.("CODE_POLICY_MAX_STALE_MS", "900000")
       ),
+    git_max_decoded_request_bytes:
+      Code.Config.Runtime.positive_integer!(
+        "CODE_GIT_MAX_DECODED_REQUEST_BYTES",
+        get.("CODE_GIT_MAX_DECODED_REQUEST_BYTES", "10485760")
+      ),
+    history_retention_days:
+      Code.Config.Runtime.history_retention_days!(get.("CODE_HISTORY_RETENTION_DAYS", "forever")),
     compaction_entry_threshold: String.to_integer(get.("CODE_COMPACTION_ENTRY_THRESHOLD", "250")),
     compaction_bytes_threshold: String.to_integer(get.("CODE_COMPACTION_BYTES_THRESHOLD", "268435456")),
     # A node may serve, perform cache maintenance, reserve event-consumer

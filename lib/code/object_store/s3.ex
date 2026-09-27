@@ -523,6 +523,11 @@ defmodule Code.ObjectStore.S3 do
   end
 
   @impl true
+  def list_bounded(prefix, limit, config) do
+    with {:ok, %{keys: keys}} <- list_page(prefix, config, [], nil, {[], []}, limit), do: {:ok, keys}
+  end
+
+  @impl true
   def list_prefixes(prefix, config) do
     list_all(prefix, config, [{"delimiter", "/"}])
   end
@@ -568,13 +573,13 @@ defmodule Code.ObjectStore.S3 do
   end
 
   defp list_all(prefix, config, extra) do
-    list_page(prefix, config, extra, nil, {[], []})
+    list_page(prefix, config, extra, nil, {[], []}, :infinity)
   end
 
   # Pages are collected in reverse and flattened once at the end. Appending
   # each page to the accumulated list instead copies everything seen so far on
   # every page, which makes a listing quadratic in the number of pages.
-  defp list_page(prefix, config, extra, token, {key_pages, prefix_pages}) do
+  defp list_page(prefix, config, extra, token, {key_pages, prefix_pages}, remaining) do
     params =
       [{"list-type", "2"}, {"prefix", full_key(prefix, config)} | extra]
       |> then(fn p -> if token, do: p ++ [{"continuation-token", token}], else: p end)
@@ -586,23 +591,33 @@ defmodule Code.ObjectStore.S3 do
         %{keys: keys, prefixes: prefixes, next: next} = parse_list_response(resp.body, config)
         acc = {[keys | key_pages], [prefixes | prefix_pages]}
 
-        if next do
-          list_page(prefix, config, extra, next, acc)
-        else
-          {key_pages, prefix_pages} = acc
-
-          {:ok,
-           %{
-             keys: key_pages |> Enum.reverse() |> Enum.concat(),
-             prefixes: prefix_pages |> Enum.reverse() |> Enum.concat()
-           }}
-        end
+        advance_listing(prefix, config, extra, next, acc, remaining, length(keys))
 
       {:ok, resp} ->
         {:error, {:unexpected_status, resp.status, body_excerpt(resp)}}
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp advance_listing(prefix, config, extra, next, acc, remaining, count) do
+    cond do
+      remaining != :infinity and count > remaining ->
+        {:error, :report_too_large}
+
+      next ->
+        budget = if remaining == :infinity, do: :infinity, else: remaining - count
+        list_page(prefix, config, extra, next, acc, budget)
+
+      true ->
+        {key_pages, prefix_pages} = acc
+
+        {:ok,
+         %{
+           keys: key_pages |> Enum.reverse() |> Enum.concat(),
+           prefixes: prefix_pages |> Enum.reverse() |> Enum.concat()
+         }}
     end
   end
 

@@ -131,6 +131,12 @@ defmodule Code.Config do
   @spec policy_max_stale_ms() :: non_neg_integer()
   def policy_max_stale_ms, do: get(:policy_max_stale_ms, :timer.minutes(15))
 
+  @spec git_max_decoded_request_bytes() :: pos_integer()
+  def git_max_decoded_request_bytes, do: get(:git_max_decoded_request_bytes, 10 * 1024 * 1024)
+
+  @spec history_retention_days() :: -1 | pos_integer()
+  def history_retention_days, do: get(:history_retention_days, -1)
+
   @spec compaction_entry_threshold() :: pos_integer()
   def compaction_entry_threshold, do: get(:compaction_entry_threshold, 250)
 

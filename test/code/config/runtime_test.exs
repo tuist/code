@@ -10,6 +10,17 @@ defmodule Code.Config.RuntimeTest do
   alias Code.Config
   alias Code.Config.Runtime
 
+  test "decoded request limits require positive integers" do
+    assert Code.Config.Runtime.positive_integer!("CODE_GIT_MAX_DECODED_REQUEST_BYTES", "10485760") ==
+             10_485_760
+
+    for value <- ["0", "-1", "1.5", "invalid"] do
+      assert_raise ArgumentError, fn ->
+        Code.Config.Runtime.positive_integer!("CODE_GIT_MAX_DECODED_REQUEST_BYTES", value)
+      end
+    end
+  end
+
   describe "auth_backend!/2" do
     test "refuses the allow-everything backend in production" do
       error = assert_raise ArgumentError, fn -> Runtime.auth_backend!("none", :prod) end
@@ -105,6 +116,18 @@ defmodule Code.Config.RuntimeTest do
       # 120 s grace, 10 s preStop, 5 s margin.
       assert Config.shutdown_timeout_ms() <= :timer.seconds(105)
       assert Config.shutdown_timeout_ms() > :timer.seconds(15)
+    end
+  end
+
+  test "history retention accepts forever or a bounded positive day count" do
+    assert Runtime.history_retention_days!("forever") == -1
+    assert Runtime.history_retention_days!("90") == 90
+    assert Runtime.history_retention_days!(" 30 ") == 30
+
+    for value <- ["0", "-1", "inherit", "30d", "3.5", "36501", "", "90secret"] do
+      assert_raise ArgumentError, ~r/CODE_HISTORY_RETENTION_DAYS/, fn ->
+        Runtime.history_retention_days!(value)
+      end
     end
   end
 end

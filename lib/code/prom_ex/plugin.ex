@@ -41,11 +41,39 @@ defmodule Code.PromEx.Plugin do
       replica_metrics(),
       push_metrics(),
       maintenance_metrics(),
+      retention_metrics(),
       git_metrics(),
       mcp_metrics(),
       factory_metrics(),
       auth_metrics()
     ]
+  end
+
+  defp retention_metrics do
+    Event.build(:code_retention_event_metrics, [
+      distribution(
+        [:code, :retention, :operation, :duration],
+        event_name: [:code, :retention, :operation],
+        measurement: :duration_us,
+        unit: {:microsecond, :second},
+        description: "Retention setting and dry-run report duration.",
+        tags: [:operation, :outcome],
+        reporter_options: [buckets: [0.01, 0.1, 1, 10, 60, 300]]
+      ),
+      counter(
+        [:code, :retention, :operation, :count],
+        event_name: [:code, :retention, :operation],
+        description: "Retention operations by bounded operation and outcome.",
+        tags: [:operation, :outcome]
+      ),
+      distribution(
+        [:code, :retention, :report, :eligible_bytes],
+        event_name: [:code, :retention, :report],
+        measurement: :eligible_bytes,
+        description: "Bytes eligible in each successful dry-run report; no objects are deleted.",
+        reporter_options: [buckets: [0, 1_048_576, 104_857_600, 1_073_741_824, 10_737_418_240]]
+      )
+    ])
   end
 
   defp http_metrics do
@@ -371,6 +399,19 @@ defmodule Code.PromEx.Plugin do
         measurement: :bytes,
         description: "Bytes served over the Git protocol.",
         tags: [:service]
+      ),
+      sum(
+        [:code, :git, :request_decoded, :bytes],
+        event_name: [:code, :git, :request_decoded],
+        measurement: :bytes,
+        description: "Decoded bytes in compressed Git requests.",
+        tags: [:service]
+      ),
+      counter(
+        [:code, :git, :encoding_rejected, :count],
+        event_name: [:code, :git, :encoding_rejected],
+        description: "Rejected Git request encodings.",
+        tags: [:service, :reason]
       ),
       counter(
         [:code, :git, :aborted, :count],

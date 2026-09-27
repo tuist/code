@@ -35,6 +35,8 @@ defmodule Code.PromExTest do
     code_git_aborted_count
     code_git_command_count
     code_git_command_duration
+    code_git_encoding_rejected_count
+    code_git_request_decoded_bytes
     code_git_pack_index_count
     code_git_requests_in_flight
     code_git_served_bytes
@@ -66,6 +68,9 @@ defmodule Code.PromExTest do
     code_replica_sync_duration
     code_replica_sync_entries_behind
     code_replica_sync_packs_downloaded
+    code_retention_operation_count
+    code_retention_operation_duration
+    code_retention_report_eligible_bytes
     code_wal_ambiguous_commit_count
     code_wal_append_attempts
     code_wal_append_batch_size
@@ -96,6 +101,7 @@ defmodule Code.PromExTest do
         duration_us: 1_000,
         duration_ms: 1,
         bytes: 10,
+        eligible_bytes: 10,
         response_bytes: 10,
         attempts: 1,
         size: 1,
@@ -189,7 +195,7 @@ defmodule Code.PromExTest do
   defp prometheus_series?(name) do
     String.starts_with?(name, ~w(
       code_auth_ code_cluster_ code_factory_ code_git_ code_http_ code_maintenance_ code_mcp_
-      code_object_store_ code_push_ code_replica_ code_wal_ code_writer_
+      code_object_store_ code_push_ code_replica_ code_retention_ code_wal_ code_writer_
     )) and not String.ends_with?(name, ["_event_metrics", "_polling_metrics"])
   end
 end

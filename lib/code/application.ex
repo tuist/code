@@ -43,6 +43,7 @@ defmodule Code.Application do
         {Task.Supervisor, name: Code.TaskSupervisor},
         object_store_children(),
         {Registry, keys: :unique, name: Code.ReplicaRegistry},
+        {Registry, keys: :unique, name: Code.RetentionRegistry},
         # Work running against a local repository outside its replica process,
         # so eviction and pack pruning can wait for it. See Code.Replica.Lease.
         {Registry, keys: :duplicate, name: Code.LeaseRegistry},

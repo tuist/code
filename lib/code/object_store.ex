@@ -39,6 +39,7 @@ defmodule Code.ObjectStore do
               {:ok, etag()} | {:error, :precondition_failed} | error()
   @callback delete(key(), config :: keyword()) :: :ok | error()
   @callback list(prefix :: String.t(), config :: keyword()) :: {:ok, [entry()]} | error()
+  @callback list_bounded(String.t(), non_neg_integer(), keyword()) :: {:ok, [entry()]} | error()
   @callback stat(key(), config :: keyword()) ::
               {:ok, %{etag: etag(), size: non_neg_integer()}} | {:error, :not_found} | error()
 
@@ -99,6 +100,9 @@ defmodule Code.ObjectStore do
 
   @spec list(String.t()) :: {:ok, [entry()]} | error()
   def list(prefix), do: dispatch(:list, [prefix])
+
+  @doc "List at most limit objects; refuse larger inventories without collecting further pages."
+  def list_bounded(prefix, limit), do: dispatch(:list_bounded, [prefix, limit])
 
   @spec stat(key()) :: {:ok, %{etag: etag(), size: non_neg_integer()}} | {:error, :not_found} | error()
   def stat(key), do: dispatch(:stat, [key])

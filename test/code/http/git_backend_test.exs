@@ -44,7 +44,7 @@ defmodule Code.HTTP.GitBackendTest do
         conn(:post, "/", body)
         |> GitBackend.run(git_dir, ["fast-import", "--quiet", "--done"],
           content_type: "application/octet-stream",
-          service: "test",
+          service: "git-upload-pack",
           repo_id: "test/backend"
         )
       end)
@@ -65,11 +65,89 @@ defmodule Code.HTTP.GitBackendTest do
     conn =
       conn(:post, "/", "cat-blob #{oid}\ndone\n")
       |> GitBackend.run(git_dir, ["fast-import", "--quiet", "--done"],
-        content_type: "application/octet-stream"
+        content_type: "application/octet-stream",
+        service: "git-upload-pack"
       )
 
     assert conn.status == 200
     assert String.starts_with?(conn.resp_body, "#{oid} blob #{@blob_bytes}\n")
+  end
+
+  test "streams a gzip request whose expanded body spans many input chunks", %{git_dir: git_dir, oid: oid} do
+    padding = String.duplicate("# padding\n", 100_000)
+    body = :zlib.gzip(padding <> "cat-blob #{oid}\ndone\n")
+
+    conn =
+      conn(:post, "/", body)
+      |> Plug.Conn.put_req_header("content-encoding", "gzip")
+      |> GitBackend.run(git_dir, ["fast-import", "--quiet", "--done"],
+        content_type: "application/octet-stream",
+        service: "git-upload-pack"
+      )
+
+    assert conn.status == 200
+    assert String.starts_with?(conn.resp_body, "#{oid} blob #{@blob_bytes}\n")
+  end
+
+  test "refuses corrupt and truncated gzip requests", %{git_dir: git_dir} do
+    handler = "gzip-rejection-#{System.unique_integer([:positive])}"
+    parent = self()
+
+    :ok =
+      :telemetry.attach(
+        handler,
+        [:code, :git, :aborted],
+        fn _event, _measurements, metadata, _config ->
+          send(parent, {:gzip_rejected, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+    compressed = :zlib.gzip("# comment\ndone\n")
+    truncated = binary_part(compressed, 0, byte_size(compressed) - 8)
+
+    for body <- ["invalid gzip", truncated, compressed <> "garbage", compressed <> compressed] do
+      conn =
+        conn(:post, "/", body)
+        |> Plug.Conn.put_req_header("content-encoding", "gzip")
+        |> GitBackend.run(git_dir, ["fast-import", "--quiet", "--done"],
+          content_type: "application/octet-stream",
+          service: "git-upload-pack"
+        )
+
+      assert conn.status == 400
+      assert_receive {:gzip_rejected, %{reason: :invalid_encoding}}
+    end
+  end
+
+  test "caps decoded request work and rejects gzip pushes", %{git_dir: git_dir} do
+    Code.Config.put_overrides(Map.put(Code.Config.overrides(), :git_max_decoded_request_bytes, 100))
+    body = :zlib.gzip(String.duplicate("# padding\n", 100))
+
+    for {service, status} <- [{"git-upload-pack", 413}, {"git-receive-pack", 415}] do
+      response =
+        conn(:post, "/", body)
+        |> Plug.Conn.put_req_header("content-encoding", " GZIP ")
+        |> GitBackend.run(git_dir, ["fast-import", "--quiet", "--done"],
+          content_type: "application/octet-stream",
+          service: service
+        )
+
+      assert response.status == status
+    end
+  end
+
+  test "refuses unsupported content encodings before starting Git", %{git_dir: git_dir} do
+    conn =
+      conn(:post, "/", "done\n")
+      |> Plug.Conn.put_req_header("content-encoding", "br")
+      |> GitBackend.run(git_dir, ["fast-import", "--quiet", "--done"],
+        content_type: "application/octet-stream",
+        service: "git-upload-pack"
+      )
+
+    assert conn.status == 415
   end
 
   test "the advertisement carries only protocol data, whatever git writes to stderr", %{root: root} do

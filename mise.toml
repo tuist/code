@@ -77,3 +77,7 @@ run = ["node scripts/generate-og-images.mjs", "zola build"]
 [tasks."site:serve"]
 description = "Serve the Code website locally"
 run = ["node scripts/generate-og-images.mjs", "zola serve"]
+
+[tasks."verify:tuist"]
+description = "Rehearse hosting Tuist's full Git history on the local two-node stack"
+run = ["./spec/support/stack.sh up", "bash scripts/verification/large-repository.sh"]

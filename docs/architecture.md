@@ -280,6 +280,30 @@ through the same conditional write as everything else, so the loser is told
 It is threshold-driven rather than scheduled. A repository nobody pushes to
 should never pay for maintenance.
 
+## Recovery retention reporting
+
+The current index carries an optional recovery retention override; zero inherits
+`CODE_HISTORY_RETENTION_DAYS`, minus one means forever, and positive values are
+days. This does not change Git history or compaction. All objects continue to be
+retained. Retention configuration and read-only reporting are implemented;
+automatic expiration and garbage collection are not implemented.
+
+A report walks the canonical `base.history_key` chain, verifies the content
+address and repository incarnation of each snapshot, and compares its
+supersession timestamp with the configured cutoff. Objects required by the
+current index or retained snapshots are protected. Objects needed exclusively
+by expired snapshots are hypothetical candidates; objects outside the chain
+remain unclassified. Publication after reporting and downloads using older
+indexes still require coordination before a future collector can delete anything.
+See [operations](operations.md#configurable-recovery-retention-dry-run-only).
+
+Retention reports keep all canonical snapshot metadata protected so that the
+history chain remains traversable, including when compaction timestamps have
+clock skew. Eligibility applies to obsolete data objects, not chain links.
+Reports refuse unverifiable legacy history rather than silently shortening the
+recovery chain. Snapshot maps are reduced to deduplicated object-pointer sets during traversal;
+reports are bounded and may refuse repositories requiring pagination.
+
 ## Deleting a repository
 
 Repository ids nest — `acme/app` and `acme/app/tools` are both valid, and the
