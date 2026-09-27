@@ -35,6 +35,8 @@ defmodule Code.PromExTest do
     code_git_aborted_count
     code_git_command_count
     code_git_command_duration
+    code_git_encoding_rejected_count
+    code_git_request_decoded_bytes
     code_git_pack_index_count
     code_git_requests_in_flight
     code_git_served_bytes

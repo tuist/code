@@ -74,6 +74,7 @@ leaves those parts to the same rule.
 | `CODE_MAX_PORTS` | `65536` | Ceiling on concurrent Git streams and connections. Raising it costs memory: the BEAM pre-allocates the whole table, and a container's default file-descriptor limit would otherwise make that 1.5 GB. The release script turns it into `ERL_MAX_PORTS`, and it takes precedence over an `ERL_MAX_PORTS` already in the environment |
 | `CODE_DEFAULT_REPLICAS` | `3` | Per-repository, overridable |
 | `CODE_STALENESS_BUDGET_MS` | `0` | See below |
+| `CODE_GIT_MAX_DECODED_REQUEST_BYTES` | `10485760` | Maximum decoded gzip fetch request size in bytes; positive integer |
 | `CODE_COMPACTION_ENTRY_THRESHOLD` | `250` | |
 | `CODE_COMPACTION_BYTES_THRESHOLD` | `268435456` | |
 | `CODE_ROLES` | `serve,maintain,events` | Comma-separated node capabilities |
@@ -549,6 +550,24 @@ so a repository that is never idle holds superseded packs until it is (the
 `[:code, :replica, :prune_deferred]` event). Caches are one directory per repository directly under the
 data directory (`acme/app` is `acme~app`); directories left in the older nested
 layout by earlier releases are no longer used and can be deleted.
+
+## Git request compression
+
+Git may gzip large fetch negotiation requests, particularly repositories with
+many reference targets. Code decodes `Content-Encoding: gzip` incrementally
+before feeding Git, using bounded decompression buffers. Compressed requests are accepted only
+for fetch, with a decoded-byte ceiling of `CODE_GIT_MAX_DECODED_REQUEST_BYTES`
+(default 10 mebibytes). Exceeding it receives `413` before output starts or aborts
+the stream afterward. Identity encoding is accepted for fetch and push; other
+encodings and compressed pushes receive `415`. Encoding names are case insensitive,
+and `x-gzip` is accepted. Concatenated members and trailing data are rejected. Invalid or truncated gzip receives
+`400` before the response starts; an invalid stream discovered after output has
+started is aborted. Existing Git served and aborted metrics cover these requests,
+with `reason=invalid_encoding` on aborted-request telemetry. Wire request bytes
+remain compressed bytes in the listener metrics. Encoding failures emit
+`code_git_encoding_rejected_count{service,reason}` with bounded reasons
+`invalid_encoding`, `unsupported_encoding`, or `too_large`, and structured warnings.
+Decoded volume emits `code_git_request_decoded_bytes` per compressed request.
 
 ## Capacity
 

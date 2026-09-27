@@ -10,6 +10,17 @@ defmodule Code.Config.RuntimeTest do
   alias Code.Config
   alias Code.Config.Runtime
 
+  test "decoded request limits require positive integers" do
+    assert Code.Config.Runtime.positive_integer!("CODE_GIT_MAX_DECODED_REQUEST_BYTES", "10485760") ==
+             10_485_760
+
+    for value <- ["0", "-1", "1.5", "invalid"] do
+      assert_raise ArgumentError, fn ->
+        Code.Config.Runtime.positive_integer!("CODE_GIT_MAX_DECODED_REQUEST_BYTES", value)
+      end
+    end
+  end
+
   describe "auth_backend!/2" do
     test "refuses the allow-everything backend in production" do
       error = assert_raise ArgumentError, fn -> Runtime.auth_backend!("none", :prod) end
@@ -107,4 +118,5 @@ defmodule Code.Config.RuntimeTest do
       assert Config.shutdown_timeout_ms() > :timer.seconds(15)
     end
   end
+
 end

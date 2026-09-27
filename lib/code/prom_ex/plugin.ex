@@ -372,6 +372,19 @@ defmodule Code.PromEx.Plugin do
         description: "Bytes served over the Git protocol.",
         tags: [:service]
       ),
+      sum(
+        [:code, :git, :request_decoded, :bytes],
+        event_name: [:code, :git, :request_decoded],
+        measurement: :bytes,
+        description: "Decoded bytes in compressed Git requests.",
+        tags: [:service]
+      ),
+      counter(
+        [:code, :git, :encoding_rejected, :count],
+        event_name: [:code, :git, :encoding_rejected],
+        description: "Rejected Git request encodings.",
+        tags: [:service, :reason]
+      ),
       counter(
         [:code, :git, :aborted, :count],
         event_name: [:code, :git, :aborted],

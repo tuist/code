@@ -125,6 +125,7 @@ config:
   # grants carried by tokens are unaffected. 15 minutes.
   policyMaxStaleMs: 900000
 
+  gitMaxDecodedRequestBytes: 10485760
   compactionEntryThreshold: 250
   compactionBytesThreshold: 268435456
   # Comma-separated node capabilities. The default single Deployment performs

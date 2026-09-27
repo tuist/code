@@ -78,4 +78,13 @@ defmodule Code.Config.Runtime do
       _ -> raise ArgumentError, "#{variable} must be a non-negative integer"
     end
   end
+
+  @doc "A positive integer."
+  def positive_integer!(variable, value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} when integer > 0 -> integer
+      _ -> raise ArgumentError, "#{variable} must be a positive integer"
+    end
+  end
+
 end

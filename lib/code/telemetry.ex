@@ -63,6 +63,8 @@ defmodule Code.Telemetry do
       (`ok`, `denied`, `timeout`, `error`); the authority itself, distinct
       from cache-served traffic.
     * `[:code, :cluster, :nodeup]` / `[:code, :cluster, :nodedown]`
+    * `[:code, :git, :encoding_rejected]` records bounded encoding rejection reasons.
+    * `[:code, :git, :request_decoded]` records decoded compressed-request bytes.
     * `[:code, :repository, :created]`
   """
 
