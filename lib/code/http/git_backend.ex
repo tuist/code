@@ -80,7 +80,10 @@ defmodule Code.HTTP.GitBackend do
           :ok = :zlib.inflateInit(decoder, 31, :error)
 
           conn
-          |> put_private(:git_request_decoder, {decoder, counter})
+          |> put_private(
+            :git_request_decoder,
+            {decoder, counter, Code.Config.git_max_decoded_request_bytes()}
+          )
           |> run_stream(repo_path, args, opts)
         after
           :telemetry.execute([:code, :git, :request_decoded], %{bytes: :counters.get(counter, 1)}, %{
@@ -296,7 +299,7 @@ defmodule Code.HTTP.GitBackend do
     with :ok <- feed(conn, port, chunk) do
       case conn.private[:git_request_decoder] do
         nil -> :ok
-        {decoder, _counter} -> :zlib.inflateEnd(decoder)
+        {decoder, _counter, _limit} -> :zlib.inflateEnd(decoder)
       end
     end
   rescue
@@ -320,11 +323,11 @@ defmodule Code.HTTP.GitBackend do
     ErlangError -> :invalid_encoding
   end
 
-  defp inflate_loop(port, {decoder, counter} = state, chunk) do
+  defp inflate_loop(port, {decoder, counter, limit} = state, chunk) do
     {status, output} = :zlib.safeInflate(decoder, chunk)
     :counters.add(counter, 1, IO.iodata_length(output))
 
-    if :counters.get(counter, 1) > Code.Config.git_max_decoded_request_bytes() do
+    if :counters.get(counter, 1) > limit do
       :too_large
     else
       with :ok <- write(port, output) do
