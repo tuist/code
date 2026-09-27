@@ -681,7 +681,10 @@ changes to historical object-availability checks, in addition to the fences belo
 
 The report performs one read per historical snapshot and listings of the three
 storage directories, so cost grows with retained and expired history and stored
-object count. Decoded reference maps are discarded after validating each snapshot.
+object count. Decoded reference maps are discarded after validating each snapshot; object
+pointers are accumulated in deduplicated sets rather than retained per snapshot.
+Unchanged current indexes need no per-object metadata requests. Newly published
+pointers are checked individually when an ordinary push races the report.
 Reports stop at 1,000 historical snapshots or 10,000 inventoried objects with
 `422 retention_report_limit_exceeded`. Object-store listings stop between pages
 rather than accumulating the entire bucket. At most 1,000 eligible objects are

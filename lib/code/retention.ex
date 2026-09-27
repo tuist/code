@@ -15,8 +15,19 @@ defmodule Code.Retention do
   alias Code.WAL
   alias Code.WAL.Index
 
+  @typep history_accounting :: %{
+           required: :sets.set(String.t()),
+           recovery: :sets.set(String.t()),
+           expired: :sets.set(String.t()),
+           retained_snapshots: non_neg_integer(),
+           expired_snapshots: non_neg_integer()
+         }
+
   @day_ms 86_400_000
   @attempts 8
+  @max_snapshots 1_000
+  @max_objects 10_000
+  @max_eligible_objects 1_000
   @content_type "application/vnd.code.wal.v1+protobuf"
   @owned ~r"^(wal/[0-9a-f]{64}\.pb|history/[0-9]+(-[0-9a-f]{64})?\.pb|packs/pack-[0-9a-f]{40,64}\.(pack|idx|rev|bitmap))$"
 
@@ -84,24 +95,24 @@ defmodule Code.Retention do
   @spec report(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def report(repo_id, opts \\ []) do
     observe(repo_id, :report, fn ->
-      name = {__MODULE__, node(), repo_id}
+      case Registry.register(Code.RetentionRegistry, repo_id, nil) do
+        {:ok, _} ->
+          try do
+            context = Code.Telemetry.context()
 
-      if :global.register_name(name, self()) == :yes do
-        try do
-          context = Code.Telemetry.context()
+            task =
+              Task.async(fn -> Code.Telemetry.with_context(context, fn -> do_report(repo_id, opts) end) end)
 
-          task =
-            Task.async(fn -> Code.Telemetry.with_context(context, fn -> do_report(repo_id, opts) end) end)
-
-          case Task.yield(task, 60_000) || Task.shutdown(task, :brutal_kill) do
-            {:ok, result} -> result
-            nil -> {:error, :report_timeout}
+            case Task.yield(task, 60_000) || Task.shutdown(task, :brutal_kill) do
+              {:ok, result} -> result
+              nil -> {:error, :report_timeout}
+            end
+          after
+            Registry.unregister(Code.RetentionRegistry, repo_id)
           end
-        after
-          :global.unregister_name(name)
-        end
-      else
-        {:error, :report_busy}
+
+        {:error, {:already_registered, _}} ->
+          {:error, :report_busy}
       end
     end)
   end
@@ -111,34 +122,45 @@ defmodule Code.Retention do
          {:ok, index, etag} <- WAL.fetch(repo_id),
          :ok <- validate_index(repo_id, index),
          {:ok, cutoff} <- cutoff(index, Keyword.get(opts, :now_ms, System.system_time(:millisecond))),
-         {:ok, history} <- history(repo_id, index, cutoff, []),
+         {:ok, history} <- history(repo_id, index, cutoff, empty_history()),
          {:ok, objects} <- inventory(repo_id),
-         :ok <- available(index, history, objects),
          {:ok, latest, version} <- revalidate(repo_id, index, etag),
-         {:ok, objects} <- refresh_current(latest, objects),
+         :ok <- validate_index(repo_id, latest),
+         {:ok, objects} <- refresh_current(index, latest, objects),
          :ok <- available(latest, history, objects) do
       {:ok, summarize(latest, history, objects, cutoff, version)}
     end
   end
 
-  defp refresh_current(index, objects) do
-    missing = MapSet.difference(object_keys(index), MapSet.new(objects, & &1.key))
-    required = MapSet.new(required_keys(index))
+  defp refresh_current(original, latest, objects) when original == latest, do: {:ok, objects}
 
-    Enum.reduce_while(missing, {:ok, objects}, fn key, {:ok, acc} ->
+  defp refresh_current(original, latest, objects) do
+    # Only newly published pointers need metadata reads. Existing required
+    # objects were checked against the inventory; absent old sidecars are optional.
+    added = :sets.subtract(object_keys(latest), object_keys(original))
+    missing = :sets.subtract(added, :sets.from_list(Enum.map(objects, & &1.key), version: 2))
+    required = :sets.from_list(required_keys(latest), version: 2)
+
+    missing
+    |> :sets.to_list()
+    |> Enum.reduce_while({:ok, objects, length(objects)}, fn key, {:ok, acc, count} ->
       case ObjectStore.stat(key) do
         {:ok, %{size: size}} ->
-          if length(acc) < 10_000,
-            do: {:cont, {:ok, [%{key: key, size: size} | acc]}},
+          if count < @max_objects,
+            do: {:cont, {:ok, [%{key: key, size: size} | acc], count + 1}},
             else: {:halt, {:error, :report_too_large}}
 
         {:error, :not_found} ->
-          if MapSet.member?(required, key), do: {:halt, {:error, :raced}}, else: {:cont, {:ok, acc}}
+          if :sets.is_element(key, required), do: {:halt, {:error, :raced}}, else: {:cont, {:ok, acc, count}}
 
         error ->
           {:halt, error}
       end
     end)
+    |> case do
+      {:ok, refreshed, _count} -> {:ok, refreshed}
+      error -> error
+    end
   end
 
   defp revalidate(repo_id, original, etag) do
@@ -167,10 +189,24 @@ defmodule Code.Retention do
     end
   end
 
+  @spec empty_history() :: history_accounting()
+  defp empty_history do
+    %{
+      required: :sets.new(version: 2),
+      recovery: :sets.new(version: 2),
+      expired: :sets.new(version: 2),
+      retained_snapshots: 0,
+      expired_snapshots: 0
+    }
+  end
+
+  @spec history(String.t(), Index.t(), integer() | nil, history_accounting()) ::
+          {:ok, history_accounting()} | {:error, term()}
   defp history(_repo_id, %{base: %{history_key: ""}}, _cutoff, acc), do: {:ok, acc}
 
-  defp history(_repo_id, _successor, _cutoff, acc) when length(acc) >= 1_000,
-    do: {:error, :report_too_large}
+  defp history(_repo_id, _successor, _cutoff, acc)
+       when acc.retained_snapshots + acc.expired_snapshots >= @max_snapshots,
+       do: {:error, :report_too_large}
 
   defp history(repo_id, successor, cutoff, acc) do
     key = successor.base.history_key
@@ -178,10 +214,31 @@ defmodule Code.Retention do
     with true <- valid_history_key?(repo_id, key) or {:error, :invalid_history},
          {:ok, body, _etag} <- history_body(key),
          {:ok, snapshot} <- decode_snapshot(body),
-         :ok <- validate_snapshot(repo_id, key, body, snapshot, successor) do
-      retained = is_nil(cutoff) or successor.base.at_ms >= cutoff
-      record = %{key: key, keys: object_keys(snapshot), required: required_keys(snapshot), retained: retained}
-      history(repo_id, snapshot, cutoff, [record | acc])
+         :ok <- validate_snapshot(repo_id, key, body, snapshot, successor),
+         {:ok, acc} <- account_snapshot(acc, key, snapshot, is_nil(cutoff) or successor.base.at_ms >= cutoff) do
+      history(repo_id, snapshot, cutoff, acc)
+    end
+  end
+
+  @spec account_snapshot(history_accounting(), String.t(), Index.t(), boolean()) ::
+          {:ok, history_accounting()} | {:error, term()}
+  defp account_snapshot(acc, key, snapshot, retained) do
+    required = :sets.union(acc.required, :sets.from_list(required_keys(snapshot), version: 2))
+    required = :sets.add_element(key, required)
+    # All chain links stay protected, including behind expired epochs and clock skew.
+    acc = %{acc | required: required, recovery: :sets.add_element(key, acc.recovery)}
+
+    if :sets.size(required) > @max_objects do
+      {:error, :report_too_large}
+    else
+      keys = object_keys(snapshot)
+
+      if retained do
+        {:ok,
+         %{acc | recovery: :sets.union(acc.recovery, keys), retained_snapshots: acc.retained_snapshots + 1}}
+      else
+        {:ok, %{acc | expired: :sets.union(acc.expired, keys), expired_snapshots: acc.expired_snapshots + 1}}
+      end
     end
   end
 
@@ -226,7 +283,7 @@ defmodule Code.Retention do
     prefix = "repos/#{repo_id}/"
 
     Enum.reduce_while(["wal/", "packs/", "history/"], {:ok, []}, fn directory, {:ok, acc} ->
-      case ObjectStore.list_bounded(prefix <> directory, 10_000 - length(acc)) do
+      case ObjectStore.list_bounded(prefix <> directory, @max_objects - length(acc)) do
         {:ok, objects} ->
           owned = Enum.filter(objects, &Regex.match?(@owned, String.replace_prefix(&1.key, prefix, "")))
           {:cont, {:ok, owned ++ acc}}
@@ -240,10 +297,10 @@ defmodule Code.Retention do
   # Sidecars are optional because a replica can rebuild them. Packs, entries
   # and snapshots are required; missing durable data makes a report fail closed.
   defp available(index, history, objects) do
-    present = MapSet.new(objects, & &1.key)
-    required = required_keys(index) ++ Enum.flat_map(history, &[&1.key | &1.required])
+    present = :sets.from_list(Enum.map(objects, & &1.key), version: 2)
+    required = :sets.union(history.required, :sets.from_list(required_keys(index), version: 2))
 
-    if Enum.all?(required, &MapSet.member?(present, &1)),
+    if :sets.is_subset(required, present),
       do: :ok,
       else: {:error, :missing_history_objects}
   end
@@ -261,23 +318,13 @@ defmodule Code.Retention do
         [pack.key, root <> ".idx", root <> ".rev", root <> ".bitmap"]
       end)
 
-    MapSet.new(entries ++ packs)
-  end
-
-  defp history_keys(records) do
-    Enum.reduce(records, MapSet.new(), fn record, acc ->
-      MapSet.union(acc, record.keys)
-    end)
+    :sets.from_list(entries ++ packs, version: 2)
   end
 
   defp summarize(index, history, objects, cutoff, etag) do
-    {retained, expired} = Enum.split_with(history, & &1.retained)
     current = object_keys(index)
-    # Keep all snapshot metadata to preserve traversal even across clock skew.
-    recovery =
-      history_keys(retained) |> MapSet.union(MapSet.new(history, & &1.key)) |> MapSet.difference(current)
-
-    eligible = history_keys(expired) |> MapSet.difference(current) |> MapSet.difference(recovery)
+    recovery = :sets.subtract(history.recovery, current)
+    eligible = history.expired |> :sets.subtract(current) |> :sets.subtract(recovery)
 
     groups = Enum.group_by(objects, &classify(&1.key, current, recovery, eligible))
 
@@ -289,22 +336,23 @@ defmodule Code.Retention do
       index_version: etag,
       policy: policy(index),
       cutoff_ms: cutoff,
-      retained_snapshots: length(retained),
-      expired_snapshots: length(expired),
+      retained_snapshots: history.retained_snapshots,
+      expired_snapshots: history.expired_snapshots,
       current: totals(groups[:current] || []),
       recovery: totals(groups[:recovery] || []),
       eligible: totals(groups[:eligible] || []),
       unclassified: totals(groups[:unclassified] || []),
-      eligible_objects: (groups[:eligible] || []) |> Enum.sort_by(& &1.key) |> Enum.take(1_000),
-      eligible_objects_truncated: length(groups[:eligible] || []) > 1_000
+      eligible_objects:
+        (groups[:eligible] || []) |> Enum.sort_by(& &1.key) |> Enum.take(@max_eligible_objects),
+      eligible_objects_truncated: length(groups[:eligible] || []) > @max_eligible_objects
     }
   end
 
   defp classify(key, current, recovery, eligible) do
     cond do
-      MapSet.member?(current, key) -> :current
-      MapSet.member?(recovery, key) -> :recovery
-      MapSet.member?(eligible, key) -> :eligible
+      :sets.is_element(key, current) -> :current
+      :sets.is_element(key, recovery) -> :recovery
+      :sets.is_element(key, eligible) -> :eligible
       true -> :unclassified
     end
   end

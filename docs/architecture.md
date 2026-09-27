@@ -301,9 +301,8 @@ Retention reports keep all canonical snapshot metadata protected so that the
 history chain remains traversable, including when compaction timestamps have
 clock skew. Eligibility applies to obsolete data objects, not chain links.
 Reports refuse unverifiable legacy history rather than silently shortening the
-recovery chain. Snapshot maps are reduced to object pointers during traversal;
+recovery chain. Snapshot maps are reduced to deduplicated object-pointer sets during traversal;
 reports are bounded and may refuse repositories requiring pagination.
-
 
 ## Deleting a repository
 

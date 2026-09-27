@@ -174,6 +174,38 @@ defmodule Code.RetentionTest do
     assert {:error, :missing_history_snapshot} = Retention.report(repo, now_ms: @now)
   end
 
+  test "unchanged indexes need no per-object metadata requests", %{repo: repo} do
+    history_fixture(repo)
+
+    stub(ObjectStore, :stat, fn _ ->
+      flunk("the complete inventory already covers unchanged current objects")
+    end)
+
+    assert {:ok, _} = Retention.report(repo, now_ms: @now)
+  end
+
+  test "new entries protect an expired pack even when published after its directory was listed", %{repo: repo} do
+    fixture = history_fixture(repo)
+
+    stub(ObjectStore, :list_bounded, fn prefix, limit ->
+      result = Mimic.call_original(ObjectStore, :list_bounded, [prefix, limit])
+
+      if String.ends_with?(prefix, "/packs/") do
+        pointer = entry(repo, "e", 15)
+        pointer = %{pointer | packs: [fixture.old_pack]}
+        {:ok, index, etag} = WAL.fetch(repo)
+        latest = %{index | entries: index.entries ++ [pointer], seq: index.seq + 1}
+        {:ok, _} = ObjectStore.put(WAL.index_key(repo), Index.encode(latest), if_match: etag)
+      end
+
+      result
+    end)
+
+    assert {:ok, report} = Retention.report(repo, now_ms: @now)
+    refute Enum.any?(report.eligible_objects, &(&1.key == fixture.old_pack.key))
+    assert report.current == %{objects: 4, bytes: 195}
+  end
+
   test "ordinary index updates do not prevent storage reporting", %{repo: repo} do
     history_fixture(repo)
 

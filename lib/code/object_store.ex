@@ -39,7 +39,7 @@ defmodule Code.ObjectStore do
               {:ok, etag()} | {:error, :precondition_failed} | error()
   @callback delete(key(), config :: keyword()) :: :ok | error()
   @callback list(prefix :: String.t(), config :: keyword()) :: {:ok, [entry()]} | error()
-  @callback list_bounded(String.t(), pos_integer(), keyword()) :: {:ok, [entry()]} | error()
+  @callback list_bounded(String.t(), non_neg_integer(), keyword()) :: {:ok, [entry()]} | error()
   @callback stat(key(), config :: keyword()) ::
               {:ok, %{etag: etag(), size: non_neg_integer()}} | {:error, :not_found} | error()
 
