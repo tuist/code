@@ -65,6 +65,9 @@ defmodule Code.Telemetry do
     * `[:code, :cluster, :nodeup]` / `[:code, :cluster, :nodedown]`
     * `[:code, :git, :encoding_rejected]` records bounded encoding rejection reasons.
     * `[:code, :git, :request_decoded]` records decoded compressed-request bytes.
+    * `[:code, :retention, :operation]` — `duration_us`, meta `operation`
+      (`configure`, `report`), `outcome` (`ok`, `error`), `repo_id`
+    * `[:code, :retention, :report]` — `eligible_bytes`; successful dry-run only
     * `[:code, :repository, :created]`
   """
 

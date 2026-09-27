@@ -125,6 +125,8 @@ config:
   # grants carried by tokens are unaffected. 15 minutes.
   policyMaxStaleMs: 900000
 
+  # Recovery-state retention reporting only; no storage objects are deleted.
+  historyRetentionDays: "forever"
   gitMaxDecodedRequestBytes: 10485760
   compactionEntryThreshold: 250
   compactionBytesThreshold: 268435456

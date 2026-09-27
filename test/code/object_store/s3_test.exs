@@ -68,6 +68,17 @@ defmodule Code.ObjectStore.S3Test do
     refute Map.has_key?(first, "delimiter")
   end
 
+  test "a bounded listing refuses excess pages" do
+    serve(%{
+      nil => page([{"repos/a/index.pb", 1}], [], "t1"),
+      "t1" => page([{"repos/b/index.pb", 2}], [], "t2")
+    })
+
+    assert {:error, :report_too_large} = S3.list_bounded("repos/", 1, @config)
+    assert_received {:request, %{"continuation-token" => "t1"}}
+    refute_received {:request, %{"continuation-token" => "t2"}}
+  end
+
   test "a delimiter listing returns one level: direct keys and child prefixes" do
     serve(%{
       nil => page([{"repos/acme/index.pb", 9}], ["repos/acme/app/"], "t1"),

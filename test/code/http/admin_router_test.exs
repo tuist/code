@@ -44,6 +44,58 @@ defmodule Code.HTTP.AdminRouterTest do
     AdminRouter.call(conn, AdminRouter.init([]))
   end
 
+  describe "retention" do
+    test "settings and storage reports require an administrator", %{repo: repo} do
+      {:ok, _} = Code.WAL.create(repo)
+
+      assert request(:get, "/retention/#{repo}").status == 401
+      assert request(:put, "/retention/#{repo}", json: %{days: 30}).status == 401
+
+      changed = request(:put, "/retention/#{repo}", json: %{days: 30}, authorization: "Bearer #{@token}")
+      assert changed.status == 200
+      assert JSON.decode!(changed.resp_body)["effective"] == 30
+
+      report = request(:get, "/retention/#{repo}", authorization: "Bearer #{@token}")
+      assert report.status == 200
+      body = JSON.decode!(report.resp_body)
+      assert body["policy"]["dry_run_only"]
+      assert body["policy"]["effective"] == 30
+      assert body["eligible"] == %{"objects" => 0, "bytes" => 0}
+    end
+
+    test "damaged history and invalid deployment defaults return stable server errors", %{repo: repo} do
+      {:ok, index} = Code.WAL.create(repo)
+
+      broken = %{
+        index
+        | base: %{index.base | history_key: Code.WAL.history_key(repo, 1, String.duplicate("a", 64))}
+      }
+
+      {:ok, _} = Code.ObjectStore.put(Code.WAL.index_key(repo), Code.WAL.Index.encode(broken))
+      response = request(:get, "/retention/#{repo}", authorization: "Bearer #{@token}")
+      assert response.status == 500
+      assert JSON.decode!(response.resp_body)["error"] == "history_incomplete"
+      {:ok, _} = Code.ObjectStore.put(Code.WAL.index_key(repo), Code.WAL.Index.encode(index))
+      configure(history_retention_days: 0)
+      response = request(:get, "/retention/#{repo}", authorization: "Bearer #{@token}")
+      assert response.status == 500
+      assert JSON.decode!(response.resp_body)["error"] == "retention_configuration_invalid"
+    end
+
+    test "invalid settings and missing repositories have distinct statuses", %{repo: repo} do
+      {:ok, _} = Code.WAL.create(repo)
+
+      assert request(:put, "/retention/#{repo}", json: %{days: 0}, authorization: "Bearer #{@token}").status ==
+               422
+
+      assert request(:put, "/retention/#{repo}", json: %{}, authorization: "Bearer #{@token}").status == 422
+      assert request(:get, "/retention/#{repo}/missing", authorization: "Bearer #{@token}").status == 404
+
+      assert request(:put, "/retention/#{repo}/missing", json: %{days: 30}, authorization: "Bearer #{@token}").status ==
+               404
+    end
+  end
+
   describe "authentication" do
     test "accepts the configured bearer token", %{account: account} do
       conn = request(:get, "/policy/#{account}", authorization: "Bearer #{@token}")

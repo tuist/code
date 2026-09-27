@@ -296,7 +296,8 @@ defmodule Code.Control do
       created_at: to_iso(index.created_at_ms),
       updated_at: to_iso(index.updated_at_ms),
       updated_by: index.updated_by,
-      desired_replicas: index.replicas
+      desired_replicas: index.replicas,
+      history_retention: Code.Retention.policy(index)
     }
   end
 

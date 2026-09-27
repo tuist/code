@@ -119,4 +119,15 @@ defmodule Code.Config.RuntimeTest do
     end
   end
 
+  test "history retention accepts forever or a bounded positive day count" do
+    assert Runtime.history_retention_days!("forever") == -1
+    assert Runtime.history_retention_days!("90") == 90
+    assert Runtime.history_retention_days!(" 30 ") == 30
+
+    for value <- ["0", "-1", "inherit", "30d", "3.5", "36501", "", "90secret"] do
+      assert_raise ArgumentError, ~r/CODE_HISTORY_RETENTION_DAYS/, fn ->
+        Runtime.history_retention_days!(value)
+      end
+    end
+  end
 end

@@ -87,4 +87,14 @@ defmodule Code.Config.Runtime do
     end
   end
 
+  @doc "A recovery retention default: forever or a positive number of days."
+  @spec history_retention_days!(String.t()) :: -1 | pos_integer()
+  def history_retention_days!("forever"), do: -1
+
+  def history_retention_days!(value) do
+    case Integer.parse(String.trim(value)) do
+      {days, ""} when days in 1..36_500 -> days
+      _ -> raise ArgumentError, "CODE_HISTORY_RETENTION_DAYS must be forever or 1 to 36500 days"
+    end
+  end
 end

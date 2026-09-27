@@ -79,7 +79,7 @@ cause a hundred materializations.
 | Tool | |
 |---|---|
 | `list_repositories` | What the caller may read |
-| `describe_repository` | Log state, default branch, size, replica placement |
+| `describe_repository` | Log state, default branch, size, replica placement, and the configured/effective recovery retention policy (reporting only) |
 | `list_refs` | Branches and tags with their object ids |
 | `read_file` | A file's contents at a revision |
 | `list_tree` | Directory entries at a revision, optionally recursive |

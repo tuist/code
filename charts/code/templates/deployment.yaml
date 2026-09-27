@@ -148,6 +148,8 @@ spec:
               value: {{ .Values.shutdown.shutdownTimeoutMs | int64 | quote }}
             - name: CODE_GIT_MAX_DECODED_REQUEST_BYTES
               value: {{ .Values.config.gitMaxDecodedRequestBytes | int64 | quote }}
+            - name: CODE_HISTORY_RETENTION_DAYS
+              value: {{ .Values.config.historyRetentionDays | quote }}
             - name: CODE_COMPACTION_ENTRY_THRESHOLD
               value: {{ .Values.config.compactionEntryThreshold | int64 | quote }}
             - name: CODE_COMPACTION_BYTES_THRESHOLD

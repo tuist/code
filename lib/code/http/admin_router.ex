@@ -135,6 +135,16 @@ defmodule Code.HTTP.AdminRouter do
   # legal names.
   # ----------------------------------------------------------------------
 
+  put "/retention/*repo" do
+    repo_id = Enum.join(conn.path_params["repo"], "/")
+    retention_response(conn, Code.Retention.configure(repo_id, conn.body_params["days"]))
+  end
+
+  get "/retention/*repo" do
+    repo_id = Enum.join(conn.path_params["repo"], "/")
+    retention_response(conn, Code.Retention.report(repo_id))
+  end
+
   post "/compact/*repo" do
     repo_id = Enum.join(conn.path_params["repo"], "/")
 
@@ -198,6 +208,35 @@ defmodule Code.HTTP.AdminRouter do
         send_json(conn, 422, %{error: inspect(reason)})
     end
   end
+
+  defp retention_response(conn, {:ok, result}), do: send_json(conn, 200, result)
+
+  defp retention_response(conn, {:error, :not_found}),
+    do: send_json(conn, 404, %{error: "repository not found"})
+
+  defp retention_response(conn, {:error, :invalid_retention}),
+    do: send_json(conn, 422, %{error: "days must be inherit, forever, or an integer from 1 to 36500"})
+
+  defp retention_response(conn, {:error, reason})
+       when reason in [:raced, :cas_exhausted, :report_busy, :report_timeout] do
+    conn |> put_resp_header("retry-after", "1") |> send_json(503, %{error: "repository changed; retry"})
+  end
+
+  defp retention_response(conn, {:error, reason})
+       when reason in [:invalid_history, :missing_history_objects, :missing_history_snapshot],
+       do: send_json(conn, 500, %{error: "history_incomplete"})
+
+  defp retention_response(conn, {:error, {:malformed_index, _}}),
+    do: send_json(conn, 500, %{error: "history_incomplete"})
+
+  defp retention_response(conn, {:error, :invalid_retention_config}),
+    do: send_json(conn, 500, %{error: "retention_configuration_invalid"})
+
+  defp retention_response(conn, {:error, :report_too_large}),
+    do: send_json(conn, 422, %{error: "retention_report_limit_exceeded"})
+
+  defp retention_response(conn, {:error, _reason}),
+    do: send_json(conn, 503, %{error: "retention_storage_unavailable"})
 
   # An absent or null count keeps the historical default of three; anything
   # else is handed to Control, which validates it before touching the log.

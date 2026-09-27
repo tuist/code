@@ -75,6 +75,7 @@ leaves those parts to the same rule.
 | `CODE_DEFAULT_REPLICAS` | `3` | Per-repository, overridable |
 | `CODE_STALENESS_BUDGET_MS` | `0` | See below |
 | `CODE_GIT_MAX_DECODED_REQUEST_BYTES` | `10485760` | Maximum decoded gzip fetch request size in bytes; positive integer |
+| `CODE_HISTORY_RETENTION_DAYS` | `forever` | Default recovery retention: `forever` or an integer from 1 to 36500 days. Reporting only; does not delete objects |
 | `CODE_COMPACTION_ENTRY_THRESHOLD` | `250` | |
 | `CODE_COMPACTION_BYTES_THRESHOLD` | `268435456` | |
 | `CODE_ROLES` | `serve,maintain,events` | Comma-separated node capabilities |
@@ -617,27 +618,104 @@ stores less, at the cost of slower materialization for a replica starting cold.
 unreachable means proving no retained history index references it, and getting
 that wrong destroys history silently, so it is not something to add casually.
 
-The safe mitigation today is a bucket lifecycle policy, which is the same tool
-you would use for any other prefix-organised data:
+### Configurable recovery retention: dry-run only
 
-```json
-{
-  "Rules": [
-    {
-      "ID": "code-history",
-      "Filter": {"Prefix": "repos/"},
-      "Status": "Enabled",
-      "NoncurrentVersionExpiration": {"NoncurrentDays": 30}
-    }
-  ]
-}
+`CODE_HISTORY_RETENTION_DAYS` sets the deployment default to `forever` or a
+positive integer from 1 to 36500. Configure it consistently on every node.
+The chart exposes the same setting as `config.historyRetentionDays`. Existing
+repositories inherit it; the durable index stores only a repository override.
+
+An administrator may override or reset that policy on any node:
+
+```sh
+curl -X PUT :4002/retention/acme/app \
+  -H 'Authorization: Bearer <admin-token>' \
+  -H 'Content-Type: application/json' -d '{"days":90}'
+curl -X PUT :4002/retention/acme/app \
+  -H 'Authorization: Bearer <admin-token>' \
+  -H 'Content-Type: application/json' -d '{"days":"forever"}'
+curl -X PUT :4002/retention/acme/app \
+  -H 'Authorization: Bearer <admin-token>' \
+  -H 'Content-Type: application/json' -d '{"days":"inherit"}'
+curl :4002/retention/acme/app -H 'Authorization: Bearer <admin-token>'
 ```
 
-Before expiring anything under `packs/`, be clear about what you are giving up:
-the current index's packs are needed to *serve* the repository, and the packs
-named by snapshots under `history/` are needed to *reconstruct* older states.
-Expiring the latter trades auditability for cost, which is a legitimate trade
-but not a reversible one.
+The report always has `policy.dry_run_only: true`. **No retention setting or
+report deletes an object, and automatic expiration is not implemented.** The
+setting specifies the recovery window used to calculate a hypothetical deletion
+inventory. It never expires commits reachable from current branches, tags, or
+private forge references. Setting `forever` makes every canonical snapshot
+retained and reports zero eligible objects.
+
+The report groups direct objects under this repository's `packs/`, `wal/`, and
+`history/` directories into four disjoint totals, each with `objects` and `bytes`:
+
+| Group | Meaning |
+|---|---|
+| `current` | Required by the current index, regardless of age |
+| `recovery` | Required by retained canonical snapshots, plus all canonical snapshot metadata needed to traverse the chain, excluding current objects |
+| `eligible` | Required exclusively by expired canonical snapshots; keys and sizes are also returned in `eligible_objects` |
+| `unclassified` | Not referenced by the canonical history chain, including racing or abandoned uploads; never assumed safe to delete |
+
+The mutable `index.pb`, object-store version history, and work-run or account
+records are outside these totals. Pack indexes and other pack sidecars are
+protected with their pack. Nested repositories are excluded by exact object-key
+shape, even when their names overlap the parent's storage directories.
+
+Age starts when a compaction supersedes an index, using the successor base's
+timestamp. A snapshot superseded exactly at the cutoff is retained. Entire
+epochs and packs are protected, so the report can retain more than the requested
+window; it does not promise to reclaim every old object. Historical snapshots
+are checked against their content digest, repository incarnation, and decreasing
+epoch order. Missing or corrupt history fails the report rather than producing
+an incomplete list. Unverifiable legacy snapshot keys also fail closed with `500 history_incomplete`.
+This includes repositories compacted before digest-addressed snapshots were
+introduced in release change #46. A new compaction does not remove the old link.
+Those repositories need a separately verified history migration before reporting;
+that migration is not implemented. Do not rewrite or delete links to bypass validation.
+
+Snapshot metadata is always protected, including behind expired epochs. This
+keeps the chain traversable under clock skew; retention of recovery packs remains
+conservative when a timestamp lies in the future. Deletion would still require
+changes to historical object-availability checks, in addition to the fences below.
+
+The report performs one read per historical snapshot and listings of the three
+storage directories, so cost grows with retained and expired history and stored
+object count. Decoded reference maps are discarded after validating each snapshot.
+Reports stop at 1,000 historical snapshots or 10,000 inventoried objects with
+`422 retention_report_limit_exceeded`. Object-store listings stop between pages
+rather than accumulating the entire bucket. At most 1,000 eligible objects are
+returned; `eligible_objects_truncated` indicates omitted keys, while totals remain
+complete. There is one report at a time per repository on each node and a 60-second
+timeout. Larger repositories need a future paginated report implementation.
+It does not read pack bodies or traverse the local Git cache.
+The current index is revalidated before returning. Ordinary updates within the
+same epoch refresh current-object protection; changed policy, epoch, or incarnation
+returns `503` with `Retry-After: 1`, as do busy or timed-out reports. Missing or
+corrupt history returns `500 history_incomplete`; an invalid deployment default
+returns `500 retention_configuration_invalid`. Storage failures return a stable
+`503 retention_storage_unavailable` body; details remain in structured logs. Invalid policy values return `422`, and a
+missing repository returns `404`.
+
+A report is an observation, **not authorization for deleting its inventory**.
+It provides no fence against a writer publishing a pack after the report, no
+lease protecting a replica downloading a superseded pack, and no deletion grace
+period. Actual collection needs those contracts before it can use this policy.
+Do not add an age-based bucket expiration rule to active Git storage: an old
+pack can still be required by the current index. Lifecycle expiration of
+noncurrent *versions* is a separate backup policy and does not reclaim the
+immutable pack keys retained here.
+
+Retention operations emit `[:code, :retention, :operation]` with `duration_us`,
+`operation` (`configure`, `report`), `outcome` (`ok`, `error`), and repository
+metadata. Successful reports also emit `[:code, :retention, :report]` with
+`eligible_bytes`. Exported metrics are `code_retention_operation_count`,
+`code_retention_operation_duration` (seconds), and
+`code_retention_report_eligible_bytes` (a distribution per report, not total
+reclaimable cluster storage). Metric labels never contain repository names.
+Trace spans are `code.retention.configure` and `code.retention.report`. Policy
+requests log `configured_retention_days` and `effective_retention_days`; failures
+log `operation`, `repo_id`, and `reason`.
 
 Storage class helps more than deletion for most installations. Packs are
 immutable and written once, so infrequent-access or intelligent tiering applies

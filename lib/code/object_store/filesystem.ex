@@ -119,6 +119,53 @@ defmodule Code.ObjectStore.Filesystem do
   end
 
   @impl true
+  def list_bounded(prefix, limit, config) do
+    root = root(config)
+
+    case bounded_directory(Path.join(root, prefix), root, {[], limit}) do
+      {:ok, {entries, _remaining}} -> {:ok, Enum.sort_by(entries, & &1.key)}
+      error -> error
+    end
+  end
+
+  defp bounded_directory(directory, root, acc) do
+    case File.ls(directory) do
+      {:ok, names} ->
+        Enum.reduce_while(names, {:ok, acc}, fn name, {:ok, state} ->
+          case bounded_path(Path.join(directory, name), root, state) do
+            {:ok, next} -> {:cont, {:ok, next}}
+            error -> {:halt, error}
+          end
+        end)
+
+      {:error, :enoent} ->
+        {:ok, acc}
+
+      error ->
+        error
+    end
+  end
+
+  defp bounded_path(path, root, {entries, remaining} = acc) do
+    case File.stat(path) do
+      {:ok, %{type: :directory}} ->
+        bounded_directory(path, root, acc)
+
+      {:ok, %{type: :regular}} when remaining == 0 ->
+        {:error, :report_too_large}
+
+      {:ok, %{type: :regular, size: size}} ->
+        {:ok, {[%{key: Path.relative_to(path, root), size: size} | entries], remaining - 1}}
+
+      {:ok, _} ->
+        {:ok, acc}
+
+      error ->
+        error
+    end
+  end
+
+  @impl true
   def list_prefixes(prefix, config) do
     root = root(config)
     dir = Path.join(root, prefix)

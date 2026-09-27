@@ -175,4 +175,5 @@ defmodule Code.Wal.V1.Index do
   field(:refs, 11, repeated: true, type: Code.Wal.V1.Index.RefsEntry, map: true)
   field(:incarnation, 12, type: :string)
   field(:deleted_at_ms, 13, type: :int64, json_name: "deletedAtMs")
+  field(:history_retention_days, 14, type: :int64, json_name: "historyRetentionDays")
 end

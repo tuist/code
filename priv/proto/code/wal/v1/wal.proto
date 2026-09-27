@@ -159,4 +159,10 @@ message Index {
   // tombstone. It is removed only after every object the repository owns has
   // been deleted.
   int64 deleted_at_ms = 13;
+
+  // Recovery-state retention policy: 0 inherits the deployment default,
+  // -1 preserves every state, and positive values are days since a snapshot
+  // was superseded. This policy never expires currently reachable Git history.
+  // Retention reporting is dry-run only; no objects are removed.
+  int64 history_retention_days = 14;
 }
