@@ -15,15 +15,10 @@ defmodule Code.HTTP.Router do
 
   import Plug.Conn
 
-  alias Code.HTTP.ApiSpec
   alias Code.HTTP.AuthPlug
   alias Code.HTTP.GitRouter
-  alias Code.HTTP.InferenceProfilesRouter
-  alias Code.HTTP.IssuesRouter
   alias Code.HTTP.MCPRouter
-  alias Code.HTTP.SecretBackendsRouter
   alias Code.HTTP.WellKnownRouter
-  alias Code.HTTP.WorkRunsRouter
 
   @impl true
   def init(opts), do: opts
@@ -51,40 +46,6 @@ defmodule Code.HTTP.Router do
     conn
     |> AuthPlug.call([])
     |> MCPRouter.call(MCPRouter.init([]))
-  end
-
-  defp route(%{path_info: ["api", "openapi.json"]} = conn) do
-    conn
-    |> OpenApiSpex.Plug.PutApiSpec.call(OpenApiSpex.Plug.PutApiSpec.init(module: ApiSpec))
-    |> OpenApiSpex.Plug.RenderSpec.call([])
-  end
-
-  defp route(%{path_info: ["api", "issues" | rest]} = conn) do
-    conn
-    |> assign(:api, true)
-    |> AuthPlug.call([])
-    |> then(&IssuesRouter.call(%{&1 | path_info: rest}, IssuesRouter.init([])))
-  end
-
-  defp route(%{path_info: ["api", "work-runs" | rest]} = conn) do
-    conn
-    |> assign(:api, true)
-    |> AuthPlug.call([])
-    |> then(&WorkRunsRouter.call(%{&1 | path_info: rest}, WorkRunsRouter.init([])))
-  end
-
-  defp route(%{path_info: ["api", "inference-profiles" | rest]} = conn) do
-    conn
-    |> assign(:api, true)
-    |> AuthPlug.call([])
-    |> then(&InferenceProfilesRouter.call(%{&1 | path_info: rest}, InferenceProfilesRouter.init([])))
-  end
-
-  defp route(%{path_info: ["api", "secret-backends" | rest]} = conn) do
-    conn
-    |> assign(:api, true)
-    |> AuthPlug.call([])
-    |> then(&SecretBackendsRouter.call(%{&1 | path_info: rest}, SecretBackendsRouter.init([])))
   end
 
   defp route(%{path_info: []} = conn) do

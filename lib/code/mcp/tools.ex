@@ -29,10 +29,10 @@ defmodule Code.MCP.Tools do
 
   ## Layout
 
-  Each domain lives in its own module (`Repositories`, `Issues`, `Factory`
-  and `Account` under `Code.MCP.Tools`) and owns both its descriptors and its
-  handlers. This module is only the public surface: the order `tools/list`
-  returns and the dispatch from a tool name to its domain.
+  Each domain lives in its own module (`Repositories` under `Code.MCP.Tools`)
+  and owns both its descriptors and its handlers. This module is only the
+  public surface: the order `tools/list` returns and the dispatch from a tool
+  name to its domain.
   """
 
   alias Code.Auth
@@ -40,19 +40,12 @@ defmodule Code.MCP.Tools do
 
   @type result :: {:ok, term()} | {:error, term()}
 
-  @domains [Tools.Repositories, Tools.Issues, Tools.Factory, Tools.Account]
+  @domains [Tools.Repositories]
 
   # The order `tools/list` has always returned. Clients do not depend on it,
   # but keeping it stable keeps the descriptor list diffable across releases.
   @order ~w(
     list_repositories describe_repository create_repository
-    create_issue list_issues get_issue update_issue delete_issue add_issue_comment
-    get_issue_comment update_issue_comment delete_issue_comment issue_history
-    create_work_run
-    configure_secret_backend list_secret_backends get_secret_backend
-    configure_inference_profile list_inference_profiles get_inference_profile
-    list_work_runs get_work_run work_run_events claim_work_node complete_work_attempt
-    approve_work_node cancel_work_run expire_work_node get_work_attempt
     list_refs read_file list_tree search log diff commit create_branch delete_branch
     history clone_url
   )

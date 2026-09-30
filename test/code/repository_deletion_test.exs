@@ -40,12 +40,6 @@ defmodule Code.RepositoryDeletionTest do
     Enum.map(entries, & &1.key)
   end
 
-  defp run_file(repo, run_id, name) do
-    key = "factory/#{repo}/runs/#{run_id}/#{name}"
-    {:ok, _} = ObjectStore.put(key, "{}")
-    key
-  end
-
   test "deleting a repository leaves repositories nested under it untouched", %{namespace: ns} do
     parent = "#{ns}/app"
     # Names chosen to collide with the parent's own directories.
@@ -55,10 +49,6 @@ defmodule Code.RepositoryDeletionTest do
       {:ok, _} = Control.create_repository(repo)
       push(repo, "refs/heads/main", String.duplicate("a", 40))
     end
-
-    run_id = "r" <> String.duplicate("A", 24)
-    parent_run = run_file(parent, run_id, "state.json")
-    child_run = run_file("#{ns}/app/runs", run_id, "state.json")
 
     # Each repository's own objects, by what its index names. Listing a
     # child's prefix is no help: `acme/app/wal/` is the child's prefix and the
@@ -74,8 +64,6 @@ defmodule Code.RepositoryDeletionTest do
     assert :ok = Control.delete_repository(parent)
 
     assert {:error, :not_found} = WAL.fetch(parent)
-    assert {:error, :not_found} = ObjectStore.get(parent_run)
-    assert {:ok, _, _} = ObjectStore.get(child_run)
 
     for key <- parent_keys, do: assert({:error, :not_found} = ObjectStore.get(key), "#{key} was left behind")
 

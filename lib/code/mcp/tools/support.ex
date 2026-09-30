@@ -39,18 +39,6 @@ defmodule Code.MCP.Tools.Support do
     end
   end
 
-  @spec authorize_account(Auth.Principal.t(), term()) :: :ok | {:error, String.t()}
-  def authorize_account(principal, repo_id) do
-    with :ok <- authorize(principal, repo_id, :admin) do
-      account = Code.Policy.account_of(repo_id)
-
-      case Auth.authorize_account(principal, account, :admin) do
-        :ok -> :ok
-        {:error, :forbidden} -> {:error, "not permitted to administer account #{account}"}
-      end
-    end
-  end
-
   # Route to the node that already holds the repository. Any pod can accept the
   # call; this is what stops every pod from having to materialize everything.
   @spec in_repository(String.t(), (Replica.view() -> term())) :: term()

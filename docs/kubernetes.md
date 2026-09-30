@@ -146,11 +146,9 @@ The subject arrives as `system:serviceaccount:<namespace>:<name>`. With
 `<namespace>/**` — so a pod in `team-ios` can use `team-ios`'s repositories and
 nothing else, with no per-team configuration at all.
 
-That default deliberately does not grant `execute`. A sandbox that must claim
-work needs an explicit `execute` grant through the account policy or the
-token's grants claim. A claim returns only the inference profile name, version,
-endpoint, and model. Its credential binding is read by the trusted provisioner
-and egress proxy, not by the sandbox or repository-command environment.
+That default deliberately does not grant `execute`. A caller that needs it
+must have an explicit `execute` grant through the account policy or the
+token's grants claim.
 
 For finer control, put explicit grants in a claim:
 

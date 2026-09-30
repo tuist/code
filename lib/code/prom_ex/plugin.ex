@@ -44,7 +44,6 @@ defmodule Code.PromEx.Plugin do
       retention_metrics(),
       git_metrics(),
       mcp_metrics(),
-      factory_metrics(),
       auth_metrics()
     ]
   end
@@ -438,28 +437,6 @@ defmodule Code.PromEx.Plugin do
         event_name: [:code, :mcp, :request],
         description: "MCP requests handled.",
         tags: [:method, :outcome]
-      )
-    ])
-  end
-
-  defp factory_metrics do
-    Event.build(:code_factory_event_metrics, [
-      distribution(
-        [:code, :factory, :operation, :duration],
-        event_name: [:code, :factory, :operation],
-        measurement: :duration_us,
-        description:
-          "Duration of durable graph-run and account-configuration operations, by bounded operation and outcome.",
-        unit: {:microsecond, :second},
-        tags: [:operation, :outcome],
-        reporter_options: [buckets: [0.001, 0.005, 0.025, 0.1, 0.5, 1, 5, 30]]
-      ),
-      counter(
-        [:code, :factory, :operation, :count],
-        event_name: [:code, :factory, :operation],
-        description:
-          "Durable graph-run and account-configuration operations, by bounded operation and outcome.",
-        tags: [:operation, :outcome]
       )
     ])
   end
