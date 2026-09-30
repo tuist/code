@@ -317,9 +317,8 @@ sweep. It happens in three steps:
    the same name is refused until the deletion completes.
 2. **Delete exactly what it owns.** The keys the tombstoned index names, plus
    anything under its own `wal/`, `packs/` and `history/` whose name has the
-   exact shape Code writes there, plus its work-run records under
-   `factory/<id>/runs/` matched the same way. A nested repository's objects
-   always sit at least one directory deeper and never match.
+   exact shape Code writes there. A nested repository's objects always sit at
+   least one directory deeper and never match.
 3. **Remove the tombstone**, only once every deletion succeeded. Otherwise the
    deletion reports how many objects remain, the tombstone stays, and calling
    it again resumes.

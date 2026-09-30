@@ -129,58 +129,11 @@ compare-and-swap, the same non-fast-forward checks, the same durability
 guarantee. There is no side door that bypasses the log. When the call returns,
 the commit is durable and ordered.
 
-### Issues
-
-| Tool | |
-|---|---|
-| `create_issue` | Open an issue with the verified caller as its author |
-| `list_issues` | Current issues in a repository, optionally paged with `limit` and `cursor` |
-| `get_issue`, `update_issue`, `delete_issue` | Read, change, or tombstone an issue |
-| `add_issue_comment` | Add a verified-author comment |
-| `get_issue_comment`, `update_issue_comment`, `delete_issue_comment` | Read, change, or tombstone a comment |
-| `issue_history` | Immutable issue and comment events |
-
-Issues use the source repository's private Git history and the normal durable
-write path. See [issues.md](issues.md) for storage, concurrency, HTTP, and
-authorization details.
-
-### Factory work runs
-
-| Tool | |
-|---|---|
-| `create_work_run`, `list_work_runs`, `get_work_run` | Create and inspect a durable graph of work; `list_work_runs` pages with `limit` and `cursor` |
-| `work_run_events` | Immutable, revision-cursored work-run events, optionally bounded with `limit` |
-| `claim_work_node`, `complete_work_attempt` | Pull one ready node (replay-safe with an `idempotency_key`) and conditionally accept its evidence |
-| `approve_work_node`, `cancel_work_run`, `expire_work_node` | Control an approval, terminal state, or stale lease |
-| `get_work_attempt` | Claim and result evidence for one attempt |
-| `configure_secret_backend`, `list_secret_backends`, `get_secret_backend` | Manage non-secret account bindings to the deployment-managed Infisical service |
-| `configure_inference_profile`, `list_inference_profiles`, `get_inference_profile` | Manage inference profiles that reference an account secret backend |
-
-An agent node can name a [Condukt](https://github.com/tuist/condukt) operation
-and typed input. It can also select a versioned account inference profile.
-Code returns the profile name, version, endpoint, and model to a caller with
-repository execution permission, but not a secret backend or credential
-binding. See [factory.md](factory.md) for profile, graph, storage, and lease
-semantics.
-
 ## Errors
 
 An ordinary failure — a branch moved, a file is missing — comes back as a tool
 result with `isError: true`, not a JSON-RPC error. The model needs to see it and
 react; aborting the conversation over a missing file would be wrong.
-
-Issue, work-run, and account-configuration tools also return a typed error in
-`structuredContent`:
-
-```json
-{"error": {"kind": "unavailable", "message": "work run changed concurrently; retry later", "retryable": true}}
-```
-
-`kind` is `invalid`, `not_found`, `conflict`, or `unavailable`, with the same
-meaning as the HTTP statuses in [issues.md](issues.md#errors). Only
-`unavailable` is `retryable`: the same call may succeed later. A `conflict`
-needs the agent to re-read state before trying again. Repository and Git tools
-return the text message only.
 
 JSON-RPC errors are reserved for protocol problems: unknown methods, malformed
 requests, unsupported protocol versions.

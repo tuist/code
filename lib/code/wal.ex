@@ -758,10 +758,10 @@ defmodule Code.WAL do
   name has the shape this module writes there. A nested repository's objects
   always sit at least one directory deeper and never match.
 
-  `extra_keys` lists further keys the caller owns on the repository's behalf
-  (the factory's run records). It is called only after the tombstone is in
-  place, so nothing created through a live index can appear after it looked,
-  and its keys are deleted in the same pass.
+  `extra_keys` lists further keys the caller owns on the repository's behalf.
+  It is called only after the tombstone is in place, so nothing created through
+  a live index can appear after it looked, and its keys are deleted in the same
+  pass.
 
   The tombstone is removed only once every other deletion has succeeded, so a
   partial failure leaves the repository refusing writes and the deletion

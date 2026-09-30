@@ -12,11 +12,12 @@ defmodule Code.IngestTest do
   alias Code.Auth.Principal
   alias Code.Control
   alias Code.Ingest
-  alias Code.Issues
   alias Code.MCP.Tools
   alias Code.Replica
   alias Code.WAL
   alias Code.WAL.Entry
+
+  @internal_ref "refs/code/reserved"
 
   setup %{repo: repo, namespace: namespace} do
     start_replica_runtime()
@@ -58,7 +59,7 @@ defmodule Code.IngestTest do
 
   test "a client cannot write Code's private references", %{repo: repo} do
     command = %V1.RefCommand{
-      ref: Issues.ref(),
+      ref: @internal_ref,
       old_oid: Entry.zero_oid(),
       new_oid: Entry.zero_oid()
     }
@@ -82,7 +83,7 @@ defmodule Code.IngestTest do
   end
 
   test "the default branch cannot point at a private reference", %{repo: repo} do
-    assert {:error, :reserved_ref} = Ingest.set_head(repo, Issues.ref())
+    assert {:error, :reserved_ref} = Ingest.set_head(repo, @internal_ref)
 
     {:ok, index, _etag} = WAL.fetch(repo)
     assert index.seq == 0, "nothing should have been written"

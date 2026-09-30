@@ -329,8 +329,6 @@ replicas are doing real catch-up work on the read path, and latency will follow.
 | `code_http_request_count{listener,method,status}`, `code_http_request_bytes{listener}` | Request volume, and response bytes sent |
 | `code_http_exception_count{listener}` | Did a request terminate unexpectedly before it could return a response? |
 | `code_mcp_request_duration{method}`, `code_mcp_request_count{method,outcome}` | MCP request latency (seconds) and volume |
-| `code_factory_operation_duration{operation,outcome}` | Are durable graph-run or account configuration operations slow (seconds) or failing? |
-| `code_factory_operation_count{operation,outcome}` | Which durable graph-run or account configuration operations are succeeding or failing? |
 | `code_auth_denied_count{permission}` | Authorization denials |
 | `code_auth_jwks_refresh_duration{outcome}`, `code_auth_jwks_refresh_count{outcome}` | Duration (seconds) and count of the background signing-key refresh, by outcome (`ok`, `error`, `crashed`). A failing refresh does not fail requests: stale keys keep serving |
 | `code_auth_jwks_lookup_count{source}` | Signing-key lookups by path: `cache_fresh` (served from cache, no refresh due), `cache_stale` (served, refresh triggered), `call_path` (fell through the fast in-ETS path into the GenServer, which may then wait on a fetch). `call_path` rising with `refresh{outcome="error"}` is an issuer outage; rising alone is unknown key ids arriving |
@@ -657,10 +655,10 @@ The report groups direct objects under this repository's `packs/`, `wal/`, and
 | `eligible` | Required exclusively by expired canonical snapshots; keys and sizes are also returned in `eligible_objects` |
 | `unclassified` | Not referenced by the canonical history chain, including racing or abandoned uploads; never assumed safe to delete |
 
-The mutable `index.pb`, object-store version history, and work-run or account
-records are outside these totals. Pack indexes and other pack sidecars are
-protected with their pack. Nested repositories are excluded by exact object-key
-shape, even when their names overlap the parent's storage directories.
+The mutable `index.pb` and object-store version history are outside these
+totals. Pack indexes and other pack sidecars are protected with their pack.
+Nested repositories are excluded by exact object-key shape, even when their
+names overlap the parent's storage directories.
 
 Age starts when a compaction supersedes an index, using the successor base's
 timestamp. A snapshot superseded exactly at the cutoff is retained. Entire

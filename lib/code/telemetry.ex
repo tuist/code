@@ -46,8 +46,6 @@ defmodule Code.Telemetry do
     * `[:code, :git, :served]` — `duration_ms`, `bytes`, meta `service`
     * `[:code, :git, :aborted]` — client vanished or stream failed
     * `[:code, :mcp, :request]` — `duration_us`, meta `method`, `outcome`
-    * `[:code, :factory, :operation]` — `duration_us`, meta `operation`,
-      `outcome`; durable graph-run and account-configuration coordination
     * `[:code, :auth, :authorized]` / `[:code, :auth, :denied]`
     * `[:code, :auth, :jwks, :refresh]` — `duration_us`, meta `outcome` (`ok`,
       `error`, `crashed`); the background signing-key refresh completed. A
@@ -89,8 +87,7 @@ defmodule Code.Telemetry do
       [:code, :push, :rejected],
       [:code, :git, :aborted],
       [:code, :wal, :compact],
-      [:code, :wal, :ambiguous_commit],
-      [:code, :factory, :operation]
+      [:code, :wal, :ambiguous_commit]
     ]
 
     :telemetry.detach("code-logging")
@@ -137,15 +134,6 @@ defmodule Code.Telemetry do
   def handle_event([:code, :wal, :ambiguous_commit], measurements, meta, _config) do
     Logger.info("recovered a commit whose reply was lost", repo_id: meta.repo_id, seq: measurements.seq)
   end
-
-  def handle_event([:code, :factory, :operation], measurements, %{outcome: :error} = meta, _config) do
-    Logger.warning("factory operation failed",
-      operation: meta.operation,
-      duration_us: measurements.duration_us
-    )
-  end
-
-  def handle_event([:code, :factory, :operation], _measurements, _meta, _config), do: :ok
 
   def handle_event(_event, _measurements, _meta, _config), do: :ok
 

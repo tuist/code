@@ -95,7 +95,7 @@ defmodule Code.Control do
           :ok | {:error, :not_found | {:invalid_repo_id, term()} | {:partial_cleanup, pos_integer()} | term()}
   def delete_repository(repo_id) do
     if WAL.valid_id?(repo_id) do
-      result = WAL.destroy(repo_id, fn -> factory_keys(repo_id) end)
+      result = WAL.destroy(repo_id)
 
       if result == :ok or match?({:error, {:partial_cleanup, _}}, result) do
         # Evict everywhere rather than waiting for the reaper, so the bytes stop
@@ -118,24 +118,6 @@ defmodule Code.Control do
       result
     else
       {:error, {:invalid_repo_id, repo_id}}
-    end
-  end
-
-  # Work-run records are kept beside the log rather than in it, under
-  # `factory/<repo_id>/runs/<run_id>/`. A nested repository's runs live under
-  # the same prefix one level down (`factory/acme/app/tools/runs/...` sits
-  # inside `factory/acme/app/...`), so keys are matched against the exact
-  # shape `Code.Factory` writes rather than deleted by prefix.
-  @run_file ~r"^r[A-Za-z0-9_\-]{24}/(specification\.json|state\.json|events/[^/]+\.json|attempts/[^/]+/(claim|result)\.json)$"
-
-  defp factory_keys(repo_id) do
-    prefix = "factory/#{repo_id}/runs/"
-
-    with {:ok, entries} <- Code.ObjectStore.list(prefix) do
-      {:ok,
-       entries
-       |> Enum.map(& &1.key)
-       |> Enum.filter(&Regex.match?(@run_file, String.replace_prefix(&1, prefix, "")))}
     end
   end
 

@@ -30,8 +30,6 @@ defmodule Code.PromExTest do
     code_cluster_observed_disk_used_bytes
     code_cluster_observed_resident
     code_cluster_observed_size
-    code_factory_operation_count
-    code_factory_operation_duration
     code_git_aborted_count
     code_git_command_count
     code_git_command_duration
@@ -194,7 +192,7 @@ defmodule Code.PromExTest do
   # Series are the names with one of the exporter's group prefixes.
   defp prometheus_series?(name) do
     String.starts_with?(name, ~w(
-      code_auth_ code_cluster_ code_factory_ code_git_ code_http_ code_maintenance_ code_mcp_
+      code_auth_ code_cluster_ code_git_ code_http_ code_maintenance_ code_mcp_
       code_object_store_ code_push_ code_replica_ code_retention_ code_wal_ code_writer_
     )) and not String.ends_with?(name, ["_event_metrics", "_polling_metrics"])
   end
