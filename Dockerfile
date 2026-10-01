@@ -12,8 +12,16 @@ ARG RUNNER_IMAGE="debian:${DEBIAN_VERSION}"
 FROM ${BUILDER_IMAGE} AS builder
 
 # build-essential is for MuonTrap's port binary, which is C.
+# cargo and protobuf-compiler are for the Rustler NIF under
+# `native/code_native/`: `cargo` builds the crate during `mix compile`, and
+# `prost-build` shells out to `protoc` to compile the WAL schema.
 RUN apt-get update -y \
-  && apt-get install -y --no-install-recommends build-essential git ca-certificates \
+  && apt-get install -y --no-install-recommends \
+       build-essential \
+       git \
+       ca-certificates \
+       cargo \
+       protobuf-compiler \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -29,7 +37,11 @@ RUN mkdir config
 COPY config/config.exs config/${MIX_ENV}.exs config/
 RUN mix deps.compile
 
+# priv/ carries the proto schema the NIF compiles against, and native/ is the
+# crate itself. Both have to be in place before `mix compile`, because the
+# Rustler build step runs there.
 COPY priv priv
+COPY native native
 COPY lib lib
 RUN mix compile
 

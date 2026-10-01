@@ -55,14 +55,10 @@ defmodule Code.WAL.Entry do
   def delete?(%V1.RefCommand{new_oid: new}), do: new == @zero
 
   @spec encode(t()) :: binary()
-  def encode(%V1.Entry{} = entry), do: V1.Entry.encode(entry)
+  def encode(%V1.Entry{} = entry), do: Code.Native.encode_entry(entry)
 
   @spec decode(binary()) :: {:ok, t()} | {:error, term()}
-  def decode(binary) do
-    {:ok, V1.Entry.decode(binary)}
-  rescue
-    error -> {:error, {:malformed_entry, error}}
-  end
+  def decode(binary), do: Code.Native.decode_entry(binary)
 
   @doc "Human-readable one-liner for logs, traces and the admin API."
   @spec describe(t()) :: String.t()

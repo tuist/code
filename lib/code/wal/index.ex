@@ -237,12 +237,8 @@ defmodule Code.WAL.Index do
   def default_branch(%V1.Index{default_branch: branch}), do: branch
 
   @spec encode(t()) :: binary()
-  def encode(%V1.Index{} = index), do: V1.Index.encode(index)
+  def encode(%V1.Index{} = index), do: Code.Native.encode_index(index)
 
   @spec decode(binary()) :: {:ok, t()} | {:error, term()}
-  def decode(binary) do
-    {:ok, V1.Index.decode(binary)}
-  rescue
-    error -> {:error, {:malformed_index, error}}
-  end
+  def decode(binary), do: Code.Native.decode_index(binary)
 end

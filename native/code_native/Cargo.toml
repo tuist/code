@@ -1,0 +1,33 @@
+[package]
+name = "code_native"
+version = "0.1.0"
+authors = []
+edition = "2021"
+publish = false
+
+# A NIF for the WAL hot path: encode and decode `code.wal.v1.Index` and
+# `code.wal.v1.Entry`. The wire format is generated from the same
+# `priv/proto/code/wal/v1/wal.proto` the Elixir side compiles, so the two
+# can never disagree about field tags.
+
+[lib]
+name = "code_native"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.36"
+prost = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[profile.release]
+# A NIF is loaded into the BEAM; a panic there is a VM crash. `abort` makes
+# the backtrace blame line visible instead of unwinding across an FFI boundary
+# into a scheduler.
+panic = "abort"
+# Small gains at the cost of a longer release build, but a NIF is only
+# rebuilt when the crate itself changes.
+lto = "thin"
+codegen-units = 1

@@ -12,6 +12,10 @@ protoc = "36.0"
 # End-to-end tests drive a real server with a real git client over the real
 # smart-HTTP protocol, which is a shell problem, not an ExUnit one.
 shellspec = "0.28.1"
+# A Rustler NIF accelerates the WAL encode/decode hot path. The toolchain is
+# pinned so cross-machine builds produce identical native artifacts; see
+# native/code_native/ for the crate itself.
+rust = "1.97"
 # Releases are cut from conventional commits; see mise/tasks/release.
 git-cliff = "2.13.1"
 helm = "4.2.4"
@@ -32,6 +36,12 @@ run = ["mix deps.get", "mix compile"]
 [tasks.proto]
 description = "Regenerate the write-ahead log schema from priv/proto"
 run = "./scripts/generate-proto.sh"
+
+[tasks.bench]
+description = "Run the WAL encode/decode microbenchmarks (baseline)"
+# BENCH_TAG defaults to "before". Re-run after a change with BENCH_TAG=after
+# to compare against the saved baseline.
+run = ["mix run bench/wal_index.exs", "mix run bench/wal_entry.exs"]
 
 [tasks.test]
 description = "Run the unit test suite"

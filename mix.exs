@@ -44,6 +44,13 @@ defmodule Code.MixProject do
       # The write-ahead log is a persisted, cross-version wire format.
       {:protobuf, "~> 0.13"},
 
+      # The log's hottest path is encoding and decoding `V1.Index`: a single
+      # push hits it per CAS attempt (up to twelve times) and a replica serve
+      # that cannot answer from its budget hits it again. A Rust NIF running
+      # prost under `DirtyCpu` keeps that cost off the schedulers; see
+      # `native/code_native/` and `Code.Native`.
+      {:rustler, "~> 0.36"},
+
       # JWT/JWKS verification. Code validates tokens; it never issues them.
       {:jose, "~> 1.11"},
 
@@ -69,7 +76,11 @@ defmodule Code.MixProject do
       # be provoked otherwise (an unreachable issuer, a storage failure).
       {:mimic, "~> 2.0", only: :test},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+
+      # Microbenchmarks for the WAL encode/decode hot paths. Not loaded in
+      # releases; scripts live under `bench/` and run with `mix run`.
+      {:benchee, "~> 1.3", only: :dev, runtime: false}
     ]
   end
 
