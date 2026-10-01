@@ -76,7 +76,7 @@ defmodule Code.MixProject do
       # be provoked otherwise (an unreachable issuer, a storage failure).
       {:mimic, "~> 2.0", only: :test},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false},
 
       # Microbenchmarks for the WAL encode/decode hot paths. Not loaded in
       # releases; scripts live under `bench/` and run with `mix run`.
