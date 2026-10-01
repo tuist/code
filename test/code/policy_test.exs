@@ -15,6 +15,7 @@ defmodule Code.PolicyTest do
   alias Code.Auth
   alias Code.Auth.Principal
   alias Code.Policy
+  alias Code.Policy.Deployment
 
   setup %{namespace: namespace} do
     start_supervised!({Policy, []})
@@ -225,8 +226,8 @@ defmodule Code.PolicyTest do
       # denial kill-switch; prime its cache so the next-call budget
       # measures only the account-policy traffic.
       _ = start_supervised({Code.Policy.Deployment, []})
-      Code.Policy.Deployment.invalidate()
-      {:ok, _} = Code.Policy.Deployment.get()
+      Deployment.invalidate()
+      {:ok, _} = Deployment.get()
 
       # Within the staleness budget the absence is answered from cache.
       reject(&Code.ObjectStore.get/1)
@@ -317,8 +318,16 @@ defmodule Code.PolicyTest do
       assert [%{permissions: [:read]}] = Policy.grants_for(account, "alice")
     end
 
-    test "does not touch grants the credential carries itself", %{account: account} do
+    test "uses credential grants while denial state remains within its separate stale budget", %{
+      account: account
+    } do
       max_stale(0)
+      Code.Config.put_overrides(Map.put(Code.Config.overrides(), :policy_denial_max_stale_ms, 60_000))
+      # Grant availability and cached revocation have different budgets. Warm
+      # both denial policies before the outage instead of relying on reads
+      # finishing in the same millisecond as a previous cache write.
+      assert {:ok, _} = Deployment.get()
+      assert {:ok, _} = Policy.get(account)
       Process.put(:store_down, true)
 
       carrying = %Principal{subject: "pod", grants: [Principal.grant("#{account}/**", [:read])]}
