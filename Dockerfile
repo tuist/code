@@ -12,17 +12,25 @@ ARG RUNNER_IMAGE="debian:${DEBIAN_VERSION}"
 FROM ${BUILDER_IMAGE} AS builder
 
 # build-essential is for MuonTrap's port binary, which is C.
-# cargo and protobuf-compiler are for the Rustler NIF under
-# `native/code_native/`: `cargo` builds the crate during `mix compile`, and
-# `prost-build` shells out to `protoc` to compile the WAL schema.
+# protobuf-compiler is `protoc`, which prost-build shells out to when
+# compiling the WAL schema for the Rustler NIF under `native/code_native/`.
+# curl is only here to fetch rustup; it is apt-removed afterwards.
 RUN apt-get update -y \
   && apt-get install -y --no-install-recommends \
        build-essential \
        git \
        ca-certificates \
-       cargo \
+       curl \
        protobuf-compiler \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Debian bookworm ships cargo 1.65, which cannot read a Cargo.lock written by
+# the toolchain we pin in `mise.toml`. Install Rust via rustup at the same
+# version so the lock file stays reproducible across machines.
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain 1.97.0 --profile minimal --no-modify-path \
+  && rustc --version && cargo --version
 
 WORKDIR /app
 
