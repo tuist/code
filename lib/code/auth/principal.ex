@@ -14,16 +14,40 @@ defmodule Code.Auth.Principal do
 
   @type grant :: %{pattern: String.t(), permissions: [permission()]}
 
+  @typedoc """
+  Where this principal's identity is anchored.
+
+    * `:deployment` — the token was verified against an issuer configured
+      by the deployment operator (`CODE_OIDC_ISSUER`). Grants compose
+      normally; the principal may touch any repository its grants allow.
+    * `{:tenant, account}` — the token was verified against an issuer
+      declared by `account`'s policy. The principal is scoped to that
+      account's repositories regardless of what the token's claim grants
+      say.
+    * `nil` — a static or allow-everything principal from a non-OIDC
+      backend. Behaves like `:deployment` for authorization purposes.
+  """
+  @type trust_anchor :: :deployment | {:tenant, String.t()} | nil
+
   @type t :: %__MODULE__{
           subject: String.t(),
           account: String.t() | nil,
           grants: [grant()],
           claims: map(),
           expires_at: DateTime.t() | nil,
-          source: atom()
+          source: atom(),
+          issuer: String.t() | nil,
+          trust_anchor: trust_anchor()
         }
 
-  defstruct subject: "anonymous", account: nil, grants: [], claims: %{}, expires_at: nil, source: :unknown
+  defstruct subject: "anonymous",
+            account: nil,
+            grants: [],
+            claims: %{},
+            expires_at: nil,
+            source: :unknown,
+            issuer: nil,
+            trust_anchor: nil
 
   @doc "Build a grant from a pattern and permission list."
   @spec grant(String.t(), [permission()]) :: grant()
@@ -99,7 +123,13 @@ defmodule Code.Auth.Principal do
       subject: principal.subject,
       account: principal.account,
       source: principal.source,
+      issuer: principal.issuer,
+      trust_anchor: describe_anchor(principal.trust_anchor),
       grants: Enum.map(principal.grants, &"#{&1.pattern}:#{Enum.join(&1.permissions, ",")}")
     }
   end
+
+  defp describe_anchor(nil), do: nil
+  defp describe_anchor(:deployment), do: "deployment"
+  defp describe_anchor({:tenant, account}), do: "tenant:#{account}"
 end

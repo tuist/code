@@ -111,11 +111,22 @@ if config_env() == :prod or System.get_env("CODE_S3_BUCKET") do
       username: get.("CODE_GIT_AUTH_USERNAME", "oauth2")
     )
 
+  # Deployment issuers: a comma-separated list of issuers the operator
+  # vouches for. Tokens from these produce a :deployment-anchored
+  # principal; tokens whose `iss` is not in this list are routed to a
+  # tenant issuer via the deployment-level reverse index.
+  deployment_issuers =
+    (if(git_auth, do: git_auth.issuer, else: nil) || System.get_env("CODE_OIDC_ISSUER") || "")
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+
   auth =
     case auth_backend do
       "oidc" ->
         {Code.Auth.OIDC,
-         issuer: if(git_auth, do: git_auth.issuer, else: System.get_env("CODE_OIDC_ISSUER")),
+         issuer: List.first(deployment_issuers),
+         issuers: deployment_issuers,
          audience: require_env.("CODE_OIDC_AUDIENCE"),
          jwks_uri: System.get_env("CODE_OIDC_JWKS_URI"),
          kubernetes: oidc_kubernetes,
@@ -173,6 +184,27 @@ if config_env() == :prod or System.get_env("CODE_S3_BUCKET") do
       Code.Config.Runtime.non_neg_integer!(
         "CODE_POLICY_MAX_STALE_MS",
         get.("CODE_POLICY_MAX_STALE_MS", "900000")
+      ),
+    # Denials fail closed independently of grants: a stale grant is a
+    # bounded availability choice, a stale denial is a security failure.
+    # Zero means the moment the store cannot be revalidated past
+    # `CODE_POLICY_STALENESS_BUDGET_MS`, denial grants become unavailable
+    # and callers treat that as a deny.
+    policy_denial_max_stale_ms:
+      Code.Config.Runtime.non_neg_integer!(
+        "CODE_POLICY_DENIAL_MAX_STALE_MS",
+        get.("CODE_POLICY_DENIAL_MAX_STALE_MS", "0")
+      ),
+    deployment_issuers: deployment_issuers,
+    max_tenant_issuers:
+      Code.Config.Runtime.positive_integer!(
+        "CODE_AUTH_MAX_ISSUERS",
+        get.("CODE_AUTH_MAX_ISSUERS", "128")
+      ),
+    jwks_max_concurrent_fetches:
+      Code.Config.Runtime.positive_integer!(
+        "CODE_AUTH_JWKS_MAX_CONCURRENT_FETCHES",
+        get.("CODE_AUTH_JWKS_MAX_CONCURRENT_FETCHES", "8")
       ),
     git_max_decoded_request_bytes:
       Code.Config.Runtime.positive_integer!(

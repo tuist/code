@@ -56,6 +56,7 @@ defmodule Code.Ingest do
     commands = Keyword.fetch!(opts, :commands)
     quarantine = Keyword.get(opts, :quarantine)
     actor = Keyword.get(opts, :actor, %V1.Actor{})
+    principal = Keyword.get(opts, :principal)
     started = System.monotonic_time(:millisecond)
 
     Code.Telemetry.span(
@@ -67,6 +68,7 @@ defmodule Code.Ingest do
       fn ->
         result =
           with {:ok, packs} <- collect_packs(repo_id, quarantine),
+               :ok <- recheck_denial(principal, repo_id),
                {:ok, result} <- commit_pushed(repo_id, commands, packs, actor, quarantine, 1) do
             Replica.record_local_push(repo_id, result.epoch, result.seq)
             Cluster.announce(repo_id, result.epoch, result.seq)
@@ -98,6 +100,40 @@ defmodule Code.Ingest do
         result
       end
     )
+  end
+
+  # Admitted operations don't finish after a denial lands. The authorize
+  # layer caught the request at HTTP-ingress time, but a long receive-pack
+  # or a batched write can span long enough that a denial written midway
+  # should still refuse the commit. Deployment and account denials are
+  # consulted here, immediately before the writer appends to the WAL —
+  # which is the last compare-and-swap in the push lifecycle. A principal
+  # is only present on paths that know about one (Git push via the hook
+  # router); internal callers are unaffected.
+  defp recheck_denial(nil, _repo_id), do: :ok
+
+  defp recheck_denial(principal, repo_id) when is_map(principal) do
+    with :ok <- deployment_denied?(principal) do
+      account_denied?(principal, repo_id)
+    end
+  end
+
+  defp deployment_denied?(principal) do
+    case Code.Policy.Deployment.denied?(principal) do
+      :allow -> :ok
+      :deny -> {:error, :denied_at_commit}
+      :unavailable -> {:error, :denial_unavailable_at_commit}
+    end
+  end
+
+  defp account_denied?(principal, repo_id) do
+    account = Code.Policy.account_of(repo_id)
+
+    case Code.Policy.denied?(account, principal) do
+      :allow -> :ok
+      :deny -> {:error, :denied_at_commit}
+      :unavailable -> {:error, :denial_unavailable_at_commit}
+    end
   end
 
   # Objects arrive in a quarantine directory that Git discards if we fail.
@@ -484,6 +520,8 @@ defmodule Code.Ingest do
   defp classify(:basis_compacted), do: :contention
   defp classify({:objects_not_provided, _}), do: :incomplete_push
   defp classify(reason) when reason in [:repository_deleted, :repository_replaced, :not_found], do: :deleted
+  defp classify(:denied_at_commit), do: :denied
+  defp classify(:denial_unavailable_at_commit), do: :denied
   defp classify(_), do: :other
 
   defp message({:objects_not_provided, count}) do
@@ -535,6 +573,14 @@ defmodule Code.Ingest do
 
   defp message({:pack_upload_failed, reason}) do
     "code: could not durably store the pushed objects (#{inspect(reason)}); nothing was applied"
+  end
+
+  defp message(:denied_at_commit) do
+    "code: this push was refused by policy; your access was revoked while it was being committed"
+  end
+
+  defp message(:denial_unavailable_at_commit) do
+    "code: policy storage was briefly unavailable at commit time and this push failed closed; please retry"
   end
 
   defp message(reason), do: "code: push rejected (#{inspect(reason)})"

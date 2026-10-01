@@ -56,8 +56,11 @@ defmodule Code.Application do
         auth_children(),
         {Code.Auth.JWKS, []},
         # Authorization policy lives in object storage like everything else;
-        # this is only its per-node cache.
+        # these are only their per-node caches. Deployment policy sits
+        # alongside per-account policy and carries the issuer index and
+        # global denylist.
         {Code.Policy, []},
+        {Code.Policy.Deployment, []},
         maintenance_children(),
         listener_children(),
         prom_ex_children(),

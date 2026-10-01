@@ -37,19 +37,51 @@ service account token is already an OIDC JWT the cluster will vouch for, so an
 agent authenticates with a credential it was born with, and nothing has to be
 created, distributed or rotated. See [kubernetes.md](kubernetes.md).
 
-### One issuer per deployment (today)
+### Deployment issuers and tenant issuers
 
-A deployment verifies against a single issuer. That covers the common shapes —
-one company's IdP, or a Kubernetes cluster vouching for its own pods — and
-tenants are then separated by subject, through namespace grants or policy
-bindings.
+Two kinds of issuers are honored.
 
-**Tenants bringing their own identity providers is not implemented.** It is not
-a large change: the key id in a token already selects which signing key
-verifies it, so a set of issuers could be tried by `kid` and the `iss` claim
-checked against whichever one owned that key. But it does not exist, and until
-it does, every tenant on a deployment must authenticate through the same
-issuer.
+**Deployment issuers** are configured by the operator through
+`CODE_OIDC_ISSUER` (comma-separated for multi-IdP deployments). They
+identify operator and workload identities and produce a
+`:deployment`-anchored principal, whose grants compose with policy
+bindings in the usual way.
+
+**Tenant issuers** are declared by each account in its own policy. A
+tenant brings its own IdP by:
+
+1. Adding an `Issuer` entry to its account policy
+   (`accounts/<account>/policy.pb`), naming the exact `iss`, the required
+   `audience`, and optionally `jwks_uri`, `subject_claim`, `subject_prefix`,
+   `require_azp`, and an `allowed_algorithms` allowlist.
+2. Registering that `iss` in the deployment-level reverse index at
+   `deployment/policy.pb`, so a fresh node can route an incoming token to
+   the owning account without scanning every account.
+
+A tenant-issued token's `iss` lands on the index, which hints at the
+owning account; the OIDC path re-reads that account's policy, finds the
+matching `Issuer` entry, verifies against its material, and produces a
+`{:tenant, account}`-anchored principal. The authorize layer then clips
+that principal's reach to the owning account's repositories regardless of
+what the token's claim grants said. A broad `**:admin` claim does not
+escape tenancy.
+
+**The index is a cache, not an authority.** An entry is a hint about
+which account to look at; the account policy is the source of truth for
+whether the issuer is still trusted. A stale, missing, or conflicting
+hint fails authentication (never aliases ownership), and
+`Code.Policy.Deployment.register_issuer/2` self-heals an index entry
+whose previous owner no longer carries the issuer in its policy.
+Deployment issuers are reserved and may not be registered as tenant
+issuers.
+
+**Standards.** Each issuer independently follows RFC 8414 /
+OpenID Connect Discovery for discovery; token signatures must use an
+asymmetric algorithm compatible with the resolved JWK's key type (RSA →
+RS/PS, EC → ES); `jku` and embedded JWKs in the token header are
+ignored. Audience binding is per-issuer and non-optional, and tenant
+issuers default to `require_azp: true`, which rejects a token minted for
+a different client of the same shared issuer.
 
 ## Authorization: data, not a service
 
@@ -133,10 +165,53 @@ hands out patterns carelessly. For a product where tenants sign themselves up,
 it is a gap: nothing stops a tenant whose grants are broad from claiming a name
 that should belong to someone else, and nothing records who claimed it.
 
-**Credential isolation: yes.** Tokens are audience-bound to this deployment and
-verified against the single issuer configured for the deployment. Per-account
-issuers are **not implemented**; see [one issuer per
-deployment](#one-issuer-per-deployment-today).
+**Credential isolation: yes.** Tokens are audience-bound to this deployment
+or, for tenant issuers, to the per-issuer audience the account declared.
+Tenant-anchored principals cannot touch another account's repositories, so
+the owning tenant's IdP can only authorize that tenant's own data. See
+[Deployment issuers and tenant issuers](#deployment-issuers-and-tenant-issuers).
+
+## Revocation
+
+Revocation has two layers, both in the log, both honored on the next read
+within the staleness budget.
+
+**Account denylist** (`accounts/<account>/policy.pb` under `denials`).
+Three kinds, all enforced at the authorize layer when the target
+account's policy is consulted:
+
+- `SUBJECT` — a glob pattern that revokes every session matching that
+  subject on this account. The pattern must be at least three characters;
+  wildcard-only patterns (`**`) are refused at write time.
+- `TOKEN` — an exact `jti`, bound to its `issuer`. Revokes one token.
+- `SESSION` — an exact session id, bound to its `issuer`. Revokes one
+  browser session.
+
+`jti` and `sid` are only unique within one issuer, so denials of those
+kinds require an `issuer`.
+
+**Deployment denylist** (`deployment/policy.pb` under `denials`). The
+same three kinds, but enforced at the authenticate layer. A deployment
+denial refuses to produce a principal at all, so a globally compromised
+subject or token is stopped before it reaches any account's policy. The
+denial count is capped (`#{128}` globally, `1024` per account) so a
+runaway grows loudly.
+
+**Fail closed.** The denial path uses a separate stale budget,
+`CODE_POLICY_DENIAL_MAX_STALE_MS` (default **0**): the moment the store
+cannot be revalidated past `CODE_POLICY_STALENESS_BUDGET_MS`, denial
+grants become unavailable and are treated as a deny. Serving a stale
+grant through a storage blip is a bounded availability choice; serving a
+stale denial would be a security failure. Grant staleness still goes
+through `CODE_POLICY_MAX_STALE_MS`, which is deliberately generous.
+
+**Documented limits of local denylisting.** A compromised bearer token
+without a usable `jti` can only be revoked by `SUBJECT`, which revokes
+every session for that subject on the owning account. If an issuer wants
+sharper semantics — "this token specifically is now dead" — the natural
+next step is RFC 7662 token introspection on a per-issuer basis. That is
+not implemented and remains the escape hatch for issuers whose tokens
+have no `jti`.
 
 **Durability isolation: yes.** One tenant cannot affect another's data;
 everything authoritative is in object storage under a distinct prefix.

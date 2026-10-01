@@ -221,6 +221,12 @@ defmodule Code.PolicyTest do
   describe "an account with no policy object" do
     test "is cached, so uncovered authorizations do not each cost a read", %{account: account} do
       assert {:ok, %{version: 0}} = Policy.get(account)
+      # Deployment policy is on the authorize path too, for the global
+      # denial kill-switch; prime its cache so the next-call budget
+      # measures only the account-policy traffic.
+      _ = start_supervised({Code.Policy.Deployment, []})
+      Code.Policy.Deployment.invalidate()
+      {:ok, _} = Code.Policy.Deployment.get()
 
       # Within the staleness budget the absence is answered from cache.
       reject(&Code.ObjectStore.get/1)
@@ -298,7 +304,13 @@ defmodule Code.PolicyTest do
 
       assert Policy.grants_for(account, "alice") == []
       assert {:error, {:policy_unavailable, :timeout}} = Policy.get(account)
-      assert {:error, :forbidden} = Auth.authorize(principal("alice"), "#{account}/app", :read)
+      # `authorize/3` consults deployment denial, grants, and account
+      # denial in order. With the store down past max-stale, either the
+      # denial lookup fails closed as `:denial_unavailable` or the grant
+      # check runs first and fails as `:forbidden`; both deny the request,
+      # which is the only property we care about here.
+      assert {:error, reason} = Auth.authorize(principal("alice"), "#{account}/app", :read)
+      assert reason in [:forbidden, :denial_unavailable]
       assert_received {:revalidation_failed, :failed_closed, age} when age > 0
 
       Process.delete(:store_down)
@@ -320,5 +332,86 @@ defmodule Code.PolicyTest do
     Policy.invalidate(account)
 
     assert Policy.grants_for(account, "alice") == []
+  end
+
+  describe "required_issuer on bindings" do
+    test "an issuer-constrained binding only applies to the matching issuer", %{account: account} do
+      {:ok, _} =
+        Policy.bind(account, "alice", ["#{account}/**"], ["read"], required_issuer: "https://idp.example.com")
+
+      assert Policy.grants_for(account, "alice", "https://idp.example.com") != []
+      # A matching subject from a different issuer never aliases.
+      assert Policy.grants_for(account, "alice", "https://other.example.com") == []
+      assert Policy.grants_for(account, "alice", nil) == []
+    end
+
+    test "an unconstrained binding applies regardless of verifying issuer", %{account: account} do
+      {:ok, _} = Policy.bind(account, "alice", ["#{account}/**"], ["read"])
+
+      assert Policy.grants_for(account, "alice", "https://any.example.com") != []
+      assert Policy.grants_for(account, "alice", nil) != []
+    end
+  end
+
+  describe "namespace grants" do
+    test "apply only when the verifying issuer matches", %{account: account} do
+      {:ok, _} =
+        Policy.set_namespace_grant(account, %Code.Policy.V1.NamespaceGrant{
+          enabled: true,
+          required_issuer: "https://cluster.example.com",
+          permissions: ["read", "write"]
+        })
+
+      principal_subject = "system:serviceaccount:#{account}:ci"
+      grants_matching = Policy.grants_for(account, principal_subject, "https://cluster.example.com")
+      grants_other = Policy.grants_for(account, principal_subject, "https://evil.example.com")
+
+      assert Enum.any?(grants_matching, &(&1.pattern == "#{account}/**"))
+      refute Enum.any?(grants_other, &(&1.pattern == "#{account}/**"))
+    end
+
+    test "require an issuer at write time", %{account: account} do
+      assert {:error, :namespace_grant_missing_issuer} =
+               Policy.set_namespace_grant(account, %Code.Policy.V1.NamespaceGrant{
+                 enabled: true,
+                 required_issuer: ""
+               })
+    end
+  end
+
+  describe "tenant denials" do
+    test "a subject denial refuses the authorize path", %{account: account} do
+      {:ok, _} = Policy.bind(account, "fred", ["#{account}/**"], ["read", "write"])
+      {:ok, _} = Policy.deny(account, %Code.Policy.V1.Denial{kind: :SUBJECT, subject: "fred"})
+
+      principal = %Principal{subject: "fred", issuer: "https://idp.example.com"}
+      assert {:error, :forbidden} = Auth.authorize(principal, "#{account}/app", :read)
+    end
+
+    test "a token denial requires matching jti and issuer in the principal's claims", %{account: account} do
+      {:ok, _} = Policy.bind(account, "fred", ["#{account}/**"], ["read"])
+
+      {:ok, _} =
+        Policy.deny(account, %Code.Policy.V1.Denial{
+          kind: :TOKEN,
+          jti: "abc",
+          issuer: "https://idp.example.com"
+        })
+
+      good = %Principal{
+        subject: "fred",
+        issuer: "https://idp.example.com",
+        claims: %{"jti" => "abc", "iss" => "https://idp.example.com"}
+      }
+
+      other_jti = %Principal{
+        subject: "fred",
+        issuer: "https://idp.example.com",
+        claims: %{"jti" => "zzz", "iss" => "https://idp.example.com"}
+      }
+
+      assert {:error, :forbidden} = Auth.authorize(good, "#{account}/app", :read)
+      assert :ok = Auth.authorize(other_jti, "#{account}/app", :read)
+    end
   end
 end

@@ -39,3 +39,4 @@ generate() {
 
 generate priv/proto/code/wal/v1/wal.proto lib/code/wal/v1/wal.pb.ex
 generate priv/proto/code/policy/v1/policy.proto lib/code/policy/v1/policy.pb.ex
+generate priv/proto/code/policy/v1/deployment.proto lib/code/policy/v1/deployment.pb.ex

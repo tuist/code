@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+// Deployment-level authorization state.
+//
+// Account policies are the authority for per-tenant trust. One thing that
+// does not fit per-account is the reverse index that lets a token's `iss` be
+// routed to the account that owns the issuer, and one thing that lives above
+// every account is the deployment-wide denylist operators use as a global
+// kill switch. Both go here.
+//
+// This object is read with a conditional GET and updated with a
+// compare-and-swap, same as everything else. The index is a cache: an entry
+// is a hint about which account to look at, and that account's own policy
+// is always revalidated before a token is accepted. The index being stale,
+// missing, or wrong is observable but never load-bearing.
+package code.policy.v1;
+
+import "code/policy/v1/policy.proto";
+
+// Reverse-routing entry: `iss` names which account's policy claims it.
+message IssuerBinding {
+  // The token's `iss`. The deployment issuer(s) named by CODE_OIDC_ISSUER are
+  // reserved and never appear here.
+  string issuer = 1;
+  // Account whose policy carries the matching Issuer entry. The lookup
+  // revalidates against that policy; a hint that disagrees is self-healed.
+  string account = 2;
+  int64 created_at_ms = 3;
+  int64 updated_at_ms = 4;
+}
+
+// Deployment-wide authorization state.
+message DeploymentPolicy {
+  // The known tenant issuers, each pointing at its owning account.
+  repeated IssuerBinding issuers = 1;
+
+  // Global kill-switch denylist. Enforced at authenticate time, so a denial
+  // added here stops a token from producing a principal on this deployment
+  // regardless of which account it came from.
+  repeated Denial denials = 2;
+
+  // Incremented on every successful update. Used by per-issuer JWKS caches as
+  // part of their cache identity, so a policy change on one node invalidates
+  // the cache on every other node once that node's next revalidation reads
+  // the new policy.
+  uint64 version = 3;
+
+  int64 created_at_ms = 4;
+  int64 updated_at_ms = 5;
+  string updated_by = 6;
+}

@@ -31,8 +31,14 @@ defmodule Code.HTTP.HookRouter do
         Ingest.resolve_quarantine(header(conn, "x-code-quarantine"), header(conn, "x-code-git-dir"))
 
       actor = %V1.Actor{subject: header(conn, "x-code-actor") || "", node: Code.Config.node_id()}
+      principal = reconstructed_principal(conn)
 
-      case Ingest.commit(repo_id, commands: commands, quarantine: quarantine, actor: actor) do
+      case Ingest.commit(repo_id,
+             commands: commands,
+             quarantine: quarantine,
+             actor: actor,
+             principal: principal
+           ) do
         {:ok, result} ->
           send_resp(conn, 200, JSON.encode!(%{seq: result.seq, epoch: result.epoch}))
 
@@ -84,4 +90,35 @@ defmodule Code.HTTP.HookRouter do
       _ -> nil
     end
   end
+
+  # Reconstruct a minimal principal from the headers the Git-side router
+  # set when it dispatched receive-pack. Enough to evaluate the denial
+  # tables (subject + issuer, plus `jti`/`sid` when the token carried
+  # them), nothing else. We never ship the token itself — the recheck
+  # is a yes/no against the denial list, not a re-authentication.
+  defp reconstructed_principal(conn) do
+    subject = header(conn, "x-code-actor")
+
+    if is_binary(subject) and subject != "" do
+      claims =
+        %{}
+        |> maybe_put("jti", header(conn, "x-code-principal-jti"))
+        |> maybe_put("sid", header(conn, "x-code-principal-sid"))
+
+      %{
+        subject: subject,
+        issuer: header(conn, "x-code-principal-issuer"),
+        trust_anchor: parse_trust_anchor(header(conn, "x-code-principal-trust-anchor")),
+        claims: claims
+      }
+    end
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, _key, ""), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp parse_trust_anchor("deployment"), do: :deployment
+  defp parse_trust_anchor("tenant:" <> account), do: {:tenant, account}
+  defp parse_trust_anchor(_other), do: nil
 end
