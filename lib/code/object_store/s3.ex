@@ -509,6 +509,16 @@ defmodule Code.ObjectStore.S3 do
   end
 
   @impl true
+  def delete_if_match(key, etag, config) do
+    case request(:delete, key, config, decode_body: false, headers: [{"if-match", etag}]) do
+      {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok
+      {:ok, %{status: 412}} -> {:error, :precondition_failed}
+      {:ok, resp} -> {:error, {:unexpected_status, resp.status, body_excerpt(resp)}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @impl true
   def delete(key, config) do
     case request(:delete, key, config, decode_body: false) do
       {:ok, %{status: status}} when status in 200..299 or status == 404 -> :ok

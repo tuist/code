@@ -26,6 +26,12 @@ defmodule Code.Config do
   @app :code
   @overrides_key {__MODULE__, :overrides}
 
+  @spec recovery_enabled?() :: boolean()
+  def recovery_enabled?, do: get(:recovery_enabled, false)
+
+  @spec recovery_verification_timeout_ms() :: pos_integer()
+  def recovery_verification_timeout_ms, do: get(:recovery_verification_timeout_ms, :timer.hours(2))
+
   @spec node_id() :: String.t()
   def node_id, do: get(:node_id, "code-1")
 

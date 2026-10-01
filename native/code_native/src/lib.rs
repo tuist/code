@@ -231,6 +231,8 @@ pub struct ElIndex {
     pub incarnation: String,
     pub deleted_at_ms: i64,
     pub history_retention_days: i64,
+    pub recovering: bool,
+    pub storage_generation: String,
     pub __unknown_fields__: UnknownFields,
     pub __protobuf__: bool,
 }
@@ -407,6 +409,8 @@ impl From<ElIndex> for proto::Index {
             incarnation: i.incarnation,
             deleted_at_ms: i.deleted_at_ms,
             history_retention_days: i.history_retention_days,
+            recovering: i.recovering,
+            storage_generation: i.storage_generation,
         }
     }
 }
@@ -427,6 +431,8 @@ impl From<proto::Index> for ElIndex {
             incarnation: i.incarnation,
             deleted_at_ms: i.deleted_at_ms,
             history_retention_days: i.history_retention_days,
+            recovering: i.recovering,
+            storage_generation: i.storage_generation,
             __unknown_fields__: vec![],
             __protobuf__: true,
         }

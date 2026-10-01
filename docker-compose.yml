@@ -101,6 +101,7 @@ services:
       CODE_S3_REGION: us-east-1
       CODE_S3_PATH_STYLE: "true"
       CODE_ADMIN_TOKEN: local-admin-token
+      CODE_RECOVERY_ENABLED: "true"
       CODE_AUTH_BACKEND: static
       CODE_AUTH_TOKENS: "local-token=acme:read,write"
       CODE_CLUSTER_STRATEGY: dns

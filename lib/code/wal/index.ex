@@ -70,9 +70,10 @@ defmodule Code.WAL.Index do
     %{index | deleted_at_ms: now, updated_at_ms: now, updated_by: node_id}
   end
 
-  @doc "Whether deletion of the repository has begun."
+  @doc "Whether the repository is unavailable due to deletion or recovery reservation."
   @spec deleted?(t()) :: boolean()
-  def deleted?(%V1.Index{deleted_at_ms: at}), do: is_integer(at) and at > 0
+  def deleted?(%V1.Index{deleted_at_ms: at, recovering: recovering}),
+    do: recovering or (is_integer(at) and at > 0)
 
   @doc """
   Every object id a ref points at in this index, including the compaction

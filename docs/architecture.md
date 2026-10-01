@@ -52,7 +52,10 @@ One object per repository, and the only one that is ever mutated. It holds:
 - `refs` — the repository's **complete current ref state**,
 - `replicas` — how many nodes should hold it,
 - `incarnation` — a random identifier assigned when the repository is created,
-- `deleted_at_ms` — set once deletion has begun (see *Deleting a repository*).
+- `deleted_at_ms` — set once deletion has begun (see *Deleting a repository*),
+- `recovering` — an unavailable destination reserved by recovery,
+- `storage_generation` — restored repositories put immutable objects in a unique
+  subdirectory under each storage directory. Empty preserves the original layout.
 
 `refs` and `replicas` deserve explanation, because they are what make both halves of the
 system cheap.
@@ -514,6 +517,24 @@ rejecting a push that a peer in the same batch just invalidated.
 
 See `Code.Ingest.Writer`.
 
+## Recovery publication
+
+Recovery selects an exact current index or canonical compaction snapshot and
+copies its packs into a new repository's namespace. A create-only tombstoned
+index with `recovering: true` reserves the destination before any copying. Normal
+creation and deletion refuse that reservation, and Git cannot serve it. After
+verifying the source and then the copied durable objects in fresh scratch
+repositories, recovery replaces the reservation through a conditional write.
+The new live index has its own incarnation and a complete base, with no source
+history pointers. Its disk remains disposable.
+
+Explicit discard conditionally clears the recovery flag while keeping the
+tombstone, then deletes through the ordinary lifecycle. A restore holding the
+reservation's earlier version cannot publish after discard. Failed operations
+leave reservations for operators to inspect and discard. See
+[operations](operations.md#restore-into-a-new-repository) for the supported
+recovery points, compatibility constraints, and recovery drill.
+
 ## Where the limits are
 
 - **A single repository's writes are still bounded by object store latency**,
@@ -523,3 +544,13 @@ See `Code.Ingest.Writer`.
   particular, which is the point.
 - **Compaction is the one expensive operation** and is why the primary concept
   exists at all.
+
+Restored repositories, and ordinary repositories created after the recovery
+rollout gate is enabled, use `packs/<generation>/`, `wal/<generation>/` and
+`history/<generation>/` for all subsequent immutable writes. A restore chooses a
+fresh generation even when its destination name was previously deleted. Cleanup
+only lists the generation recorded in its tombstone and conditionally deletes
+that exact index version. Both are necessary: an index fence alone would still
+let a delayed cleanup remove identical packs reused by a later restore.
+Repository listing reads only indexes with a deletion or recovery marker to
+hide unavailable repositories; a stale deletion marker cannot hide a new incarnation.

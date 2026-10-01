@@ -176,4 +176,6 @@ defmodule Code.Wal.V1.Index do
   field(:incarnation, 12, type: :string)
   field(:deleted_at_ms, 13, type: :int64, json_name: "deletedAtMs")
   field(:history_retention_days, 14, type: :int64, json_name: "historyRetentionDays")
+  field(:recovering, 15, type: :bool)
+  field(:storage_generation, 16, type: :string, json_name: "storageGeneration")
 end

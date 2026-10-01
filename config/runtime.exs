@@ -211,6 +211,7 @@ if config_env() == :prod or System.get_env("CODE_S3_BUCKET") do
         "CODE_GIT_MAX_DECODED_REQUEST_BYTES",
         get.("CODE_GIT_MAX_DECODED_REQUEST_BYTES", "10485760")
       ),
+    recovery_enabled: get.("CODE_RECOVERY_ENABLED", "false") == "true",
     history_retention_days:
       Code.Config.Runtime.history_retention_days!(get.("CODE_HISTORY_RETENTION_DAYS", "forever")),
     compaction_entry_threshold: String.to_integer(get.("CODE_COMPACTION_ENTRY_THRESHOLD", "250")),

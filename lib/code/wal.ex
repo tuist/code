@@ -115,6 +115,31 @@ defmodule Code.WAL do
   @spec history_key(repo_id(), non_neg_integer(), String.t()) :: String.t()
   def history_key(repo_id, epoch, digest), do: "repos/#{repo_id}/history/#{epoch}-#{digest}.pb"
 
+  @doc false
+  def object_prefix(repo_id, directory, generation \\ "") do
+    suffix = if generation == "", do: "", else: generation <> "/"
+    "repos/#{repo_id}/#{directory}/" <> suffix
+  end
+
+  @doc false
+  def storage_generation(repo_id) do
+    case ObjectStore.get(index_key(repo_id)) do
+      {:ok, body, _} ->
+        with {:ok, index} <- Index.decode(body), do: {:ok, index.storage_generation}
+
+      {:error, :not_found} ->
+        {:ok, ""}
+
+      error ->
+        error
+    end
+  end
+
+  @doc false
+  def snapshot_key(index, digest) do
+    object_prefix(index.repo_id, "history", index.storage_generation) <> "#{index.epoch}-#{digest}.pb"
+  end
+
   @doc """
   Create the log for a new repository.
 
@@ -132,6 +157,9 @@ defmodule Code.WAL do
     unless valid_id?(repo_id), do: throw({:invalid_repo_id, repo_id})
 
     index = Index.new(repo_id, Keyword.put_new(opts, :node_id, Config.node_id()))
+    # Opting into the upgraded recovery/storage format protects ordinary name
+    # reuse too, even when the previous incarnation used the legacy flat layout.
+    index = if Config.recovery_enabled?(), do: %{index | storage_generation: index.incarnation}, else: index
 
     case ObjectStore.put(index_key(repo_id), Index.encode(index),
            if_none_match: "*",
@@ -150,7 +178,11 @@ defmodule Code.WAL do
   defp existing(repo_id) do
     case read_raw(repo_id, nil) do
       {:ok, index, _etag} ->
-        if Index.deleted?(index), do: {:error, :deletion_in_progress}, else: {:error, :already_exists}
+        cond do
+          index.recovering -> {:error, :recovery_in_progress}
+          Index.deleted?(index) -> {:error, :deletion_in_progress}
+          true -> {:error, :already_exists}
+        end
 
       _ ->
         {:error, :already_exists}
@@ -246,7 +278,8 @@ defmodule Code.WAL do
   defp append(repo_id, build, attempts) do
     with {:ok, index, etag} <- fetch_live(repo_id),
          {:ok, entry} <- build.(index),
-         {:ok, key, size, digest} <- put_entry(repo_id, entry) do
+         :ok <- check_generation(index, entry, nil),
+         {:ok, key, size, digest} <- put_entry(repo_id, entry, index.storage_generation) do
       updated = Index.append(index, entry, key, size, digest, Config.node_id())
 
       case ObjectStore.put(index_key(repo_id), Index.encode(updated),
@@ -447,7 +480,31 @@ defmodule Code.WAL do
   end
 
   defp validate(index, item) do
-    with :ok <- check_basis(index, Map.get(item, :basis)), do: item.validate.(index)
+    with :ok <- check_basis(index, Map.get(item, :basis)),
+         :ok <- check_generation(index, item.entry, item.key),
+         do: item.validate.(index)
+  end
+
+  # Upload and preparation can straddle deletion plus name reuse. Even a
+  # fresh basis must not let a new incarnation reference the old one's objects.
+  defp check_generation(%{storage_generation: ""}, _entry, _key), do: :ok
+
+  defp check_generation(index, entry, key) do
+    entry_owned? =
+      is_nil(key) or
+        owned_key?(index.repo_id, index.storage_generation, {"wal/", ~r"^wal/[0-9a-f]{64}\.pb$"}, key)
+
+    packs_owned? =
+      Enum.all?(entry.packs, fn pack ->
+        owned_key?(
+          index.repo_id,
+          index.storage_generation,
+          {"packs/", ~r"^packs/pack-[0-9a-f]{40,64}\.pack$"},
+          pack.key
+        )
+      end)
+
+    if entry_owned? and packs_owned?, do: :ok, else: {:error, :repository_replaced}
   end
 
   @doc """
@@ -509,9 +566,10 @@ defmodule Code.WAL do
   def prepare(repo_id, entry, validate, opts \\ []) do
     body = Entry.encode(entry)
     digest = digest(body)
-    key = entry_key(repo_id, digest)
 
-    with {:ok, _} <- write_immutable(key, body) do
+    with {:ok, generation} <- storage_generation(repo_id),
+         key = object_prefix(repo_id, "wal", generation) <> digest <> ".pb",
+         {:ok, _} <- write_immutable(key, body) do
       {:ok,
        %{
          entry: entry,
@@ -541,7 +599,7 @@ defmodule Code.WAL do
           {:ok, Index.t()} | {:error, term()}
   def compact(repo_id, packs, refs, symrefs, index, etag) do
     snapshot = Index.encode(index)
-    history = history_key(repo_id, index.epoch, digest(snapshot))
+    history = snapshot_key(index, digest(snapshot))
 
     if Index.deleted?(index) do
       {:error, :repository_deleted}
@@ -603,22 +661,31 @@ defmodule Code.WAL do
   else's repository.
   """
   @spec put_pack(repo_id(), Path.t()) :: {:ok, Entry.pack()} | {:error, term()}
-  def put_pack(repo_id, pack_path) do
+  def put_pack(repo_id, pack_path, opts \\ []) do
     name = Path.basename(pack_path)
 
-    with {:ok, digest, size} <- ObjectStore.digest_file(pack_path),
-         {:ok, _} <- stream_immutable(pack_key(repo_id, name), pack_path),
-         :ok <- put_pack_index(repo_id, pack_path) do
+    with {:ok, generation} <- pack_generation(repo_id, opts),
+         key = object_prefix(repo_id, "packs", generation) <> name,
+         {:ok, digest, size} <- ObjectStore.digest_file(pack_path),
+         {:ok, _} <- stream_immutable(key, pack_path),
+         :ok <- put_pack_index(Path.dirname(key), pack_path) do
       :telemetry.execute([:code, :wal, :pack_upload], %{bytes: size}, %{repo_id: repo_id})
-      {:ok, %Code.Wal.V1.Pack{key: pack_key(repo_id, name), size: size, digest: digest}}
+      {:ok, %Code.Wal.V1.Pack{key: key, size: size, digest: digest}}
     end
   end
 
-  defp put_pack_index(repo_id, pack_path) do
+  defp pack_generation(repo_id, opts) do
+    case Keyword.fetch(opts, :storage_generation) do
+      {:ok, generation} -> {:ok, generation}
+      :error -> storage_generation(repo_id)
+    end
+  end
+
+  defp put_pack_index(prefix, pack_path) do
     idx = Path.rootname(pack_path) <> ".idx"
 
     if File.exists?(idx) do
-      with {:ok, _} <- stream_immutable(pack_key(repo_id, Path.basename(idx)), idx), do: :ok
+      with {:ok, _} <- stream_immutable(prefix <> "/" <> Path.basename(idx), idx), do: :ok
     else
       # Not fatal: a replica can rebuild the index locally with `index-pack`.
       :ok
@@ -711,7 +778,11 @@ defmodule Code.WAL do
   defp tombstone(repo_id, attempts) do
     with :ok <- check_id(repo_id),
          {:ok, index, etag} <- fetch_raw(repo_id) do
-      if Index.deleted?(index), do: {:ok, index}, else: write_tombstone(repo_id, index, etag, attempts)
+      cond do
+        index.recovering -> {:error, :recovery_in_progress}
+        Index.deleted?(index) -> {:ok, index}
+        true -> write_tombstone(repo_id, index, etag, attempts)
+      end
     end
   end
 
@@ -774,18 +845,20 @@ defmodule Code.WAL do
     started = System.monotonic_time(:millisecond)
 
     result =
-      with {:ok, index} <- tombstone(repo_id),
-           :ok <- mark_deleting(repo_id),
+      with :ok <- ObjectStore.verify_conditional_deletes(),
+           {:ok, index} <- tombstone(repo_id),
+           {:ok, version} <- tombstone_version(repo_id, index),
+           {:ok, marker_version} <- mark_deleting(repo_id, index),
            {:ok, owned} <- owned_keys(repo_id, index),
            {:ok, extra} <- extra_keys.() do
         keys = Enum.uniq(owned ++ extra)
         failed = delete_keys(keys)
 
-        # The marker goes before the index: an orphaned marker with no index
-        # next to it would hide a repository later created under the same id.
+        # Remove only the versions this cleanup owns. A delayed worker can
+        # finish after another worker freed the name and a new restore took it.
         if failed == [] do
-          with :ok <- ObjectStore.delete(deleting_key(repo_id)),
-               :ok <- ObjectStore.delete(index_key(repo_id)),
+          with :ok <- delete_version(deleting_key(repo_id), marker_version),
+               :ok <- delete_version(index_key(repo_id), version),
                do: {:ok, length(keys)}
         else
           Logger.error("repository deletion left objects behind",
@@ -819,15 +892,42 @@ defmodule Code.WAL do
     end
   end
 
-  # A listing hint, not state: the tombstone in the index is what refuses
-  # writes and reads. The marker sits beside `index.pb` so the repository walk,
-  # which already sees every key at that level, can leave a repository whose
-  # deletion is in progress (or stopped at partial cleanup) out of the list
-  # without reading its index.
-  defp mark_deleting(repo_id) do
-    case ObjectStore.put(deleting_key(repo_id), "", content_type: "application/octet-stream") do
-      {:ok, _etag} -> :ok
+  # Marker deletion is conditional too: a delayed cleanup must not remove
+  # another incarnation's marker. Listings check the index itself for liveness.
+  defp tombstone_version(repo_id, expected) do
+    with {:ok, body, version} <- ObjectStore.get(index_key(repo_id)),
+         {:ok, ^expected} <- Index.decode(body) do
+      {:ok, version}
+    else
+      {:ok, _} -> {:error, :raced}
       error -> error
+    end
+  end
+
+  defp mark_deleting(repo_id, index) do
+    body = Index.encode(index)
+
+    case ObjectStore.put(deleting_key(repo_id), body, if_none_match: "*") do
+      {:ok, version} ->
+        {:ok, version}
+
+      {:error, :precondition_failed} ->
+        with {:ok, existing, version} <- ObjectStore.get(deleting_key(repo_id)) do
+          case Index.decode(existing) do
+            {:ok, marker} when marker.incarnation == index.incarnation -> {:ok, version}
+            _ -> ObjectStore.put(deleting_key(repo_id), body, if_match: version)
+          end
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp delete_version(key, version) do
+    case ObjectStore.delete_if_match(key, version) do
+      {:error, :precondition_failed} -> {:error, :raced}
+      result -> result
     end
   end
 
@@ -861,7 +961,7 @@ defmodule Code.WAL do
   @doc false
   @spec owned_keys(repo_id(), Index.t()) :: {:ok, [String.t()]} | {:error, term()}
   def owned_keys(repo_id, index) do
-    prefix = "repos/#{repo_id}/"
+    generation = index.storage_generation
 
     named =
       Enum.flat_map(index.entries, &[&1.key]) ++
@@ -869,12 +969,10 @@ defmodule Code.WAL do
         if(index.base.history_key != "", do: [index.base.history_key], else: [])
 
     Enum.reduce_while(@owned_patterns, {:ok, named}, fn {dir, pattern}, {:ok, acc} ->
-      case ObjectStore.list(prefix <> dir) do
+      case ObjectStore.list(object_prefix(repo_id, String.trim_trailing(dir, "/"), generation)) do
         {:ok, entries} ->
           owned =
-            entries
-            |> Enum.map(& &1.key)
-            |> Enum.filter(&Regex.match?(pattern, String.replace_prefix(&1, prefix, "")))
+            entries |> Enum.map(& &1.key) |> Enum.filter(&owned_key?(repo_id, generation, {dir, pattern}, &1))
 
           {:cont, {:ok, acc ++ owned}}
 
@@ -883,9 +981,22 @@ defmodule Code.WAL do
       end
     end)
     |> case do
-      {:ok, keys} -> {:ok, keys |> Enum.filter(&String.starts_with?(&1, prefix)) |> Enum.uniq()}
-      error -> error
+      {:ok, keys} ->
+        {:ok,
+         keys
+         |> Enum.filter(fn key ->
+           Enum.any?(@owned_patterns, &owned_key?(repo_id, generation, &1, key))
+         end)
+         |> Enum.uniq()}
+
+      error ->
+        error
     end
+  end
+
+  defp owned_key?(repo_id, generation, {dir, pattern}, key) do
+    prefix = object_prefix(repo_id, String.trim_trailing(dir, "/"), generation)
+    String.starts_with?(key, prefix) and Regex.match?(pattern, dir <> String.replace_prefix(key, prefix, ""))
   end
 
   @doc """
@@ -897,9 +1008,10 @@ defmodule Code.WAL do
   corpus's whole history; this grows with the number of repositories and
   account prefixes.
 
+  Only indexes with a deletion or recovery marker are read for liveness.
   A repository's own storage prefixes (`wal/`, `packs/`, `history/`) are never
   listed. A repository nested at exactly one of those names, such as
-  `acme/app/wal` beside `acme/app`, is still found with a single `stat` of its
+  `acme/app/wal` beside `acme/app`, is still found with a single read of its
   index; one nested further below such a name is not.
   """
   @spec list_repositories() :: {:ok, [repo_id()]} | {:error, term()}
@@ -910,11 +1022,12 @@ defmodule Code.WAL do
   @storage_prefixes ["wal/", "packs/", "history/"]
 
   defp walk_repositories(prefix, acc) do
-    with {:ok, %{keys: keys, prefixes: children}} <- ObjectStore.list_prefixes(prefix) do
-      index = prefix <> "index.pb"
-      repository? = Enum.any?(keys, &(&1.key == index))
-      deleting? = Enum.any?(keys, &(&1.key == prefix <> "deleting"))
-      acc = if repository? and not deleting?, do: [repository_id(prefix) | acc], else: acc
+    with {:ok, %{keys: keys, prefixes: children}} <- ObjectStore.list_prefixes(prefix),
+         index = prefix <> "index.pb",
+         repository? = Enum.any?(keys, &(&1.key == index)),
+         marked? = Enum.any?(keys, &(&1.key == prefix <> "deleting")),
+         {:ok, live?} <- listing_index(index, repository?, marked?) do
+      acc = if live?, do: [repository_id(prefix) | acc], else: acc
 
       Enum.reduce_while(children, {:ok, acc}, fn child, {:ok, acc} ->
         result =
@@ -933,10 +1046,38 @@ defmodule Code.WAL do
   end
 
   defp nested_under_storage(child, acc) do
+    with {:ok, live?} <- nested_listing_index(child) do
+      {:ok, if(live?, do: [repository_id(child) | acc], else: acc)}
+    end
+  end
+
+  defp nested_listing_index(child) do
     case ObjectStore.stat(child <> "index.pb") do
-      {:ok, _} -> {:ok, [repository_id(child) | acc]}
-      {:error, :not_found} -> {:ok, acc}
-      {:error, reason} -> {:error, reason}
+      {:ok, _} ->
+        case ObjectStore.stat(child <> "deleting") do
+          {:ok, _} -> listing_index(child <> "index.pb", true, true)
+          {:error, :not_found} -> {:ok, true}
+          error -> error
+        end
+
+      {:error, :not_found} ->
+        {:ok, false}
+
+      error ->
+        error
+    end
+  end
+
+  defp listing_index(_key, false, _marked), do: {:ok, false}
+  defp listing_index(_key, true, false), do: {:ok, true}
+
+  defp listing_index(key, true, true) do
+    with {:ok, body, _} <- ObjectStore.get(key, []),
+         {:ok, index} <- Index.decode(body) do
+      {:ok, not Index.deleted?(index)}
+    else
+      {:error, :not_found} -> {:ok, false}
+      error -> error
     end
   end
 
@@ -947,9 +1088,9 @@ defmodule Code.WAL do
   @spec digest(binary()) :: String.t()
   def digest(body), do: :crypto.hash(:sha256, body) |> Base.encode16(case: :lower)
 
-  defp put_entry(repo_id, entry) do
+  defp put_entry(repo_id, entry, generation) do
     body = Entry.encode(entry)
-    key = entry_key(repo_id, digest(body))
+    key = object_prefix(repo_id, "wal", generation) <> digest(body) <> ".pb"
 
     with {:ok, _} <- write_immutable(key, body), do: {:ok, key, byte_size(body), digest(body)}
   end

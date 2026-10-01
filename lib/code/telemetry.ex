@@ -66,6 +66,9 @@ defmodule Code.Telemetry do
     * `[:code, :retention, :operation]` — `duration_us`, meta `operation`
       (`configure`, `report`), `outcome` (`ok`, `error`), `repo_id`
     * `[:code, :retention, :report]` — `eligible_bytes`; successful dry-run only
+    * `[:code, :recovery, :operation]` — `duration_us`, meta `operation`
+      (`points`, `restore`, `discard`), `outcome` (`ok`, `error`), `repo_id`, `target`
+    * `[:code, :recovery, :restored]` — `bytes`; successfully restored pack bytes
     * `[:code, :repository, :created]`
   """
 

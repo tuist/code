@@ -427,7 +427,10 @@ missing repository is a `404`. `DELETE /repositories/<id>` answers `204` when
 everything is gone, `404` for an id that is not a repository (including an
 account prefix such as `acme`, which never deletes the repositories under it),
 and `503` with `Retry-After` when the repository is tombstoned but some objects
-remain. Repeating the request finishes the cleanup. A `503` with `Retry-After`
+remain. Repeating the request finishes the cleanup. Deletion requires the object store
+to enforce version-conditional deletion. Before tombstoning, each delete proves
+that a stale version cannot remove a replacement object; unsupported backends
+are refused while the repository remains live. A `503` with `Retry-After`
 also means a conditional write lost its retries to concurrent writers; the
 request was valid and can be repeated as is.
 
@@ -589,12 +592,14 @@ full-history Tuist migration rehearsal.
 
 ## Storage growth, and what is safe to delete
 
-Object storage only grows. Nothing in Code deletes an object except
+Repository object storage only grows. Repository data is removed by
 `DELETE /repositories/<id>`, which tombstones the repository and then removes
 exactly the objects it owns — never a nested repository's, which share its
 prefix (see `docs/architecture.md`, *Deleting a repository*). If some deletions
 fail it reports `partial_cleanup` with the number left, keeps refusing writes,
-and resumes when called again. While a deletion is in progress or stopped
+and resumes when called again. Isolated conditional-delete capability probes
+are also created and removed in `probes/`; these hold no repository data.
+While a deletion is in progress or stopped
 there, `GET /repositories` and MCP `list_repositories` leave the repository
 out.
 That is a deliberate consequence of the provenance guarantee — every state a
@@ -731,6 +736,192 @@ The object store is the repository. Back up the bucket; versioning and
 cross-region replication apply as they would to any bucket. Nothing on any
 node's disk needs backing up, ever.
 
-Because every entry is retained and every pre-compaction index is snapshotted
-under `history/`, point-in-time reconstruction of any repository state is
-possible from the bucket alone.
+The supported recovery workflow below restores exact current or canonical
+pre-compaction snapshots from the bucket alone. Selecting an arbitrary push or
+wall-clock timestamp is not implemented. In particular, symbolic-reference
+entries record their new value without their old value; simply rewinding branch
+updates does not reconstruct an earlier default branch reliably.
+
+### Restore into a new repository
+
+Recovery is an authenticated admin operation. It never changes the source's
+index, refs, policy, or packs. Run the helper from this checkout:
+
+```sh
+export CODE_ADMIN_URL=http://127.0.0.1:4002
+# Supply CODE_ADMIN_TOKEN through your normal secret-management mechanism.
+scripts/restore-repository points acme/app
+scripts/restore-repository restore acme/app acme/app-recovered <point-id>
+```
+
+The helper requires `curl` and `python3`. Its `points` command calls
+`GET /recovery-points/<source>` and returns `points`, newest first. Each point
+includes an `id`, `epoch`, `sequence`, `updated_at_ms`, `head`, reference count,
+pack count, and total pack bytes. The id hashes the exact **stored bytes** of
+the index, not a re-encoding of its reference maps. Timestamps are advisory;
+the digest selects the exact state. A current point can disappear when the
+index is rewritten. Relist and select a new point rather than silently restoring
+something different. Canonical historical points remain stable while retained.
+
+The restore command calls `POST /restore/<source>` with:
+
+```json
+{"repository":"acme/app-recovered","point":"<point-id>"}
+```
+
+The destination must be unused. Recovery first reserves its index using a
+create-only write, with `recovering: true` and a deletion timestamp. Git reads
+and writes cannot access the destination until recovery finishes, and ordinary
+creation and deletion refuse the reserved id. Ordinary repository listings hide
+reservations. `scripts/restore-repository status <destination>` calls
+`GET /restore/<destination>` and reports `recovering` or `deleting`, the creating
+node, and creation/update timestamps. This is durable reservation state, not a
+heartbeat or evidence that the originating request is still running.
+
+Recovery follows only the canonical snapshot chain named by the current index,
+checking snapshot digests, repository identity, incarnation, epoch progression,
+and sequence boundaries. It refuses pack keys outside that repository's own
+pack directory. Unreferenced snapshots from losing compactions are never offered
+as recovery points. Legacy snapshot keys without a content digest are unsupported.
+Listing returns up to 1,000 verified indexes. Its `incomplete` field is `null`
+for a complete chain, or `history_limit`, `unverifiable_history`, `missing_snapshot`,
+or `storage_unavailable` when earlier history cannot be offered. The current
+verified index remains selectable even with legacy or incomplete history.
+Searching for an older point still refuses unverifiable links or a search past
+the limit. Listing validates metadata; restore additionally checks actual objects.
+
+The selected packs are downloaded and verified in a fresh scratch repository.
+Recovery applies the selected refs and symbolic refs and runs `git fsck --full
+--no-reflogs`. It streams the packs and rebuilt or verified pack indexes into the
+destination's unique storage generation, then downloads the copied objects into a
+second fresh repository and repeats verification. This catches corrupt existing
+objects as well as failed transfers, without buffering packs in memory. Only
+after both checks does a conditional write publish the complete live index.
+
+Success returns `201` with the recovered reference map, `head`, source epoch and
+sequence, point id, pack count, and bytes. The destination has a fresh
+incarnation, epoch 1, sequence 0, and no link to the source's recovery chain.
+It preserves the selected replica count and inherits the deployment's retention
+default. Account policy is not copied: access follows the destination account's
+existing policy. Historical packs can include unreachable objects; this is a
+recovery operation, not an export that sanitizes object contents.
+
+A successful destination depends only on its own durable objects. Deleting the
+source, losing every node cache, and materializing the destination from scratch
+does not lose its recovered history. Scratch directories are removed when the
+operation exits normally. A killed request or node can leave disposable
+`.recovery-*` directories; node startup and the next restore remove them. Pack
+staging stays within that recovery scratch directory. Each node permits one
+restore at a time per data directory and checks for at least three times the
+selected pack bytes plus one gibibyte of free disk space. Space can still change
+after that check; prefer a dedicated maintenance node with adequate disk for
+large recoveries. Verification permits two hours per full object check;
+`recovery_verification_timeout_ms` can override this in node configuration.
+
+### Failed or interrupted recovery
+
+A failure after reservation keeps the destination unavailable. The durable
+reservation survives node loss. To discard its copied objects and free the name:
+
+```sh
+scripts/restore-repository discard acme/app-recovered
+```
+
+This calls `DELETE /restore/<destination>`. It refuses a live repository with
+`409 destination_not_recovering`. Discard first conditionally turns the
+reservation into an ordinary deletion tombstone, then runs the existing deletion
+workflow. The conditional write fences an in-flight restore from publishing
+after cancellation. If cleanup fails or the request dies after releasing the
+reservation, repeat the same discard command. It resumes deletion of a plain
+tombstone. Partial cleanup returns `503 recovery_cleanup_incomplete`. Ordinary
+`DELETE /repositories/<destination>` can also finish cleanup.
+An upload already in flight during cancellation can leave unreferenced objects;
+automatic orphan collection remains unimplemented.
+
+An existing destination produces `409 destination_exists`; invalid input
+produces `422`; missing sources or stale point ids produce `404`. Corrupt history
+or failed object verification returns a stable `500` error, with details in
+structured logs. Storage failures return `503`; a verification timeout returns
+`503 recovery_verification_timeout` rather than a corruption error. A cancelled
+or replaced reservation returns `409 recovery_changed_concurrently`. A source
+that was deleted or recreated before the final liveness check returns
+`409 recovery_source_changed`. A lost publication reply is
+checked against the destination's exact new index. If its outcome cannot be
+confirmed, the response is `503 recovery_publication_unknown`: inspect the
+destination before discarding or retrying. A lost reservation reply can also
+leave a reserved name; inspect and discard it before retrying.
+
+Production restores are disabled by default (`503 recovery_disabled`). Set
+`CODE_RECOVERY_ENABLED=true` only after every serving and maintenance node has
+been upgraded and old admin listeners have been drained. With Helm, set it through
+`extraEnv`. Development and the local test stack enable it. Enabling this gate also gives
+ordinary newly created repositories unique storage generations, protecting their
+name reuse from delayed cleanup. New-generation pushes also reject entries or
+packs uploaded into a previous generation, even when their ref basis is fresh.
+Existing flat-layout repositories retain their
+layout until deleted; their replacements use the new layout. Disabling the gate
+makes new ordinary repositories use the legacy layout again, so keep it enabled
+for normal operations after rollout. This is an explicit
+operator rollout assertion, not a membership probe: disconnected old nodes cannot
+be reliably detected. Keep old versions from rejoining and do not roll back while
+restored repositories exist. Old versions cannot respect reservation deletion
+fences or write into the restored generation. Conditional deletion support is
+required from the object store. Each restore first writes an isolated probe
+object, confirms that deletion with a stale version is refused and leaves the
+replacement intact, then confirms a matching deletion succeeds. A backend that
+ignores `If-Match` returns `503 recovery_conditional_delete_unsupported` before
+reserving the destination. Probe requests use the `probes/conditional-delete-*`
+namespace under the configured object-store prefix. Node credentials must permit
+reading, writing and deleting those probe objects; a lost response can leave an unreferenced probe object. See [Amazon Simple Storage Service conditional deletes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-deletes.html).
+
+A restore rechecks source incarnation and liveness just before publication, but
+that read and destination publication are separate object-store operations. To
+guarantee erasure while administrators might restore data, first disable and drain
+recovery on every node, then delete the source and any previously restored copies.
+There is no cross-repository erasure transaction or automatic reservation expiry.
+The admin token authorizes recovery across accounts; account-facing restore is not
+implemented.
+
+### Recovery from a bucket backup
+
+Restore the backed-up bucket into a separate storage location and point an
+isolated Code deployment at it. That deployment must have the backed-up
+`index.pb` and all objects required by the selected point. Run the same listing
+and recovery commands there, then clone and verify the recovered repository.
+This workflow does not fetch object-store versions, restore buckets, or recover
+repositories whose index and required packs have already been permanently
+deleted. It also does not transfer the recovered repository into another Code
+deployment automatically.
+
+### Recovery drill and observability
+
+`mise run verify:recovery` starts the local two-node test stack and runs a drill
+against uniquely named fixture repositories. It imports branches and an
+annotated tag, compacts, replaces the main branch with unrelated history,
+deletes the other branch and tag, and compacts again. It restores the older
+canonical point into a new repository, deletes the source, evicts both
+destination caches, and compares branch/tag targets and all reachable objects
+in fresh mirror clones from both nodes. Both clones must pass `git fsck --full`.
+The same drill runs in `mise run e2e`. Artifacts and a report remain under
+`tmp/e2e/recovery.*`; stop the standalone drill's stack with `mise run e2e:down`.
+This verifies repository recovery, not a backup provider's bucket restoration.
+Unit tests separately recover from a copied filesystem bucket after deleting
+the original repository.
+
+Recovery emits `[:code, :recovery, :operation]` with `duration_us` and metadata
+`operation` (`points`, `restore`, `discard`), `outcome` (`ok`, `rejected`, `incomplete`, `error`), `repo_id`,
+and `target`. Successful restores emit `[:code, :recovery, :restored]` with pack
+`bytes`. Exported metrics are `code_recovery_operation_count`,
+`code_recovery_operation_duration` (seconds), and `code_recovery_restored_bytes`.
+Only bounded operation and outcome values are metric labels. Trace spans are
+`code.recovery.points`, `code.recovery.restore`, `code.recovery.discard`, and
+`code.recovery.verify`, and `code.recovery.stage` (bounded stage names for
+storage capability, reservation, capacity, source verification, copying, destination verification and
+publication). Outer spans carry source and destination ids. Scratch reconstruction
+does not emit replica-sync counters or synchronized-replica logs. Restore and
+discard successes and all failures produce
+structured logs with source/destination identifiers, point ids where applicable,
+and bounded failure reasons, alongside the trace context. Reservation status is
+read on demand; a cluster-wide reservation gauge and asynchronous recovery jobs
+are not implemented. HTTP requests remain synchronous, so a proxy timeout does
+not establish whether publication completed. Inspect the destination before retrying.
