@@ -101,7 +101,7 @@ defmodule Code.ObjectStore.S3 do
       |> maybe_header("if-none-match", Keyword.get(opts, :if_none_match))
       |> maybe_header("content-type", Keyword.get(opts, :content_type, "application/octet-stream"))
 
-    case request(:put, key, config, headers: headers, body: IO.iodata_to_binary(body), decode_body: false) do
+    case request(:put, key, config, headers: headers, body: body, decode_body: false) do
       {:ok, %{status: status} = resp} when status in 200..299 ->
         {:ok, etag(resp)}
 

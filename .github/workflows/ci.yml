@@ -24,7 +24,10 @@ jobs:
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
-          install_args: "erlang elixir"
+          # rust and protoc are needed by the Rustler NIF under
+          # native/code_native/: cargo compiles the crate during `mix compile`
+          # and prost-build shells out to protoc for the schema.
+          install_args: "erlang elixir rust protoc"
       - uses: actions/cache@v6
         with:
           path: |
@@ -46,7 +49,7 @@ jobs:
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
-          install_args: "erlang elixir"
+          install_args: "erlang elixir rust protoc"
       - uses: actions/cache@v6
         with:
           path: |
@@ -65,7 +68,7 @@ jobs:
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
-          install_args: "erlang elixir"
+          install_args: "erlang elixir rust protoc"
       - uses: actions/cache@v6
         with:
           path: |
@@ -84,7 +87,7 @@ jobs:
       - uses: jdx/mise-action@v4
         with:
           version: ${{ env.MISE_VERSION }}
-          install_args: "erlang elixir shellspec"
+          install_args: "erlang elixir shellspec rust protoc"
       - uses: actions/cache@v6
         with:
           path: |

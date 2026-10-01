@@ -20,3 +20,11 @@ erl_crash.dump
 
 # End-to-end scratch state
 /spec/support/*.pid
+
+# Benchee snapshots and HTML reports
+/bench/results/
+
+# Rustler-compiled NIF artefacts: the shared library is built from
+# native/code_native/ on `mix compile`.
+/native/code_native/target/
+/priv/native/
