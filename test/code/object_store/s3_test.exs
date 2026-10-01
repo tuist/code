@@ -52,7 +52,7 @@ defmodule Code.ObjectStore.S3Test do
   end
 
   test "conditional deletion sends the version fence and preserves precondition failures" do
-    for status <- [204, 412] do
+    for status <- [204, 409, 412] do
       expect(Req, :request, fn request ->
         assert request.method == :delete
         assert Req.Request.get_header(request, "if-match") == ["version"]

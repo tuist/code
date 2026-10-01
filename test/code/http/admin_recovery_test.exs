@@ -1,5 +1,8 @@
 defmodule Code.HTTP.AdminRecoveryTest do
   use Code.Case, async: true
+  use Mimic
+
+  setup :set_mimic_private
 
   import Plug.Conn
   import Plug.Test
@@ -93,6 +96,31 @@ defmodule Code.HTTP.AdminRecoveryTest do
     response = request(:get, "/recovery-points/#{repo}")
     assert response.status == 500
     assert %{"error" => "recovery_history_invalid"} = JSON.decode!(response.resp_body)
+  end
+
+  test "ordinary deletion reports unsupported conditional storage without deleting the repository", %{
+    repo: repo
+  } do
+    {:ok, index} = WAL.create(repo)
+    stub(ObjectStore, :verify_conditional_deletes, fn -> {:error, :conditional_delete_unsupported} end)
+    response = request(:delete, "/repositories/#{repo}")
+    assert response.status == 503
+    assert %{"error" => "conditional_delete_unsupported"} = JSON.decode!(response.resp_body)
+    assert {:ok, ^index, _} = WAL.fetch(repo)
+  end
+
+  test "ordinary deletion reports a cleanup version conflict", %{repo: repo} do
+    {:ok, _} = WAL.create(repo)
+
+    stub(ObjectStore, :delete_if_match, fn key, version ->
+      if key == WAL.index_key(repo),
+        do: {:error, :precondition_failed},
+        else: Mimic.call_original(ObjectStore, :delete_if_match, [key, version])
+    end)
+
+    response = request(:delete, "/repositories/#{repo}")
+    assert response.status == 409
+    assert %{"error" => "repository_changed_concurrently"} = JSON.decode!(response.resp_body)
   end
 
   defp request(method, path, payload \\ %{}, token \\ "admin-secret") do

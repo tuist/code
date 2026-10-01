@@ -833,7 +833,9 @@ reservation into an ordinary deletion tombstone, then runs the existing deletion
 workflow. The conditional write fences an in-flight restore from publishing
 after cancellation. If cleanup fails or the request dies after releasing the
 reservation, repeat the same discard command. It resumes deletion of a plain
-tombstone. Partial cleanup returns `503 recovery_cleanup_incomplete`. Ordinary
+tombstone only in the incarnation that discard inspected. An overlapping discard
+returns `409 recovery_changed_concurrently` if the name now belongs to a successor.
+Partial cleanup returns `503 recovery_cleanup_incomplete`. Ordinary
 `DELETE /repositories/<destination>` can also finish cleanup.
 An upload already in flight during cancellation can leave unreferenced objects;
 automatic orphan collection remains unimplemented.
@@ -841,12 +843,17 @@ automatic orphan collection remains unimplemented.
 An existing destination produces `409 destination_exists`; invalid input
 produces `422`; missing sources or stale point ids produce `404`. Corrupt history
 or failed object verification returns a stable `500` error, with details in
-structured logs. Storage failures return `503`; a verification timeout returns
-`503 recovery_verification_timeout` rather than a corruption error. A cancelled
-or replaced reservation returns `409 recovery_changed_concurrently`. A source
+structured logs. Storage failures return `503`; a full object-check timeout returns
+`503 recovery_verification_timeout` rather than a corruption error. Pack download
+and installation still use the existing thirty-minute worker limit. Exceeding
+that limit terminates the request and leaves an unavailable reservation to
+inspect and discard; it does not currently return that stable timeout response.
+A cancelled or replaced reservation returns `409 recovery_changed_concurrently`. A source
 that was deleted or recreated before the final liveness check returns
 `409 recovery_source_changed`. A lost publication reply is
-checked against the destination's exact new index. If its outcome cannot be
+checked against the destination's new incarnation and storage generation, so
+a push or compaction after publication does not turn success into an unknown
+outcome. If its outcome cannot be
 confirmed, the response is `503 recovery_publication_unknown`: inspect the
 destination before discarding or retrying. A lost reservation reply can also
 leave a reserved name; inspect and discard it before retrying.
@@ -858,6 +865,13 @@ been upgraded and old admin listeners have been drained. With Helm, set it throu
 ordinary newly created repositories unique storage generations, protecting their
 name reuse from delayed cleanup. New-generation pushes also reject entries or
 packs uploaded into a previous generation, even when their ref basis is fresh.
+Pushes and compaction upload into the generation captured by their working index;
+compaction also refuses packs from another generation. A losing concurrent
+restore retains the listing marker because the winning reservation may rely on it.
+Delayed deletion also leaves markers belonging to another incarnation intact.
+A marker beside a live repository is harmless: inventory checks the index for
+actual liveness. Ordinary replica pack staging uses the system temporary directory;
+recovery staging stays inside its swept scratch directory.
 Existing flat-layout repositories retain their
 layout until deleted; their replacements use the new layout. Disabling the gate
 makes new ordinary repositories use the legacy layout again, so keep it enabled
@@ -871,7 +885,11 @@ object, confirms that deletion with a stale version is refused and leaves the
 replacement intact, then confirms a matching deletion succeeds. A backend that
 ignores `If-Match` returns `503 recovery_conditional_delete_unsupported` before
 reserving the destination. Probe requests use the `probes/conditional-delete-*`
-namespace under the configured object-store prefix. Node credentials must permit
+namespace under the configured object-store prefix.
+Ordinary deletion returns `409 repository_changed_concurrently` when a conditional
+cleanup loses its version, and `503 conditional_delete_unsupported` when the probe
+fails its semantic checks. Concurrent conditional-delete conflicts are treated
+as failed version conditions. Node credentials must permit
 reading, writing and deleting those probe objects; a lost response can leave an unreferenced probe object. See [Amazon Simple Storage Service conditional deletes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-deletes.html).
 
 A restore rechecks source incarnation and liveness just before publication, but

@@ -111,6 +111,12 @@ defmodule Code.HTTP.AdminRouter do
       {:error, :recovery_in_progress} ->
         send_json(conn, 409, %{error: "recovery_in_progress"})
 
+      {:error, :raced} ->
+        send_json(conn, 409, %{error: "repository_changed_concurrently"})
+
+      {:error, :conditional_delete_unsupported} ->
+        send_json(conn, 503, %{error: "conditional_delete_unsupported"})
+
       # The tombstone is down, so the repository is gone for every reader and
       # writer; some objects are left, and repeating the request resumes.
       {:error, {:partial_cleanup, remaining}} ->

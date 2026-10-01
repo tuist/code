@@ -66,7 +66,7 @@ defmodule Code.Recovery do
            {:ok, index} <- decode_index(body),
            true <- index.repo_id == target and Index.deleted?(index),
            :ok <- release_reservation(target, index, version),
-           :ok <- WAL.destroy(target) do
+           :ok <- WAL.destroy(target, fn -> {:ok, []} end, tombstoned_incarnation: index.incarnation) do
         {:ok, %{discarded: target}}
       else
         false -> {:error, :not_recovering}
@@ -324,7 +324,8 @@ defmodule Code.Recovery do
           {:ok, reservation, version, marker_version}
 
         {:error, :precondition_failed} ->
-          ObjectStore.delete_if_match(WAL.deleting_key(target), marker_version)
+          # Another restorer may own the index and rely on this marker.
+          # Retain it; inventory checks the index for its actual liveness.
           {:error, :already_exists}
 
         {:error, reason} ->
@@ -410,7 +411,7 @@ defmodule Code.Recovery do
              true <- refs == index.refs do
           :ok
         else
-          false -> {:error, :recovered_refs_mismatch}
+          false -> {:error, {:verification_failed, :recovered_refs_mismatch}}
           {:error, {:git, :timeout, _}} -> {:error, :recovery_verification_timeout}
           {:error, reason} -> {:error, {:verification_failed, reason}}
         end
@@ -478,8 +479,13 @@ defmodule Code.Recovery do
   # publication committed. Our fresh incarnation identifies our own index.
   defp confirm_publication(target, index, reason) do
     case WAL.fetch(target) do
-      {:ok, ^index, _} -> :ok
-      _ -> {:error, reason}
+      {:ok, current, _}
+      when current.incarnation == index.incarnation and
+             current.storage_generation == index.storage_generation ->
+        :ok
+
+      _ ->
+        {:error, reason}
     end
   end
 

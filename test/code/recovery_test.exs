@@ -618,6 +618,7 @@ defmodule Code.RecoveryTest do
              Recovery.restore(context.repo, repo(context, "too-big"), point.id)
   end
 
+  @tag timeout: 180_000
   test "snapshot limit reports a bounded partial inventory and still permits current recovery", context do
     {:ok, initial} = WAL.create(context.repo)
 
@@ -654,6 +655,220 @@ defmodule Code.RecoveryTest do
     assert {:ok, _} = Code.Retention.report(target)
     {:ok, %{points: [current | _]}} = Recovery.points(target)
     assert {:ok, _} = Recovery.restore(target, repo(context, "second-generation"), current.id)
+  end
+
+  test "a losing concurrent restore preserves the reservation listing marker", context do
+    seed(context)
+    {:ok, %{points: [point]}} = Recovery.points(context.repo)
+    target = repo(context, "dup")
+    parent = self()
+    overrides = Config.overrides()
+    other_data = Path.join(context.root, "node-b")
+    File.mkdir_p!(other_data)
+
+    stub(ObjectStore, :put, fn key, body, opts ->
+      if key == WAL.index_key(target) and opts[:if_none_match] == "*" do
+        if self() == parent do
+          r2 =
+            Task.async(fn ->
+              Config.put_overrides(Map.put(overrides, :data_dir, other_data))
+              Recovery.restore(context.repo, target, point.id)
+            end)
+
+          assert_receive {:r2_at_index, r2pid}, 10_000
+          result = Mimic.call_original(ObjectStore, :put, [key, body, opts])
+          send(r2pid, :go)
+          send(parent, {:r2_result, Task.await(r2, 30_000)})
+          result
+        else
+          send(parent, {:r2_at_index, self()})
+          receive do: (:go -> :ok)
+          Mimic.call_original(ObjectStore, :put, [key, body, opts])
+        end
+      else
+        Mimic.call_original(ObjectStore, :put, [key, body, opts])
+      end
+    end)
+
+    # R1 stops after reserving, as a node crash or a storage error would.
+    stub(ObjectStore, :get_file, fn _key, _path -> {:error, :boom} end)
+
+    assert {:error, _} = Recovery.restore(context.repo, target, point.id)
+    assert_received {:r2_result, {:error, :already_exists}}
+
+    assert {:ok, pending, _} = ObjectStore.get(WAL.index_key(target))
+    assert {:ok, %{recovering: true}} = Index.decode(pending)
+    assert {:ok, _} = ObjectStore.stat(WAL.deleting_key(target))
+    {:ok, ids} = WAL.list_repositories()
+    refute target in ids, "an unavailable reservation is listed as a live repository"
+  end
+
+  test "a lost publication reply followed by a push is recognized as successful", context do
+    seed(context)
+    {:ok, %{points: [point]}} = Recovery.points(context.repo)
+    target = repo(context, "lost-reply-push")
+    fired = :counters.new(1, [])
+
+    stub(ObjectStore, :put, fn key, body, opts ->
+      result = Mimic.call_original(ObjectStore, :put, [key, body, opts])
+
+      if key == WAL.index_key(target) and Keyword.has_key?(opts, :if_match) and
+           :counters.get(fired, 1) == 0 do
+        :counters.add(fired, 1, 1)
+        {:ok, _} = result
+        # a client pushes to the freshly visible repository before the timeout fires
+        {:ok, _} = WAL.append(target, fn _ -> {:ok, Entry.new(commands: [], packs: [], at_ms: 99)} end)
+        {:error, :timeout}
+      else
+        result
+      end
+    end)
+
+    result = Recovery.restore(context.repo, target, point.id)
+    {:ok, live, _} = WAL.fetch(target)
+    assert live.seq == 1
+    assert {:error, :not_found} = ObjectStore.stat(WAL.deleting_key(target))
+
+    assert match?({:ok, _}, result),
+           "repository is live and recovered but restore reported #{inspect(result)}"
+  end
+
+  test "a delayed discard cannot delete a newly created repository", context do
+    seed(context)
+    {:ok, %{points: [point]}} = Recovery.points(context.repo)
+    target = repo(context, "discard-victim")
+    fired = :counters.new(1, [])
+
+    # A restore that failed after reserving, so the name holds a reservation.
+    stub(ObjectStore, :get_file, fn _key, _path -> {:error, :boom} end)
+    assert {:error, _} = Recovery.restore(context.repo, target, point.id)
+    assert {:ok, pending, _} = ObjectStore.get(WAL.index_key(target))
+    assert {:ok, %{recovering: true}} = Index.decode(pending)
+
+    # First discard has released the reservation and is about to start deletion
+    # (the capability probe is the first thing destroy/1 does). Meanwhile an
+    # operator's second discard (the documented "repeat the command") or an
+    # ordinary DELETE finishes the job and a client re-creates the name.
+    stub(ObjectStore, :verify_conditional_deletes, fn ->
+      if :counters.get(fired, 1) == 0 do
+        :counters.add(fired, 1, 1)
+        assert :ok = WAL.destroy(target)
+        assert {:ok, _} = WAL.create(target)
+      end
+
+      Mimic.call_original(ObjectStore, :verify_conditional_deletes, [])
+    end)
+
+    result = Recovery.discard(target)
+    assert {:error, :raced} = result
+    assert {:ok, _, _} = WAL.fetch(target), "discard destroyed the newly created repository"
+  end
+
+  test "compaction uploads stay in the captured generation after repository replacement", context do
+    start_replica_runtime()
+    original = seed(context)
+    {:ok, _} = Replica.ensure_fresh(context.repo)
+    fired = :counters.new(1, [])
+
+    stub(ObjectStore, :put_file, fn key, file, opts ->
+      if String.ends_with?(key, ".pack") and :counters.get(fired, 1) == 0 do
+        :counters.add(fired, 1, 1)
+        assert :ok = WAL.destroy(context.repo)
+        assert {:ok, _} = WAL.create(context.repo)
+        {:ok, successor, _} = WAL.fetch(context.repo)
+        refute successor.storage_generation == original.index.storage_generation
+
+        assert String.starts_with?(
+                 key,
+                 WAL.object_prefix(context.repo, "packs", original.index.storage_generation)
+               )
+      end
+
+      Mimic.call_original(ObjectStore, :put_file, [key, file, opts])
+    end)
+
+    assert {:error, :raced} = Code.Replica.Compactor.compact(context.repo)
+    assert :counters.get(fired, 1) == 1
+    {:ok, successor, _} = WAL.fetch(context.repo)
+
+    assert {:ok, []} =
+             ObjectStore.list(WAL.object_prefix(context.repo, "packs", successor.storage_generation))
+
+    assert successor.refs == %{}
+  end
+
+  test "compaction refuses packs from another generation before writing history", context do
+    original = seed(context)
+    {:ok, _} = WAL.create(repo(context, "other"))
+    {:ok, foreign} = WAL.put_pack(repo(context, "other"), original.file)
+    {:ok, index, version} = WAL.fetch(context.repo)
+
+    assert {:error, :repository_replaced} =
+             WAL.compact(context.repo, [foreign], index.refs, index.base.symrefs, index, version)
+
+    assert {:ok, ^index, ^version} = WAL.fetch(context.repo)
+    assert {:ok, []} = ObjectStore.list(WAL.object_prefix(context.repo, "history", index.storage_generation))
+  end
+
+  test "reference mismatch after object verification is classified as an integrity failure", context do
+    seed(context)
+    {:ok, index, version} = WAL.fetch(context.repo)
+
+    index = %{
+      index
+      | base: %{index.base | symrefs: Map.put(index.base.symrefs, "refs/tags/v1", "refs/heads/main")}
+    }
+
+    {:ok, _} = ObjectStore.put(WAL.index_key(context.repo), Index.encode(index), if_match: version)
+    {:ok, %{points: [point]}} = Recovery.points(context.repo)
+    target = repo(context, "mismatched-refs")
+
+    assert {:error, {:verification_failed, :recovered_refs_mismatch}} =
+             Recovery.restore(context.repo, target, point.id)
+
+    assert {:error, :not_found} = WAL.fetch(target)
+  end
+
+  test "ordinary replica staging uses the system temporary directory", context do
+    seed(context)
+
+    stub(ObjectStore, :get_file, fn key, file ->
+      assert String.starts_with?(file, Path.join(System.tmp_dir!(), "code-packs-"))
+      refute String.starts_with?(file, context.data)
+      Mimic.call_original(ObjectStore, :get_file, [key, file])
+    end)
+
+    assert {:ok, _} = Replica.ensure_fresh(context.repo)
+  end
+
+  test "delayed deletion cannot take over a successor reservation marker", context do
+    original = seed(context)
+    fired = :counters.new(1, [])
+    successor = %{Index.tombstone(Index.new(context.repo), "successor") | recovering: true}
+
+    stub(ObjectStore, :put, fn key, body, opts ->
+      if key == WAL.deleting_key(context.repo) and opts[:if_none_match] == "*" and
+           :counters.get(fired, 1) == 0 do
+        :counters.add(fired, 1, 1)
+        assert :ok = WAL.destroy(context.repo)
+        assert {:ok, _} = ObjectStore.put(key, Index.encode(successor), if_none_match: "*")
+
+        assert {:ok, _} =
+                 ObjectStore.put(WAL.index_key(context.repo), Index.encode(successor), if_none_match: "*")
+      end
+
+      Mimic.call_original(ObjectStore, :put, [key, body, opts])
+    end)
+
+    assert :counters.get(fired, 1) == 0
+    assert {:error, :raced} = WAL.destroy(context.repo)
+    assert {:ok, marker, _} = ObjectStore.get(WAL.deleting_key(context.repo))
+    assert {:ok, ^successor} = Index.decode(marker)
+    assert {:ok, pending, _} = ObjectStore.get(WAL.index_key(context.repo))
+    assert {:ok, ^successor} = Index.decode(pending)
+    assert {:ok, ids} = WAL.list_repositories()
+    refute context.repo in ids
+    refute successor.incarnation == original.index.incarnation
   end
 
   defp seed(context) do

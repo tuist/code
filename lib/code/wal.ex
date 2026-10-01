@@ -604,7 +604,8 @@ defmodule Code.WAL do
     if Index.deleted?(index) do
       {:error, :repository_deleted}
     else
-      with {:ok, _} <- write_immutable(history, snapshot) do
+      with :ok <- check_generation(index, %{packs: packs}, nil),
+           {:ok, _} <- write_immutable(history, snapshot) do
         compacted = Index.rebase(index, packs, refs, symrefs, Config.node_id(), history)
 
         case ObjectStore.put(index_key(repo_id), Index.encode(compacted),
@@ -829,6 +830,9 @@ defmodule Code.WAL do
   name has the shape this module writes there. A nested repository's objects
   always sit at least one directory deeper and never match.
 
+  `tombstoned_incarnation` restricts cleanup to an already unavailable incarnation,
+  refusing a live or replaced repository instead of tombstoning it.
+
   `extra_keys` lists further keys the caller owns on the repository's behalf.
   It is called only after the tombstone is in place, so nothing created through
   a live index can appear after it looked, and its keys are deleted in the same
@@ -839,14 +843,14 @@ defmodule Code.WAL do
   resumable; it is reported as `{:error, {:partial_cleanup, failed}}` with the
   number of keys that could not be removed.
   """
-  @spec destroy(repo_id(), (-> {:ok, [String.t()]} | {:error, term()})) ::
+  @spec destroy(repo_id(), (-> {:ok, [String.t()]} | {:error, term()}), keyword()) ::
           :ok | {:error, :not_found | {:partial_cleanup, pos_integer()} | term()}
-  def destroy(repo_id, extra_keys \\ fn -> {:ok, []} end) do
+  def destroy(repo_id, extra_keys \\ fn -> {:ok, []} end, opts \\ []) do
     started = System.monotonic_time(:millisecond)
 
     result =
       with :ok <- ObjectStore.verify_conditional_deletes(),
-           {:ok, index} <- tombstone(repo_id),
+           {:ok, index} <- destruction_index(repo_id, opts),
            {:ok, version} <- tombstone_version(repo_id, index),
            {:ok, marker_version} <- mark_deleting(repo_id, index),
            {:ok, owned} <- owned_keys(repo_id, index),
@@ -892,6 +896,24 @@ defmodule Code.WAL do
     end
   end
 
+  # Discard resumes only the unavailable incarnation it inspected. It must never
+  # tombstone a successor that acquired the name while cleanup was in flight.
+  defp destruction_index(repo_id, opts) do
+    case Keyword.fetch(opts, :tombstoned_incarnation) do
+      :error ->
+        tombstone(repo_id)
+
+      {:ok, incarnation} ->
+        with {:ok, index, _} <- fetch_raw(repo_id),
+             true <- index.incarnation == incarnation and not index.recovering and Index.deleted?(index) do
+          {:ok, index}
+        else
+          false -> {:error, :raced}
+          error -> error
+        end
+    end
+  end
+
   # Marker deletion is conditional too: a delayed cleanup must not remove
   # another incarnation's marker. Listings check the index itself for liveness.
   defp tombstone_version(repo_id, expected) do
@@ -915,7 +937,10 @@ defmodule Code.WAL do
         with {:ok, existing, version} <- ObjectStore.get(deleting_key(repo_id)) do
           case Index.decode(existing) do
             {:ok, marker} when marker.incarnation == index.incarnation -> {:ok, version}
-            _ -> ObjectStore.put(deleting_key(repo_id), body, if_match: version)
+            # A delayed cleanup must not take ownership of a successor marker.
+            # It can still delete its own index conditionally, leaving this
+            # unrelated marker for inventory to check against the actual index.
+            _ -> {:ok, nil}
           end
         end
 
@@ -923,6 +948,8 @@ defmodule Code.WAL do
         error
     end
   end
+
+  defp delete_version(_key, nil), do: :ok
 
   defp delete_version(key, version) do
     case ObjectStore.delete_if_match(key, version) do

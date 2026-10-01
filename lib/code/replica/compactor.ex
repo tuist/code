@@ -121,7 +121,7 @@ defmodule Code.Replica.Compactor do
           with :ok <- Git.reset_refs(view.path, refs),
                {:ok, packs} <- Git.repack(view.path),
                :ok <- Git.verify_packs_closed(view.path, packs, Enum.uniq(Map.values(refs))),
-               {:ok, descriptors} <- upload_packs(repo_id, packs),
+               {:ok, descriptors} <- upload_packs(repo_id, packs, index.storage_generation),
                {:ok, compacted} <- WAL.compact(repo_id, descriptors, refs, index.base.symrefs, index, etag) do
             Replica.record_local_push(repo_id, compacted.epoch, compacted.seq)
             Cluster.announce(repo_id, compacted.epoch, compacted.seq)
@@ -166,10 +166,10 @@ defmodule Code.Replica.Compactor do
     if view.epoch == index.epoch and view.seq == index.seq, do: :ok, else: {:error, :stale_replica}
   end
 
-  defp upload_packs(repo_id, packs) do
+  defp upload_packs(repo_id, packs, generation) do
     packs
     |> Enum.reduce_while({:ok, []}, fn pack, {:ok, acc} ->
-      case WAL.put_pack(repo_id, pack) do
+      case WAL.put_pack(repo_id, pack, storage_generation: generation) do
         {:ok, descriptor} -> {:cont, {:ok, [descriptor | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
