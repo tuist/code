@@ -58,6 +58,7 @@ defmodule Code.PromExTest do
     code_push_committed_duration
     code_push_local_apply_failed_count
     code_push_rejected_count
+    code_recovery_job_count
     code_recovery_operation_count
     code_recovery_operation_duration
     code_recovery_restored_bytes
@@ -131,6 +132,7 @@ defmodule Code.PromExTest do
         kind: :compact,
         mode: :force,
         repo_id: "acme/app",
+        state: "queued",
         source: :cache_fresh
       }
 

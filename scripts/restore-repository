@@ -7,7 +7,11 @@ usage() {
   cat <<'HELP'
 Usage:
   scripts/restore-repository points SOURCE
-  scripts/restore-repository restore SOURCE DESTINATION POINT
+  scripts/restore-repository restore SOURCE DESTINATION POINT [JOB_ID]
+  scripts/restore-repository job JOB_ID
+  scripts/restore-repository wait JOB_ID
+  scripts/restore-repository retry JOB_ID
+  scripts/restore-repository cancel JOB_ID
   scripts/restore-repository status DESTINATION
   scripts/restore-repository discard DESTINATION
 
@@ -15,7 +19,8 @@ Set CODE_ADMIN_URL to the private admin listener and CODE_ADMIN_TOKEN to its
 bearer token. Requires curl and python3. Commands print the server response.
 
 POINT is an exact id returned by the points command. Restore creates a new
-repository, checks its stored Git objects, and refuses an existing destination.
+job and refuses an existing destination. Supply a 32-character lowercase hex
+JOB_ID to make submission retries idempotent. Use wait to await verification.
 Discard removes an unfinished recovery reservation; it refuses a live repository.
 HELP
 }
@@ -27,8 +32,8 @@ fi
 
 case ${1:-} in
   points) [[ $# == 2 ]] || { usage >&2; exit 2; } ;;
-  status|discard) [[ $# == 2 ]] || { usage >&2; exit 2; } ;;
-  restore) [[ $# == 4 ]] || { usage >&2; exit 2; } ;;
+  status|discard|job|wait|retry|cancel) [[ $# == 2 ]] || { usage >&2; exit 2; } ;;
+  restore) [[ $# == 4 || $# == 5 ]] || { usage >&2; exit 2; } ;;
   *) usage >&2; exit 2 ;;
 esac
 
@@ -44,6 +49,39 @@ for value in sys.argv[1:]:
         sys.exit('Invalid repository identifier')
 VALIDATE
 
+if [[ $1 == job || $1 == wait || $1 == retry || $1 == cancel ]]; then
+  [[ $2 =~ ^[0-9a-f]{32}$ ]] || { echo 'Invalid job identifier' >&2; exit 2; }
+  endpoint="${CODE_ADMIN_URL%/}/recovery-jobs/$2"
+  if [[ $1 == wait ]]; then
+    limit=${CODE_RECOVERY_WAIT_TIMEOUT_SECONDS:-86400}
+    [[ $limit =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid wait timeout' >&2; exit 2; }
+    started=$SECONDS
+    while :; do
+      response=$(curl --silent --show-error --fail-with-body --max-time 60 \
+        --header "Authorization: Bearer ${CODE_ADMIN_TOKEN}" "$endpoint")
+      state=$(printf '%s' "$response" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')
+      case $state in
+        succeeded) printf '%s\n' "$response"; exit 0 ;;
+        failed|cancelled) printf '%s\n' "$response"; exit 1 ;;
+        queued|running|cancelling) ;;
+        *) echo "Unexpected recovery job state: $state" >&2; exit 1 ;;
+      esac
+      if (( SECONDS - started >= limit )); then
+        printf '%s\n' "$response"
+        exit 124
+      fi
+      sleep 1
+    done
+  elif [[ $1 == job ]]; then
+    curl --silent --show-error --fail-with-body --header "Authorization: Bearer ${CODE_ADMIN_TOKEN}" "$endpoint"
+  else
+    curl --silent --show-error --fail-with-body --request POST \
+      --header "Authorization: Bearer ${CODE_ADMIN_TOKEN}" "$endpoint/$1"
+  fi
+  printf '\n'
+  exit 0
+fi
+
 if [[ $1 == points ]]; then
   curl --silent --show-error --fail-with-body \
     --header "Authorization: Bearer ${CODE_ADMIN_TOKEN}" \
@@ -57,9 +95,12 @@ elif [[ $1 == discard ]]; then
     --header "Authorization: Bearer ${CODE_ADMIN_TOKEN}" \
     "${CODE_ADMIN_URL%/}/restore/$2"
 else
-  payload=$(python3 - "$3" "$4" <<'PAYLOAD'
+  payload=$(python3 - "$3" "$4" "${5:-}" <<'PAYLOAD'
 import json, sys
-print(json.dumps({'repository': sys.argv[1], 'point': sys.argv[2]}))
+payload = {'repository': sys.argv[1], 'point': sys.argv[2]}
+if sys.argv[3]:
+    payload['id'] = sys.argv[3]
+print(json.dumps(payload))
 PAYLOAD
 )
   curl --silent --show-error --fail-with-body --request POST \

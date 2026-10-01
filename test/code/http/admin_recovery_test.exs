@@ -43,9 +43,12 @@ defmodule Code.HTTP.AdminRecoveryTest do
     target = repo(context, "copy")
     payload = %{repository: target, point: point}
     response = request(:post, "/restore/#{context.repo}", payload)
-    assert response.status == 201
+    assert response.status == 202
+    assert %{"id" => id, "state" => "queued"} = JSON.decode!(response.resp_body)
+    assert {:ok, job} = Code.Recovery.Jobs.claim(id)
+    assert {:ok, _} = Code.Recovery.Jobs.run(job)
 
-    assert %{"repository" => ^target, "head" => "refs/heads/trunk", "refs" => %{}} =
+    assert %{"repository" => ^target, "state" => "queued"} =
              JSON.decode!(response.resp_body)
 
     assert {:ok, _, _} = WAL.fetch(target)
@@ -121,6 +124,24 @@ defmodule Code.HTTP.AdminRecoveryTest do
     response = request(:delete, "/repositories/#{repo}")
     assert response.status == 409
     assert %{"error" => "repository_changed_concurrently"} = JSON.decode!(response.resp_body)
+  end
+
+  test "job control routes require admin authentication and persist cancellation", context do
+    {:ok, _} = WAL.create(context.repo)
+    {:ok, %{points: [point]}} = Code.Recovery.points(context.repo)
+    target = repo(context, "job-control")
+    id = String.duplicate("b", 32)
+    response = request(:post, "/restore/#{context.repo}", %{repository: target, point: point.id, id: id})
+    assert response.status == 202
+
+    for {method, suffix} <- [{:get, ""}, {:post, "/cancel"}, {:post, "/retry"}] do
+      assert request(method, "/recovery-jobs/#{id}#{suffix}", %{}, "invalid").status == 401
+    end
+
+    assert request(:get, "/recovery-jobs/#{id}").status == 200
+    assert request(:post, "/recovery-jobs/#{id}/cancel").status == 200
+    assert %{"state" => "cancelled"} = JSON.decode!(request(:get, "/recovery-jobs/#{id}").resp_body)
+    assert request(:post, "/recovery-jobs/#{id}/retry").status == 202
   end
 
   defp request(method, path, payload \\ %{}, token \\ "admin-secret") do

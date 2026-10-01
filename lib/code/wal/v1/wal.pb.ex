@@ -178,4 +178,6 @@ defmodule Code.Wal.V1.Index do
   field(:history_retention_days, 14, type: :int64, json_name: "historyRetentionDays")
   field(:recovering, 15, type: :bool)
   field(:storage_generation, 16, type: :string, json_name: "storageGeneration")
+  field(:recovery_job_id, 17, type: :string, json_name: "recoveryJobId")
+  field(:recovery_token, 18, type: :string, json_name: "recoveryToken")
 end

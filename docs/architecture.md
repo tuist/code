@@ -554,3 +554,27 @@ that exact index version. Both are necessary: an index fence alone would still
 let a delayed cleanup remove identical packs reused by a later restore.
 Repository listing reads only indexes with a deletion or recovery marker to
 hide unavailable repositories; a stale deletion marker cannot hide a new incarnation.
+
+### Durable recovery jobs
+
+Admin restore submissions persist the exact selected index and a destination
+reservation template under `recovery/active/<job-id>.pb` before returning. Nodes
+with the maintenance role claim queued jobs or expired running jobs through a
+conditional write. They renew a lease, persist verification/copy/publication
+stages and copied pack bytes, and run one local worker at a time. Status does
+not depend on the accepting node staying alive.
+
+The job ownership token is also written into the recovering destination index.
+A takeover or cancellation changes its object version, fencing a previous
+worker's publication. Stage checkpoints refuse changed job ownership. Leases
+are scheduling hints; the object-store conditions enforce publication safety.
+Cancellation persists its intent before fencing the destination, so another
+node can finish an interrupted cancellation. A publication that wins the race
+is reported as success rather than undone.
+
+Terminal attempts are copied into immutable `recovery/history/` records before
+conditionally removing their active record. A retry creates a new active
+attempt; a delayed archive cannot delete that replacement. Retries reverify
+both source and destination packs, and retry after discard selects a new storage
+generation. Local scratch remains disposable; neither progress nor ownership
+uses local disk as authority.

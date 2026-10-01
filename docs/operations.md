@@ -75,6 +75,7 @@ leaves those parts to the same rule.
 | `CODE_DEFAULT_REPLICAS` | `3` | Per-repository, overridable |
 | `CODE_STALENESS_BUDGET_MS` | `0` | See below |
 | `CODE_GIT_MAX_DECODED_REQUEST_BYTES` | `10485760` | Maximum decoded gzip fetch request size in bytes; positive integer |
+| `CODE_RECOVERY_PACK_TIMEOUT_MS` | `1800000` | Positive timeout per recovery pack download, in milliseconds |
 | `CODE_HISTORY_RETENTION_DAYS` | `forever` | Default recovery retention: `forever` or an integer from 1 to 36500 days. Reporting only; does not delete objects |
 | `CODE_COMPACTION_ENTRY_THRESHOLD` | `250` | |
 | `CODE_COMPACTION_BYTES_THRESHOLD` | `268435456` | |
@@ -751,7 +752,8 @@ index, refs, policy, or packs. Run the helper from this checkout:
 export CODE_ADMIN_URL=http://127.0.0.1:4002
 # Supply CODE_ADMIN_TOKEN through your normal secret-management mechanism.
 scripts/restore-repository points acme/app
-scripts/restore-repository restore acme/app acme/app-recovered <point-id>
+scripts/restore-repository restore acme/app acme/app-recovered <point-id> <job-id>
+scripts/restore-repository wait <job-id>
 ```
 
 The helper requires `curl` and `python3`. Its `points` command calls
@@ -769,7 +771,15 @@ The restore command calls `POST /restore/<source>` with:
 {"repository":"acme/app-recovered","point":"<point-id>"}
 ```
 
-The destination must be unused. Recovery first reserves its index using a
+Submission returns `202` with a durable job id and state `queued`. An optional
+`id` is a 32-character lowercase hexadecimal submission key: repeating the same
+source, destination and point with that key returns the existing job; different
+parameters return `409 recovery_idempotency_conflict`. Generate the key before
+submitting so a lost response can be retried safely. The selected index is stored
+in the job, so subsequent source pushes cannot change the requested point.
+
+The destination must be unused. A node with the `maintain` role claims the job
+and reserves its index using a
 create-only write, with `recovering: true` and a deletion timestamp. Git reads
 and writes cannot access the destination until recovery finishes, and ordinary
 creation and deletion refuse the reserved id. Ordinary repository listings hide
@@ -798,8 +808,12 @@ second fresh repository and repeats verification. This catches corrupt existing
 objects as well as failed transfers, without buffering packs in memory. Only
 after both checks does a conditional write publish the complete live index.
 
-Success returns `201` with the recovered reference map, `head`, source epoch and
-sequence, point id, pack count, and bytes. The destination has a fresh
+`GET /recovery-jobs/<job-id>` reports state, stage, attempt, owner node,
+timestamps, copied/total pack counts and bytes, and a bounded error code. The
+helper exposes this as `job`; `wait` polls until `succeeded`, `failed` or
+`cancelled`. Its default deadline is one day, configurable through
+`CODE_RECOVERY_WAIT_TIMEOUT_SECONDS`. A wait timeout does not cancel the job.
+Successful completion publishes the destination with a fresh
 incarnation, epoch 1, sequence 0, and no link to the source's recovery chain.
 It preserves the selected replica count and inherits the deployment's retention
 default. Account policy is not copied: access follows the destination account's
@@ -817,11 +831,47 @@ selected pack bytes plus one gibibyte of free disk space. Space can still change
 after that check; prefer a dedicated maintenance node with adequate disk for
 large recoveries. Verification permits two hours per full object check;
 `recovery_verification_timeout_ms` can override this in node configuration.
+Pack downloads default to thirty minutes per pack; set
+`CODE_RECOVERY_PACK_TIMEOUT_MS` to change this. A download timeout kills the
+download worker, releases scratch and admission, and records
+`recovery_pack_timeout` in the failed job.
 
 ### Failed or interrupted recovery
 
 A failure after reservation keeps the destination unavailable. The durable
-reservation survives node loss. To discard its copied objects and free the name:
+reservation and job survive node loss. The scheduler renews its ownership lease
+while working. A running job whose lease has been expired for five seconds can
+be claimed by another maintenance node, which repeats verification and uses a
+fresh ownership token. Wall-clock
+leases guide scheduling; conditional writes to both the job and destination
+fence stale workers from publishing or changing current progress. Only one
+recovery worker runs per node/data directory. Completed jobs move from the active
+queue into immutable history under `recovery/history/`; status stays available.
+This history has no automatic retention policy. A graceful worker shutdown
+releases its job to the queue without consuming an attempt; abrupt node loss
+uses the takeover budget. Immutable history also prevents a delayed retry from
+reusing an already completed attempt number.
+
+Use `scripts/restore-repository retry <job-id>` to retry a failed or cancelled
+job without changing the selected point. It resets progress and starts a new
+attempt. Verified existing copies may be reused but are checked again before
+publication. Retry after discard reserves a fresh incarnation and storage
+generation. Failed jobs do not retry automatically. Each submission or explicit
+retry permits
+three automatic attempts by default; exhausting that budget fences the worker
+and records `recovery_attempt_limit`. Node configuration can override
+`recovery_job_max_attempts` and `recovery_job_takeover_grace_ms`. The attempt
+limit is persisted with the job, so moving between nodes cannot reset it.
+Transient controller heartbeat failures retry with a bounded delay while the
+last confirmed lease remains valid; ownership loss stops the worker immediately.
+
+Use `scripts/restore-repository cancel <job-id>` to stop an unfinished job.
+Cancellation first persists `cancelling`, fences destination publication, then
+records `cancelled`. The worker stops when ownership is checked again; an
+in-flight transfer can continue briefly. If publication wins the race,
+cancellation returns `409 recovery_already_published` and reports success in
+job status. Cancellation keeps the destination unavailable. To discard its
+copied objects and free the name:
 
 ```sh
 scripts/restore-repository discard acme/app-recovered
@@ -840,23 +890,23 @@ Partial cleanup returns `503 recovery_cleanup_incomplete`. Ordinary
 An upload already in flight during cancellation can leave unreferenced objects;
 automatic orphan collection remains unimplemented.
 
-An existing destination produces `409 destination_exists`; invalid input
-produces `422`; missing sources or stale point ids produce `404`. Corrupt history
-or failed object verification returns a stable `500` error, with details in
-structured logs. Storage failures return `503`; a full object-check timeout returns
-`503 recovery_verification_timeout` rather than a corruption error. Pack download
-and installation still use the existing thirty-minute worker limit. Exceeding
-that limit terminates the request and leaves an unavailable reservation to
-inspect and discard; it does not currently return that stable timeout response.
-A cancelled or replaced reservation returns `409 recovery_changed_concurrently`. A source
-that was deleted or recreated before the final liveness check returns
-`409 recovery_source_changed`. A lost publication reply is
-checked against the destination's new incarnation and storage generation, so
-a push or compaction after publication does not turn success into an unknown
-outcome. If its outcome cannot be
-confirmed, the response is `503 recovery_publication_unknown`: inspect the
-destination before discarding or retrying. A lost reservation reply can also
-leave a reserved name; inspect and discard it before retrying.
+An existing destination produces `409 destination_exists` at submission; invalid
+input produces `422`; missing sources or stale point ids produce `404`. Invalid
+history rejects submission with a stable `500` error. Submission and control
+storage failures return `503`. Worker failures are reported through job status,
+including `recovery_verification_timeout` for a full object-check timeout and
+`recovery_pack_timeout` for a pack download timeout. Failed integrity checks use
+`recovery_failed`, with verification failures logged in the worker trace.
+
+A cancelled or replaced reservation cannot publish. A source that was deleted
+or recreated before the final liveness check fails the job with `source_changed`.
+A lost publication reply is checked against the destination's new incarnation
+and storage generation, so a push or compaction after publication does not turn
+success into an unknown outcome. If its outcome cannot be confirmed, the job
+reports `publication_unknown`: inspect the destination before discarding or
+retrying. An interrupted worker can recognize its own live destination after
+takeover and finish the job without overwriting subsequent pushes. Retry can
+also adopt its own unavailable reservation after a lost reservation reply.
 
 Production restores are disabled by default (`503 recovery_disabled`). Set
 `CODE_RECOVERY_ENABLED=true` only after every serving and maintenance node has
@@ -939,7 +989,10 @@ publication). Outer spans carry source and destination ids. Scratch reconstructi
 does not emit replica-sync counters or synchronized-replica logs. Restore and
 discard successes and all failures produce
 structured logs with source/destination identifiers, point ids where applicable,
-and bounded failure reasons, alongside the trace context. Reservation status is
-read on demand; a cluster-wide reservation gauge and asynchronous recovery jobs
-are not implemented. HTTP requests remain synchronous, so a proxy timeout does
-not establish whether publication completed. Inspect the destination before retrying.
+and bounded failure reasons, alongside the trace context. Job transitions emit `[:code, :recovery, :job]` with attempt and age measurements
+and bounded `state` metadata. `code_recovery_job_count` counts transitions by
+state. Worker spans use `code.recovery.job`; structured logs include job id,
+state, stage and attempt beside trace context. Repository names and job ids are
+never metric labels. A cluster-wide reservation gauge is not implemented.
+Submission and control requests are short operations; use the durable job id
+to establish the result after a proxy timeout.

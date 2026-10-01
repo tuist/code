@@ -66,6 +66,12 @@ defmodule Code.PromEx.Plugin do
         description: "Recovery operations by bounded operation and outcome.",
         tags: [:operation, :outcome]
       ),
+      counter(
+        [:code, :recovery, :job, :count],
+        event_name: [:code, :recovery, :job],
+        description: "Durable recovery job transitions by bounded state.",
+        tags: [:state]
+      ),
       sum(
         [:code, :recovery, :restored, :bytes],
         event_name: [:code, :recovery, :restored],

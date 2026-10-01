@@ -233,6 +233,8 @@ pub struct ElIndex {
     pub history_retention_days: i64,
     pub recovering: bool,
     pub storage_generation: String,
+    pub recovery_job_id: String,
+    pub recovery_token: String,
     pub __unknown_fields__: UnknownFields,
     pub __protobuf__: bool,
 }
@@ -411,6 +413,8 @@ impl From<ElIndex> for proto::Index {
             history_retention_days: i.history_retention_days,
             recovering: i.recovering,
             storage_generation: i.storage_generation,
+            recovery_job_id: i.recovery_job_id,
+            recovery_token: i.recovery_token,
         }
     }
 }
@@ -433,6 +437,8 @@ impl From<proto::Index> for ElIndex {
             history_retention_days: i.history_retention_days,
             recovering: i.recovering,
             storage_generation: i.storage_generation,
+            recovery_job_id: i.recovery_job_id,
+            recovery_token: i.recovery_token,
             __unknown_fields__: vec![],
             __protobuf__: true,
         }

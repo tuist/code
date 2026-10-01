@@ -32,6 +32,24 @@ defmodule Code.Config do
   @spec recovery_verification_timeout_ms() :: pos_integer()
   def recovery_verification_timeout_ms, do: get(:recovery_verification_timeout_ms, :timer.hours(2))
 
+  @spec recovery_pack_timeout_ms() :: pos_integer()
+  def recovery_pack_timeout_ms, do: get(:recovery_pack_timeout_ms, :timer.minutes(30))
+
+  @spec recovery_job_lease_ms() :: pos_integer()
+  def recovery_job_lease_ms, do: get(:recovery_job_lease_ms, 60_000)
+
+  @spec recovery_job_poll_ms() :: pos_integer()
+  def recovery_job_poll_ms, do: get(:recovery_job_poll_ms, 1_000)
+
+  @spec recovery_job_max_attempts() :: pos_integer()
+  def recovery_job_max_attempts, do: get(:recovery_job_max_attempts, 3)
+
+  @spec recovery_job_takeover_grace_ms() :: non_neg_integer()
+  def recovery_job_takeover_grace_ms, do: get(:recovery_job_takeover_grace_ms, 5_000)
+
+  @spec recovery_runner() :: GenServer.server()
+  def recovery_runner, do: get(:recovery_runner, Code.Recovery.Runner)
+
   @spec node_id() :: String.t()
   def node_id, do: get(:node_id, "code-1")
 

@@ -57,17 +57,25 @@ defmodule Code.Replica.Sync do
         "code.replica.to.seq" => index.seq
       },
       fn ->
-        do_run(repo_id, path, index, epoch, seq, Keyword.get(opts, :purpose, :replica))
+        do_run(repo_id, path, index, epoch, seq, opts)
       end
     )
   end
 
-  defp do_run(repo_id, path, index, epoch, seq, purpose) do
+  defp do_run(repo_id, path, index, epoch, seq, opts) do
+    purpose = Keyword.get(opts, :purpose, :replica)
     started = System.monotonic_time(:millisecond)
     required = Index.required_packs(index)
 
     with :ok <- ensure_repository(path, index),
-         {:ok, downloaded} <- install_packs(repo_id, path, required, purpose),
+         {:ok, downloaded} <-
+           install_packs(
+             repo_id,
+             path,
+             required,
+             purpose,
+             Keyword.get(opts, :pack_timeout, :timer.minutes(30))
+           ),
          :ok <- Git.reset_refs(path, Index.refs(index)),
          :ok <- apply_symrefs(path, index),
          :ok <- prune(repo_id, path, required) do
@@ -161,9 +169,9 @@ defmodule Code.Replica.Sync do
   # waste on a repository under active use. "Installed" means the pack and its
   # `.idx` are both in place: `Code.Git.install_pack/2` publishes the index
   # last, so a pack without one is an interrupted install and is fetched again.
-  defp install_packs(_repo_id, _path, [], _purpose), do: {:ok, 0}
+  defp install_packs(_repo_id, _path, [], _purpose, _timeout), do: {:ok, 0}
 
-  defp install_packs(repo_id, path, packs, purpose) do
+  defp install_packs(repo_id, path, packs, purpose, timeout) do
     present = path |> Git.installed_packs() |> MapSet.new(&Path.basename/1)
     missing = Enum.reject(packs, &MapSet.member?(present, Path.basename(&1.key)))
 
@@ -186,12 +194,14 @@ defmodule Code.Replica.Sync do
             Telemetry.with_context(context, fn -> fetch_and_install(repo_id, path, pack, scratch) end)
           end,
           max_concurrency: 4,
-          timeout: :timer.minutes(30),
+          timeout: timeout,
+          on_timeout: :kill_task,
           ordered: false
         )
         |> Enum.reduce_while({:ok, 0}, fn
           {:ok, :ok}, {:ok, count} -> {:cont, {:ok, count + 1}}
           {:ok, {:error, reason}}, _acc -> {:halt, {:error, reason}}
+          {:exit, :timeout}, _acc -> {:halt, {:error, :pack_download_timeout}}
           {:exit, reason}, _acc -> {:halt, {:error, {:pack_download_crashed, reason}}}
         end)
       after

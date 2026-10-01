@@ -44,7 +44,13 @@ git -C "$work/source" push -q --force "$source_url" \
   'replacement:refs/heads/main' ':refs/heads/side' ':refs/tags/v1'
 curl -fsS -X POST -H "Authorization: Bearer $E2E_ADMIN_TOKEN" \
   "$NODE1_ADMIN_URL/compact/$source_repo" >/dev/null
-"$helper" restore "$source_repo" "$target_repo" "$point" > "$work/restored.json"
+"$helper" restore "$source_repo" "$target_repo" "$point" > "$work/submitted.json"
+job_id=$(python3 - "$work/submitted.json" <<'JOB'
+import json, sys
+print(json.load(open(sys.argv[1]))['id'])
+JOB
+)
+"$helper" wait "$job_id" > "$work/restored.json"
 
 # A recovered repository must not depend on any of the source's durable objects.
 curl -fsS -X DELETE -H "Authorization: Bearer $E2E_ADMIN_TOKEN" \
