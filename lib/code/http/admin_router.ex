@@ -79,6 +79,7 @@ defmodule Code.HTTP.AdminRouter do
     case Control.create_repository(params["repository"] || "", replicas: replicas_param(params)) do
       {:ok, summary} -> send_json(conn, 201, summary)
       {:error, :already_exists} -> send_json(conn, 409, %{error: "already exists"})
+      {:error, :recovery_in_progress} -> send_json(conn, 409, %{error: "recovery_in_progress"})
       {:error, :invalid_replica_count} -> send_json(conn, 422, %{error: invalid_replicas_message()})
       {:error, reason} -> send_json(conn, 422, %{error: inspect(reason)})
     end
@@ -107,6 +108,15 @@ defmodule Code.HTTP.AdminRouter do
       {:error, {:invalid_repo_id, _}} ->
         send_json(conn, 404, %{error: "repository not found"})
 
+      {:error, :recovery_in_progress} ->
+        send_json(conn, 409, %{error: "recovery_in_progress"})
+
+      {:error, :raced} ->
+        send_json(conn, 409, %{error: "repository_changed_concurrently"})
+
+      {:error, :conditional_delete_unsupported} ->
+        send_json(conn, 503, %{error: "conditional_delete_unsupported"})
+
       # The tombstone is down, so the repository is gone for every reader and
       # writer; some objects are left, and repeating the request resumes.
       {:error, {:partial_cleanup, remaining}} ->
@@ -134,6 +144,26 @@ defmodule Code.HTTP.AdminRouter do
   # only unambiguous option when `acme/ios-app` and `acme/ios/app` are both
   # legal names.
   # ----------------------------------------------------------------------
+
+  get "/recovery-points/*repo" do
+    repo_id = Enum.join(conn.path_params["repo"], "/")
+    recovery_response(conn, Code.Recovery.points(repo_id), 200)
+  end
+
+  get "/restore/*repo" do
+    recovery_response(conn, Code.Recovery.status(Enum.join(repo, "/")), 200)
+  end
+
+  post "/restore/*repo" do
+    repo_id = Enum.join(conn.path_params["repo"], "/")
+    params = conn.body_params
+    recovery_response(conn, Code.Recovery.restore(repo_id, params["repository"], params["point"]), 201)
+  end
+
+  delete "/restore/*repo" do
+    repo_id = Enum.join(conn.path_params["repo"], "/")
+    recovery_response(conn, Code.Recovery.discard(repo_id), 200)
+  end
 
   put "/retention/*repo" do
     repo_id = Enum.join(conn.path_params["repo"], "/")
@@ -378,6 +408,37 @@ defmodule Code.HTTP.AdminRouter do
       send_json(conn, 404, %{error: "not found"})
     end
   end
+
+  defp recovery_response(conn, {:ok, payload}, status), do: send_json(conn, status, payload)
+
+  defp recovery_response(conn, {:error, reason}, _status) do
+    {status, error} = recovery_error(reason)
+    send_json(conn, status, %{error: error})
+  end
+
+  defp recovery_error(:invalid_repository), do: {422, "invalid_repository"}
+  defp recovery_error(:invalid_recovery_point), do: {422, "invalid_recovery_point"}
+  defp recovery_error(:not_found), do: {404, "repository_not_found"}
+  defp recovery_error(:recovery_point_not_found), do: {404, "recovery_point_not_found"}
+  defp recovery_error(:already_exists), do: {409, "destination_exists"}
+  defp recovery_error(:not_recovering), do: {409, "destination_not_recovering"}
+  defp recovery_error(:recovery_disabled), do: {503, "recovery_disabled"}
+  defp recovery_error(:conditional_delete_unsupported), do: {503, "recovery_conditional_delete_unsupported"}
+  defp recovery_error(:recovery_capacity_unavailable), do: {503, "recovery_capacity_unavailable"}
+  defp recovery_error(:recovery_busy), do: {503, "recovery_busy"}
+  defp recovery_error(:insufficient_recovery_space), do: {503, "insufficient_recovery_space"}
+  defp recovery_error(:recovery_verification_timeout), do: {503, "recovery_verification_timeout"}
+  defp recovery_error(:source_changed), do: {409, "recovery_source_changed"}
+  defp recovery_error({:partial_cleanup, _}), do: {503, "recovery_cleanup_incomplete"}
+  defp recovery_error(:raced), do: {409, "recovery_changed_concurrently"}
+  defp recovery_error(:history_too_large), do: {422, "recovery_history_limit_exceeded"}
+  defp recovery_error(:invalid_history), do: {500, "recovery_history_invalid"}
+  defp recovery_error({:invalid_history, _}), do: {500, "recovery_history_invalid"}
+  defp recovery_error(:missing_history_snapshot), do: {500, "recovery_history_incomplete"}
+  defp recovery_error({:verification_failed, _}), do: {500, "recovery_verification_failed"}
+  defp recovery_error(:pack_metadata_mismatch), do: {500, "recovery_verification_failed"}
+  defp recovery_error(:publication_unknown), do: {503, "recovery_publication_unknown"}
+  defp recovery_error(_), do: {503, "recovery_storage_unavailable"}
 
   defp send_json(conn, 204, _payload), do: send_resp(conn, 204, "")
 

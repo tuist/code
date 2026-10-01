@@ -2,7 +2,7 @@ defmodule Code.ObjectStore do
   @moduledoc """
   The contract Code needs from object storage.
 
-  Only three things matter beyond plain reads and writes, and all three exist
+  Four things matter beyond plain reads and writes, and all four exist
   in S3 and in every serious S3-compatible implementation:
 
     * **Conditional GET.** `get/2` takes the ETag we last saw. A `:not_modified`
@@ -11,9 +11,13 @@ defmodule Code.ObjectStore do
     * **Compare-and-swap.** `put/3` accepts `:if_match` and `:if_none_match`,
       which is how pushes are linearized without a consensus protocol. A
       rejected CAS is a `{:error, :precondition_failed}`, never a lost write.
+    * **Conditional deletion.** `delete_if_match/2` removes only the object
+      version the caller read. Recovery proves this behavior before reserving
+      a destination, so a backend that ignores the precondition fails closed.
     * **Immutability by convention.** Packfiles are content-addressed, so they
       are written once and never mutated. Only the WAL index is ever updated in
-      place, and only under CAS.
+      place among authoritative repository data, and only under CAS. Deletion
+      markers and isolated capability probes are auxiliary objects.
 
   Backends receive their own configuration as the last argument, so a node can
   in principle talk to more than one store.
@@ -38,6 +42,7 @@ defmodule Code.ObjectStore do
   @callback put(key(), iodata(), [put_opt()], config :: keyword()) ::
               {:ok, etag()} | {:error, :precondition_failed} | error()
   @callback delete(key(), config :: keyword()) :: :ok | error()
+  @callback delete_if_match(key(), etag(), config :: keyword()) :: :ok | error()
   @callback list(prefix :: String.t(), config :: keyword()) :: {:ok, [entry()]} | error()
   @callback list_bounded(String.t(), non_neg_integer(), keyword()) :: {:ok, [entry()]} | error()
   @callback stat(key(), config :: keyword()) ::
@@ -97,6 +102,16 @@ defmodule Code.ObjectStore do
 
   @spec delete(key()) :: :ok | error()
   def delete(key), do: dispatch(:delete, [key])
+
+  @doc "Delete only the exact object version read by the caller."
+  @spec delete_if_match(key(), etag()) :: :ok | error()
+  def delete_if_match(key, etag), do: dispatch(:delete_if_match, [key, etag])
+
+  @doc "Prove this backend enforces conditional deletes, rather than ignoring the header."
+  @spec verify_conditional_deletes() :: :ok | error()
+  def verify_conditional_deletes do
+    Code.ObjectStore.Capabilities.verify_conditional_deletes()
+  end
 
   @spec list(String.t()) :: {:ok, [entry()]} | error()
   def list(prefix), do: dispatch(:list, [prefix])

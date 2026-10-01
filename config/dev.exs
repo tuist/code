@@ -22,3 +22,5 @@ config :code, Code.PromEx,
   manual_metrics_start_delay: :no_delay,
   grafana: :disabled,
   metrics_server: :disabled
+
+config :code, recovery_enabled: true

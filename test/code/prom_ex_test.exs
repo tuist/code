@@ -58,6 +58,9 @@ defmodule Code.PromExTest do
     code_push_committed_duration
     code_push_local_apply_failed_count
     code_push_rejected_count
+    code_recovery_operation_count
+    code_recovery_operation_duration
+    code_recovery_restored_bytes
     code_replica_evict_count
     code_replica_evict_deferred_count
     code_replica_prune_deferred_packs
@@ -193,7 +196,7 @@ defmodule Code.PromExTest do
   defp prometheus_series?(name) do
     String.starts_with?(name, ~w(
       code_auth_ code_cluster_ code_git_ code_http_ code_maintenance_ code_mcp_
-      code_object_store_ code_push_ code_replica_ code_retention_ code_wal_ code_writer_
+      code_object_store_ code_push_ code_recovery_ code_replica_ code_retention_ code_wal_ code_writer_
     )) and not String.ends_with?(name, ["_event_metrics", "_polling_metrics"])
   end
 end

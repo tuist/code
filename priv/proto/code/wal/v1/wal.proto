@@ -165,4 +165,15 @@ message Index {
   // was superseded. This policy never expires currently reachable Git history.
   // Retention reporting is dry-run only; no objects are removed.
   int64 history_retention_days = 14;
+
+  // A recovery reserves its destination with a tombstoned index before copying
+  // packs. Ordinary deletion must not sweep those packs while they are being
+  // verified. Recovery publishes the complete live index with a conditional
+  // write, or an explicit discard clears this flag before deletion.
+  bool recovering = 15;
+
+  // Restored repositories keep immutable objects in a unique generation's
+  // subdirectory. Delayed cleanup of a previous incarnation cannot remove them.
+  // Empty retains the original flat object layout.
+  string storage_generation = 16;
 }

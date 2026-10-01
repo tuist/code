@@ -16,3 +16,5 @@ config :code,
   node_id: "test-1"
 
 config :code, Code.PromEx, disabled: true
+
+config :code, recovery_enabled: false

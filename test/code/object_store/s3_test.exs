@@ -51,6 +51,19 @@ defmodule Code.ObjectStore.S3Test do
     end)
   end
 
+  test "conditional deletion sends the version fence and preserves precondition failures" do
+    for status <- [204, 409, 412] do
+      expect(Req, :request, fn request ->
+        assert request.method == :delete
+        assert Req.Request.get_header(request, "if-match") == ["version"]
+        {:ok, %Req.Response{status: status, body: ""}}
+      end)
+
+      expected = if status == 204, do: :ok, else: {:error, :precondition_failed}
+      assert S3.delete_if_match("repos/acme/app/index.pb", "version", @config) == expected
+    end
+  end
+
   test "a paginated listing keeps every key, in order" do
     serve(%{
       nil => page([{"repos/a/index.pb", 1}, {"repos/b/index.pb", 2}], [], "t1"),

@@ -29,7 +29,7 @@ defmodule Code.Retention do
   @max_objects 10_000
   @max_eligible_objects 1_000
   @content_type "application/vnd.code.wal.v1+protobuf"
-  @owned ~r"^(wal/[0-9a-f]{64}\.pb|history/[0-9]+(-[0-9a-f]{64})?\.pb|packs/pack-[0-9a-f]{40,64}\.(pack|idx|rev|bitmap))$"
+  @owned ~r"^(wal/([0-9a-f]{32}/)?[0-9a-f]{64}\.pb|history/([0-9a-f]{32}/)?[0-9]+(-[0-9a-f]{64})?\.pb|packs/([0-9a-f]{32}/)?pack-[0-9a-f]{40,64}\.(pack|idx|rev|bitmap))$"
 
   @doc "Change a repository override: inherit, forever, or 1 to 36500 days."
   @spec configure(String.t(), term()) :: {:ok, map()} | {:error, term()}
@@ -211,7 +211,7 @@ defmodule Code.Retention do
   defp history(repo_id, successor, cutoff, acc) do
     key = successor.base.history_key
 
-    with true <- valid_history_key?(repo_id, key) or {:error, :invalid_history},
+    with true <- valid_history_key?(repo_id, successor.storage_generation, key) or {:error, :invalid_history},
          {:ok, body, _etag} <- history_body(key),
          {:ok, snapshot} <- decode_snapshot(body),
          :ok <- validate_snapshot(repo_id, key, body, snapshot, successor),
@@ -256,8 +256,8 @@ defmodule Code.Retention do
     end
   end
 
-  defp valid_history_key?(repo_id, key) do
-    relative = String.replace_prefix(key, "repos/#{repo_id}/history/", "")
+  defp valid_history_key?(repo_id, generation, key) do
+    relative = String.replace_prefix(key, WAL.object_prefix(repo_id, "history", generation), "")
     key != relative and Regex.match?(~r"^[0-9]+-[0-9a-f]{64}\.pb$", relative)
   end
 
@@ -265,8 +265,9 @@ defmodule Code.Retention do
     digest = :crypto.hash(:sha256, body) |> Base.encode16(case: :lower)
 
     if validate_index(repo_id, snapshot) == :ok and snapshot.incarnation == successor.incarnation and
+         snapshot.storage_generation == successor.storage_generation and
          snapshot.epoch < successor.epoch and successor.base.at_ms > 0 and
-         key == WAL.history_key(repo_id, snapshot.epoch, digest) do
+         key == WAL.snapshot_key(snapshot, digest) do
       :ok
     else
       {:error, :invalid_history}

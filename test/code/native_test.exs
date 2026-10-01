@@ -17,19 +17,19 @@ defmodule Code.NativeTest do
 
   describe "unknown wire fields" do
     test "survive a decode roundtrip via the NIF path" do
-      # Field tag 15 with varint wire type 0 and value 1 — a tag the current
+      # Field tag 100 with varint wire type 0 and value 1 — a tag the current
       # Index schema does not define, standing in for whatever a newer node
       # might write.
-      future_bytes = <<120, 1>>
+      future_bytes = <<160, 6, 1>>
 
       {:ok, decoded} = Index.decode(future_bytes)
 
-      assert decoded.__unknown_fields__ == [{15, 0, 1}],
+      assert decoded.__unknown_fields__ == [{100, 0, 1}],
              "forward-compat fields must survive NIF decode via Elixir fallback"
     end
 
     test "are written back verbatim on re-encode" do
-      future_bytes = <<120, 1>>
+      future_bytes = <<160, 6, 1>>
       {:ok, decoded} = Index.decode(future_bytes)
 
       assert Index.encode(decoded) == future_bytes,
@@ -70,6 +70,15 @@ defmodule Code.NativeTest do
       }
 
       assert Entry.encode(entry) == <<8, 42>>
+    end
+  end
+
+  test "recovery reservation and storage generation round-trip through both codecs" do
+    index = %{Index.new("acme/app") | recovering: true, storage_generation: String.duplicate("a", 32)}
+
+    for bytes <- [Index.encode(index), V1.Index.encode(index)] do
+      assert {:ok, ^index} = Index.decode(bytes)
+      assert V1.Index.decode(bytes) == index
     end
   end
 

@@ -172,6 +172,7 @@ stack::node_up() {
     CODE_HOOK_PORT="${hook_port}" \
     CODE_ADMIN_PORT="${admin_port}" \
     CODE_ADMIN_TOKEN="${E2E_ADMIN_TOKEN}" \
+    CODE_RECOVERY_ENABLED="true" \
     CODE_AUTH_BACKEND="static" \
     CODE_AUTH_TOKENS="${E2E_TOKEN}=acme:read,write,execute;${E2E_OUTSIDER_TOKEN}=outsider:read" \
     CODE_POLICY_STALENESS_BUDGET_MS="500" \

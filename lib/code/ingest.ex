@@ -67,7 +67,8 @@ defmodule Code.Ingest do
       },
       fn ->
         result =
-          with {:ok, packs} <- collect_packs(repo_id, quarantine),
+          with {:ok, index} <- basis_index(repo_id, 1),
+               {:ok, packs} <- collect_packs(repo_id, quarantine, index.storage_generation),
                :ok <- recheck_denial(principal, repo_id),
                {:ok, result} <- commit_pushed(repo_id, commands, packs, actor, quarantine, 1) do
             Replica.record_local_push(repo_id, result.epoch, result.seq)
@@ -140,14 +141,14 @@ defmodule Code.Ingest do
   # With `receive.unpackLimit = 1` they are always a packfile, so the artefact
   # on disk and the artefact in the log are the same bytes and no repacking or
   # re-encoding stands between the client's push and what gets stored.
-  defp collect_packs(_repo_id, nil), do: {:ok, []}
+  defp collect_packs(_repo_id, nil, _generation), do: {:ok, []}
 
-  defp collect_packs(repo_id, quarantine) do
+  defp collect_packs(repo_id, quarantine, generation) do
     quarantine
     |> Path.join("pack/*.pack")
     |> Path.wildcard()
     |> Enum.reduce_while({:ok, []}, fn pack, {:ok, acc} ->
-      case WAL.put_pack(repo_id, pack) do
+      case WAL.put_pack(repo_id, pack, storage_generation: generation) do
         {:ok, descriptor} -> {:cont, {:ok, [descriptor | acc]}}
         {:error, reason} -> {:halt, {:error, {:pack_upload_failed, reason}}}
       end
@@ -484,7 +485,7 @@ defmodule Code.Ingest do
 
       try do
         with {:ok, pack} <- Git.pack_objects(path, include, exclude, scratch) |> pack_failed(),
-             {:ok, packs} <- upload_new_pack(repo_id, path, pack) do
+             {:ok, packs} <- upload_new_pack(repo_id, path, pack, index.storage_generation) do
           {:ok, packs, exclude}
         end
       after
@@ -496,10 +497,10 @@ defmodule Code.Ingest do
   defp pack_failed({:error, reason}), do: {:error, {:pack_failed, reason}}
   defp pack_failed(ok), do: ok
 
-  defp upload_new_pack(_repo_id, _path, nil), do: {:ok, []}
+  defp upload_new_pack(_repo_id, _path, nil, _generation), do: {:ok, []}
 
-  defp upload_new_pack(repo_id, path, pack) do
-    with {:ok, descriptor} <- WAL.put_pack(repo_id, pack),
+  defp upload_new_pack(repo_id, path, pack, generation) do
+    with {:ok, descriptor} <- WAL.put_pack(repo_id, pack, storage_generation: generation),
          # Install it locally too, so this node holds the same artefact every
          # other replica will download rather than a pile of loose objects.
          {:ok, _installed} <- Git.install_pack(path, pack) do

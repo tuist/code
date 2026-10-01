@@ -35,6 +35,7 @@ defmodule Code.Application do
     # it once during serial application startup so concurrent first pushes can
     # never race to publish different values.
     Config.hook_token()
+    Code.Recovery.sweep_scratch()
     log_boot()
     check_ports()
 
@@ -44,6 +45,7 @@ defmodule Code.Application do
         object_store_children(),
         {Registry, keys: :unique, name: Code.ReplicaRegistry},
         {Registry, keys: :unique, name: Code.RetentionRegistry},
+        {Registry, keys: :unique, name: Code.RecoveryRegistry},
         # Work running against a local repository outside its replica process,
         # so eviction and pack pruning can wait for it. See Code.Replica.Lease.
         {Registry, keys: :duplicate, name: Code.LeaseRegistry},

@@ -178,6 +178,21 @@ defmodule Code.ObjectStoreTest do
     end
   end
 
+  test "the backend proves conditional delete semantics" do
+    assert :ok = ObjectStore.verify_conditional_deletes()
+    assert {:ok, []} = ObjectStore.list("probes/")
+  end
+
+  test "conditional deletion preserves replacement objects" do
+    {:ok, original} = ObjectStore.put("conditional", "first")
+    {:ok, replacement} = ObjectStore.put("conditional", "second")
+    assert {:error, :precondition_failed} = ObjectStore.delete_if_match("conditional", original)
+    assert {:ok, "second", ^replacement} = ObjectStore.get("conditional")
+    assert :ok = ObjectStore.delete_if_match("conditional", replacement)
+    assert {:error, :not_found} = ObjectStore.get("conditional")
+    assert :ok = ObjectStore.delete_if_match("conditional", replacement)
+  end
+
   test "delete/1 is idempotent" do
     ObjectStore.put("gone", "x")
     assert :ok = ObjectStore.delete("gone")

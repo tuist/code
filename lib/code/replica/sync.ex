@@ -46,7 +46,7 @@ defmodule Code.Replica.Sync do
   """
   @spec run(String.t(), Path.t(), Index.t(), non_neg_integer(), non_neg_integer()) ::
           {:ok, outcome()} | {:error, term()}
-  def run(repo_id, path, index, epoch, seq) do
+  def run(repo_id, path, index, epoch, seq, opts \\ []) do
     Telemetry.span(
       "code.replica.sync",
       %{
@@ -57,23 +57,23 @@ defmodule Code.Replica.Sync do
         "code.replica.to.seq" => index.seq
       },
       fn ->
-        do_run(repo_id, path, index, epoch, seq)
+        do_run(repo_id, path, index, epoch, seq, Keyword.get(opts, :purpose, :replica))
       end
     )
   end
 
-  defp do_run(repo_id, path, index, epoch, seq) do
+  defp do_run(repo_id, path, index, epoch, seq, purpose) do
     started = System.monotonic_time(:millisecond)
     required = Index.required_packs(index)
 
     with :ok <- ensure_repository(path, index),
-         {:ok, downloaded} <- install_packs(repo_id, path, required),
+         {:ok, downloaded} <- install_packs(repo_id, path, required, purpose),
          :ok <- Git.reset_refs(path, Index.refs(index)),
          :ok <- apply_symrefs(path, index),
          :ok <- prune(repo_id, path, required) do
       duration = System.monotonic_time(:millisecond) - started
 
-      if index.seq != seq or index.epoch != epoch do
+      if purpose == :replica and (index.seq != seq or index.epoch != epoch) do
         Logger.info(
           "synchronized replica",
           repo_id: repo_id,
@@ -84,11 +84,13 @@ defmodule Code.Replica.Sync do
         )
       end
 
-      :telemetry.execute(
-        [:code, :replica, :sync],
-        %{duration_ms: duration, packs_downloaded: downloaded, entries_behind: index.seq - seq},
-        %{repo_id: repo_id, epoch: index.epoch}
-      )
+      if purpose == :replica do
+        :telemetry.execute(
+          [:code, :replica, :sync],
+          %{duration_ms: duration, packs_downloaded: downloaded, entries_behind: index.seq - seq},
+          %{repo_id: repo_id, epoch: index.epoch}
+        )
+      end
 
       {:ok, %{epoch: index.epoch, seq: index.seq, downloaded: downloaded}}
     end
@@ -159,9 +161,9 @@ defmodule Code.Replica.Sync do
   # waste on a repository under active use. "Installed" means the pack and its
   # `.idx` are both in place: `Code.Git.install_pack/2` publishes the index
   # last, so a pack without one is an interrupted install and is fetched again.
-  defp install_packs(_repo_id, _path, []), do: {:ok, 0}
+  defp install_packs(_repo_id, _path, [], _purpose), do: {:ok, 0}
 
-  defp install_packs(repo_id, path, packs) do
+  defp install_packs(repo_id, path, packs, purpose) do
     present = path |> Git.installed_packs() |> MapSet.new(&Path.basename/1)
     missing = Enum.reject(packs, &MapSet.member?(present, Path.basename(&1.key)))
 
@@ -170,7 +172,7 @@ defmodule Code.Replica.Sync do
     else
       scratch =
         Path.join(
-          System.tmp_dir!(),
+          if(purpose == :recovery, do: Path.dirname(path), else: System.tmp_dir!()),
           "code-packs-" <> Base.url_encode64(:crypto.strong_rand_bytes(9), padding: false)
         )
 

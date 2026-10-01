@@ -42,10 +42,37 @@ defmodule Code.PromEx.Plugin do
       push_metrics(),
       maintenance_metrics(),
       retention_metrics(),
+      recovery_metrics(),
       git_metrics(),
       mcp_metrics(),
       auth_metrics()
     ]
+  end
+
+  defp recovery_metrics do
+    Event.build(:code_recovery_event_metrics, [
+      distribution(
+        [:code, :recovery, :operation, :duration],
+        event_name: [:code, :recovery, :operation],
+        measurement: :duration_us,
+        unit: {:microsecond, :second},
+        description: "Recovery point listing and restore duration.",
+        tags: [:operation, :outcome],
+        reporter_options: [buckets: [0.01, 0.1, 1, 10, 60, 300, 1800]]
+      ),
+      counter(
+        [:code, :recovery, :operation, :count],
+        event_name: [:code, :recovery, :operation],
+        description: "Recovery operations by bounded operation and outcome.",
+        tags: [:operation, :outcome]
+      ),
+      sum(
+        [:code, :recovery, :restored, :bytes],
+        event_name: [:code, :recovery, :restored],
+        measurement: :bytes,
+        description: "Verified pack bytes in successfully restored repositories."
+      )
+    ])
   end
 
   defp retention_metrics do

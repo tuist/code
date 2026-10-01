@@ -41,6 +41,19 @@ defmodule Code.ObjectStore.Filesystem do
   end
 
   @impl true
+  def delete_if_match(key, etag, config) do
+    Lock.transaction(fn ->
+      case check_conditions(path_for(key, config), if_match: etag) do
+        :ok ->
+          delete(key, config)
+
+        {:error, :precondition_failed} = error ->
+          if File.exists?(path_for(key, config)), do: error, else: :ok
+      end
+    end)
+  end
+
+  @impl true
   def delete(key, config) do
     case File.rm(path_for(key, config)) do
       :ok -> :ok

@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Operator helper for the authenticated admin listener. Credentials stay in the
+# environment rather than in this command's arguments or printed output.
+set -euo pipefail
+
+usage() {
+  cat <<'HELP'
+Usage:
+  scripts/restore-repository points SOURCE
+  scripts/restore-repository restore SOURCE DESTINATION POINT
+  scripts/restore-repository status DESTINATION
+  scripts/restore-repository discard DESTINATION
+
+Set CODE_ADMIN_URL to the private admin listener and CODE_ADMIN_TOKEN to its
+bearer token. Requires curl and python3. Commands print the server response.
+
+POINT is an exact id returned by the points command. Restore creates a new
+repository, checks its stored Git objects, and refuses an existing destination.
+Discard removes an unfinished recovery reservation; it refuses a live repository.
+HELP
+}
+
+if [[ ${1:-} == --help || ${1:-} == -h ]]; then
+  usage
+  exit 0
+fi
+
+case ${1:-} in
+  points) [[ $# == 2 ]] || { usage >&2; exit 2; } ;;
+  status|discard) [[ $# == 2 ]] || { usage >&2; exit 2; } ;;
+  restore) [[ $# == 4 ]] || { usage >&2; exit 2; } ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+: "${CODE_ADMIN_URL:?Set CODE_ADMIN_URL to the private admin listener}"
+: "${CODE_ADMIN_TOKEN:?Set CODE_ADMIN_TOKEN}"
+
+# Validate before constructing a route; repository ids must not introduce query
+# strings, fragments, or traversal into the request.
+python3 - "$2" "${3:-}" <<'VALIDATE'
+import re, sys
+for value in sys.argv[1:]:
+    if value and (len(value.encode()) > 512 or '..' in value or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._-]*(/[a-zA-Z0-9][a-zA-Z0-9._-]*)*', value)):
+        sys.exit('Invalid repository identifier')
+VALIDATE
+
+if [[ $1 == points ]]; then
+  curl --silent --show-error --fail-with-body \
+    --header "Authorization: Bearer ${CODE_ADMIN_TOKEN}" \
+    "${CODE_ADMIN_URL%/}/recovery-points/$2"
+elif [[ $1 == status ]]; then
+  curl --silent --show-error --fail-with-body \
+    --header "Authorization: Bearer ${CODE_ADMIN_TOKEN}" \
+    "${CODE_ADMIN_URL%/}/restore/$2"
+elif [[ $1 == discard ]]; then
+  curl --silent --show-error --fail-with-body --request DELETE \
+    --header "Authorization: Bearer ${CODE_ADMIN_TOKEN}" \
+    "${CODE_ADMIN_URL%/}/restore/$2"
+else
+  payload=$(python3 - "$3" "$4" <<'PAYLOAD'
+import json, sys
+print(json.dumps({'repository': sys.argv[1], 'point': sys.argv[2]}))
+PAYLOAD
+)
+  curl --silent --show-error --fail-with-body --request POST \
+    --header "Authorization: Bearer ${CODE_ADMIN_TOKEN}" \
+    --header 'Content-Type: application/json' --data-binary "$payload" \
+    "${CODE_ADMIN_URL%/}/restore/$2"
+fi
+printf '\n'

@@ -91,3 +91,7 @@ run = ["node scripts/generate-og-images.mjs", "zola serve"]
 [tasks."verify:tuist"]
 description = "Rehearse hosting Tuist's full Git history on the local two-node stack"
 run = ["./spec/support/stack.sh up", "bash scripts/verification/large-repository.sh"]
+
+[tasks."verify:recovery"]
+description = "Recover a historical repository on the local two-node stack"
+run = ["./spec/support/stack.sh up", "bash scripts/verification/recovery.sh"]
