@@ -230,7 +230,6 @@ defmodule Code.ObjectStore.Filesystem do
 
   defp do_put(key, body, opts, config) do
     path = path_for(key, config)
-    body = IO.iodata_to_binary(body)
     current = File.read(path)
 
     with :ok <- check_if_none_match(Keyword.get(opts, :if_none_match), current),
