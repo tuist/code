@@ -131,6 +131,50 @@ defmodule Code.Config do
   @spec policy_max_stale_ms() :: non_neg_integer()
   def policy_max_stale_ms, do: get(:policy_max_stale_ms, :timer.minutes(15))
 
+  @doc """
+  How long a cached policy may keep authorizing *the denial path* after the
+  last successful read.
+
+  Grants compose with token claims, so serving a stale grant through a
+  storage blip is a bounded availability choice. Denials are the opposite:
+  a stale denial is a security failure. The grant window
+  (`policy_max_stale_ms`) can be generous; this one defaults to zero,
+  meaning a denial becomes unavailable the moment the store cannot be
+  revalidated past `policy_staleness_budget_ms`.
+  """
+  @spec policy_denial_max_stale_ms() :: non_neg_integer()
+  def policy_denial_max_stale_ms, do: get(:policy_denial_max_stale_ms, 0)
+
+  @doc """
+  Deployment-wide trusted issuers.
+
+  Operator-controlled through `CODE_OIDC_ISSUER` (comma-separated for
+  multi-IdP deployments). Tenant policies may not register one of these as
+  their own, because the deployment issuer is a trust anchor for operator
+  identities and must not be shadowed by a tenant.
+  """
+  @spec deployment_issuers() :: [String.t()]
+  def deployment_issuers, do: get(:deployment_issuers, [])
+
+  @doc """
+  Maximum number of distinct tenant issuers the deployment will register.
+
+  A guard against unbounded growth of the deployment-level reverse index
+  and the per-issuer JWKS fan-out. Each registered issuer costs an ETS
+  table, a GenServer, a refresh task, and a waiter queue.
+  """
+  @spec max_tenant_issuers() :: pos_integer()
+  def max_tenant_issuers, do: get(:max_tenant_issuers, 128)
+
+  @doc """
+  Maximum concurrent JWKS fetches across all issuers.
+
+  A single tenant should never be able to starve another's key refresh.
+  The semaphore is held for the duration of one HTTP fetch per issuer.
+  """
+  @spec jwks_max_concurrent_fetches() :: pos_integer()
+  def jwks_max_concurrent_fetches, do: get(:jwks_max_concurrent_fetches, 8)
+
   @spec git_max_decoded_request_bytes() :: pos_integer()
   def git_max_decoded_request_bytes, do: get(:git_max_decoded_request_bytes, 10 * 1024 * 1024)
 

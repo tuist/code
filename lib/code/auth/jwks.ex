@@ -327,10 +327,24 @@ defmodule Code.Auth.JWKS do
     ArgumentError -> :miss
   end
 
-  # Keyed by the configuration it came from: a node pointed at a different
-  # issuer must not keep answering from the previous one's keys or document.
+  # Keyed by the configuration it came from and by the deployment policy
+  # version, so a node pointed at a different issuer, or one whose tenant
+  # policies have changed since the keys were cached, must not keep
+  # answering from the previous state. SHA-256 instead of phash2 because
+  # cross-issuer collisions on 32-bit hashes are a cache poisoning vector,
+  # not just a performance one.
   defp config_signature(config) do
-    :erlang.phash2(Keyword.take(config, [:issuer, :jwks_uri, :kubernetes, :discovery_endpoint]))
+    fields =
+      Keyword.take(config, [
+        :issuer,
+        :jwks_uri,
+        :kubernetes,
+        :discovery_endpoint,
+        :ca_cert_file,
+        :deployment_version
+      ])
+
+    :crypto.hash(:sha256, :erlang.term_to_binary(fields))
   end
 
   defp issuer_of(%{"issuer" => issuer}) when is_binary(issuer) and issuer != "", do: {:ok, issuer}
@@ -451,23 +465,152 @@ defmodule Code.Auth.JWKS do
 
   # Bounded: the owning process never waits on this, but a waiter does, and an
   # issuer that accepts a connection and never answers must not hold a
-  # request for longer than its own timeout.
+  # request for longer than its own timeout. Non-trusted endpoints must be
+  # HTTPS, must resolve to a public address unless the issuer explicitly
+  # opted into private networks, and have a hard body size cap so an issuer
+  # that returns an unbounded response cannot exhaust node memory.
+  @jwks_body_cap 1_048_576
+  @allowed_private? :local_network
+
   defp get(url, config, trusted?) do
-    if trusted? and URI.parse(url).scheme != "https" do
-      {:error, :insecure_kubernetes_endpoint}
-    else
-      timeout = fetch_timeout(config)
+    uri = URI.parse(url)
 
-      options =
-        [retry: false, receive_timeout: timeout]
-        |> put_transport(timeout, ca_cert_file(config, trusted?))
-        |> put_bearer(if(trusted?, do: token_file(config)))
-
-      Req.get(url, options)
+    with :ok <- check_url(uri, url, config, trusted?) do
+      do_get(url, config, trusted?)
     end
   rescue
     error -> {:error, {:request_failed, Exception.message(error)}}
   end
+
+  # HTTPS is required for every tenant endpoint except loopback. On loopback
+  # there is no network path and no MITM surface, so http is tolerated for
+  # test fixtures and local dev. RFC 1918 and link-local still require
+  # explicit opt-in via `local_network: true`.
+  defp check_url(uri, url, config, trusted?) do
+    if trusted? do
+      check_trusted_url(uri)
+    else
+      check_tenant_url(uri, url, config)
+    end
+  end
+
+  defp check_trusted_url(%URI{scheme: "https"}), do: :ok
+  defp check_trusted_url(_uri), do: {:error, :insecure_kubernetes_endpoint}
+
+  defp check_tenant_url(uri, url, config) do
+    cond do
+      uri.scheme != "https" and not loopback_host?(uri) ->
+        {:error, {:insecure_jwks_url, url}}
+
+      not public_host?(uri, config) and not loopback_host?(uri) ->
+        {:error, {:blocked_address, uri.host}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp loopback_host?(%URI{host: host}) when is_binary(host) do
+    down = String.downcase(host)
+
+    cond do
+      down == "localhost" -> true
+      down == "ip6-localhost" -> true
+      match?({:ok, {127, _, _, _}}, :inet.parse_address(String.to_charlist(host))) -> true
+      match?({:ok, {0, 0, 0, 0, 0, 0, 0, 1}}, :inet.parse_address(String.to_charlist(host))) -> true
+      true -> false
+    end
+  end
+
+  defp loopback_host?(_), do: false
+
+  defp do_get(url, config, trusted?) do
+    timeout = fetch_timeout(config)
+
+    # Redirects are refused, not followed. A tenant endpoint that returns
+    # a 302 at request time can otherwise redirect us to a metadata or
+    # internal address even when the configured URL resolved to a public
+    # one, which defeats the IP guard. The policy is: a tenant declares an
+    # endpoint, we visit that endpoint, we never chase elsewhere.
+    options =
+      [retry: false, receive_timeout: timeout, redirect: false]
+      |> put_transport(timeout, ca_cert_file(config, trusted?))
+      |> put_bearer(if(trusted?, do: token_file(config)))
+
+    case Req.get(url, options) do
+      {:ok, %{status: status}} when status in 300..399 ->
+        {:error, {:redirect_refused, status, url}}
+
+      {:ok, %{body: body}} when is_binary(body) and byte_size(body) > @jwks_body_cap ->
+        {:error, {:body_too_large, byte_size(body)}}
+
+      other ->
+        other
+    end
+  end
+
+  defp public_host?(%URI{host: host}, config) when is_binary(host) do
+    cond do
+      Keyword.get(config, @allowed_private?, false) == true -> true
+      private_hostname?(host) -> false
+      true -> all_addresses_public?(host)
+    end
+  end
+
+  defp public_host?(_uri, _config), do: false
+
+  defp private_hostname?(host) do
+    down = String.downcase(host)
+    down == "localhost" or down == "metadata.google.internal" or down == "169.254.169.254"
+  end
+
+  # Resolve the hostname and refuse the request if *any* resolved address
+  # is a private, loopback, or link-local one. Checking only literal IPs
+  # misses a public-looking hostname whose A record points at a metadata
+  # endpoint, which is a cheap SSRF primitive. A resolution error also
+  # fails closed: an endpoint we cannot resolve is not an endpoint we
+  # fetch from.
+  defp all_addresses_public?(host) do
+    charlist = String.to_charlist(host)
+
+    case resolve(charlist) do
+      {:ok, addresses} when addresses != [] -> Enum.all?(addresses, &(not private_address?(&1)))
+      _ -> false
+    end
+  end
+
+  defp resolve(host) do
+    # Try IPv4 and IPv6; silence lookup errors by returning an empty list for
+    # a family that is simply unavailable.
+    v4 = safe_getaddrs(host, :inet)
+    v6 = safe_getaddrs(host, :inet6)
+
+    case v4 ++ v6 do
+      [] -> {:error, :unresolved}
+      addresses -> {:ok, addresses}
+    end
+  end
+
+  defp safe_getaddrs(host, family) do
+    case :inet.getaddrs(host, family) do
+      {:ok, addresses} -> addresses
+      {:error, _} -> []
+    end
+  rescue
+    _ -> []
+  end
+
+  defp private_address?({127, _, _, _}), do: true
+  defp private_address?({10, _, _, _}), do: true
+  defp private_address?({172, b, _, _}) when b in 16..31, do: true
+  defp private_address?({192, 168, _, _}), do: true
+  defp private_address?({169, 254, _, _}), do: true
+  defp private_address?({0, _, _, _}), do: true
+  defp private_address?({a, _, _, _, _, _, _, _}) when a in 0..0, do: true
+  defp private_address?({a, _, _, _, _, _, _, _}) when a in 0xFE80..0xFEBF, do: true
+  defp private_address?({a, _, _, _, _, _, _, _}) when a in 0xFC00..0xFDFF, do: true
+  defp private_address?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
+  defp private_address?(_), do: false
 
   defp put_transport(options, timeout, nil), do: Keyword.put(options, :connect_options, timeout: timeout)
 
@@ -511,6 +654,8 @@ defmodule Code.Auth.JWKS do
 
   defp decode_map(_body), do: {:error, :invalid_discovery_document}
 
+  @max_keys_per_set 32
+
   defp parse_keys(body) when is_binary(body) do
     case JSON.decode(body) do
       {:ok, decoded} -> parse_keys(decoded)
@@ -519,13 +664,37 @@ defmodule Code.Auth.JWKS do
   end
 
   defp parse_keys(%{"keys" => keys}) when is_list(keys) do
-    case Enum.flat_map(keys, &to_jwk/1) do
-      [] -> {:error, :empty_jwks}
-      parsed -> {:ok, Map.new(parsed)}
+    if length(keys) > @max_keys_per_set do
+      {:error, {:too_many_keys, length(keys)}}
+    else
+      filter_and_validate(keys)
     end
   end
 
   defp parse_keys(_body), do: {:error, :invalid_jwks}
+
+  defp filter_and_validate(keys) do
+    parsed = Enum.flat_map(keys, &to_jwk/1)
+
+    cond do
+      parsed == [] ->
+        {:error, :empty_jwks}
+
+      duplicate_kids?(parsed) ->
+        # Two keys with the same `kid` make verification order-dependent
+        # on the parse order of the set, which is an ambiguous state we
+        # must refuse — not silently resolve to whichever came last.
+        {:error, :duplicate_kid}
+
+      true ->
+        {:ok, Map.new(parsed)}
+    end
+  end
+
+  defp duplicate_kids?(parsed) do
+    kids = Enum.map(parsed, &elem(&1, 0))
+    length(kids) != length(Enum.uniq(kids))
+  end
 
   # Only public signing keys of the kinds the verifier accepts. Anything else,
   # including a key JOSE cannot parse, is skipped rather than crashing the

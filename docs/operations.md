@@ -87,7 +87,10 @@ leaves those parts to the same rule.
 | `CODE_IDLE_EVICTION_MS` | `3600000` | Drop untouched repositories from disk |
 | `CODE_DATA_DIR` | `/var/lib/code/repositories` | Put this on fast local NVMe |
 | `CODE_POLICY_STALENESS_BUDGET_MS` | `5000` | How long a cached authorization policy, or a cached absence of one, is used before revalidating |
-| `CODE_POLICY_MAX_STALE_MS` | `900000` | How long a cached policy may keep authorizing while object storage cannot confirm it. See [Object storage is unreachable](#failure-modes) |
+| `CODE_POLICY_MAX_STALE_MS` | `900000` | How long a cached policy may keep **authorizing grants** while object storage cannot confirm it. See [Object storage is unreachable](#failure-modes) |
+| `CODE_POLICY_DENIAL_MAX_STALE_MS` | `0` | How long a cached policy may keep **honoring denials** while object storage cannot confirm it. Zero means revocation fails closed the moment the store cannot be revalidated past `CODE_POLICY_STALENESS_BUDGET_MS` |
+| `CODE_AUTH_MAX_ISSUERS` | `128` | Cap on the number of tenant OIDC issuers the deployment will accept via `Code.Policy.Deployment.register_issuer/2` |
+| `CODE_AUTH_JWKS_MAX_CONCURRENT_FETCHES` | `8` | Cap on concurrent JWKS refreshes across all issuers, so a single slow issuer cannot starve the others |
 | `CODE_ADMIN_IP` | all interfaces | Address the admin listener binds to, such as `127.0.0.1`. Leave unset in Kubernetes, where probes reach the pod IP |
 | `CODE_SHUTDOWN_TIMEOUT_MS` | `100000` | How long listeners wait for in-flight requests on shutdown. Keep it below the orchestrator's grace period. See [Graceful shutdown](#graceful-shutdown) |
 
@@ -141,7 +144,7 @@ See [kubernetes.md](kubernetes.md) for the full picture.
 | Variable | Notes |
 |---|---|
 | `CODE_AUTH_BACKEND` | `webhook` (default), `oidc`, `static`, `none`. `none` authorizes everything and is refused when `MIX_ENV=prod`, which includes the release image |
-| `CODE_OIDC_ISSUER` | Token issuer, used to discover the JWKS |
+| `CODE_OIDC_ISSUER` | Deployment issuer(s), comma-separated. Tokens from these produce a deployment-anchored principal; tenant issuers go in each account's policy instead and are routed via the deployment-level reverse index |
 | `CODE_OIDC_AUDIENCE` | **Set this.** Binds tokens to this deployment |
 | `CODE_OIDC_KUBERNETES` | `true` to discover the issuer and keys from the Kubernetes API server. Only then are the pod's service-account token and cluster CA attached, and only to the API server over HTTPS |
 | `CODE_AUTH_ENDPOINT` | For the webhook backend: where credentials are sent to be checked |

@@ -16,7 +16,8 @@ syntax = "proto3";
 //
 // It also fixes the one real weakness of putting grants in token claims:
 // revocation. A claim is true until the token expires, which may be an hour. A
-// binding removed here is gone on the next read.
+// binding removed here is gone on the next read, and a denial written here
+// refuses already-issued tokens on their next authentication.
 package code.policy.v1;
 
 // Grants one subject a set of permissions over a set of repositories.
@@ -46,6 +47,127 @@ message Binding {
   // When set, the binding stops applying after this instant. Useful for
   // granting an agent access for the duration of a task.
   int64 expires_at_ms = 6;
+
+  // When set, the binding only applies to principals whose verifying issuer
+  // equals this value. The policy identity for a principal is (iss, sub), so
+  // two issuers whose subject strings happen to collide can never be aliased
+  // by a binding that forgets to say which issuer it meant.
+  string required_issuer = 7;
+}
+
+// A trusted token issuer for this account.
+//
+// A tenant declares, via its own policy, which issuers are allowed to vouch
+// for its subjects. The deployment-level policy carries a reverse index from
+// `iss` to account, but that index is a cache; this entry is the authority,
+// and every authentication revalidates against it.
+message Issuer {
+  // The token's `iss` claim. Exact string match. The deployment issuer(s)
+  // configured through CODE_OIDC_ISSUER are reserved and may not appear here.
+  string issuer = 1;
+
+  // The resource identifier this issuer's tokens must name in `aud`. Required
+  // and non-empty; there is no silent fallback to the deployment audience,
+  // because tenant and deployment audiences are different trust boundaries.
+  string audience = 2;
+
+  // Optional override of the issuer's discovered `jwks_uri`. Must be HTTPS and
+  // not resolve to a loopback/private/link-local address unless the issuer is
+  // explicitly marked local_network.
+  string jwks_uri = 3;
+
+  // Optional override of the subject claim. Defaults to "sub". The resolved
+  // value is validated as a non-empty string regardless of which claim it
+  // came from.
+  string subject_claim = 4;
+
+  // Required prefix of the resolved subject value. A belt-and-braces defence
+  // against a shared issuer whose other tenants' subjects could collide.
+  string subject_prefix = 5;
+
+  // Optional clock-skew override, in seconds. Falls back to the deployment
+  // leeway when zero.
+  int64 leeway_seconds = 6;
+
+  // Explicit algorithm allowlist for tokens from this issuer. Empty inherits
+  // the deployment default. Only asymmetric signing algorithms are ever
+  // considered valid.
+  repeated string allowed_algorithms = 7;
+
+  // When true, `azp` must equal `audience`. Defaults to true for tenant
+  // issuers, protecting against replay across clients that share the issuer.
+  bool require_azp = 8;
+
+  // When true, the discovery and JWKS fetches may resolve to a loopback or
+  // RFC 1918 address. Off by default; opt in explicitly for air-gapped and
+  // development issuers.
+  bool local_network = 9;
+
+  int64 created_at_ms = 10;
+  int64 updated_at_ms = 11;
+}
+
+// Refuses a principal regardless of what grants would otherwise allow.
+//
+// A grant removed from `bindings` revokes permission on next read, but it
+// does not refuse a token that already carried its grants in claims. Denials
+// are the mechanism for that: a denial matched by a principal refuses the
+// request outright, before any grant source is consulted.
+message Denial {
+  enum Kind {
+    // Match by subject pattern. Revokes every session for the subject.
+    SUBJECT = 0;
+    // Match by exact `jti`. Revokes one token.
+    TOKEN = 1;
+    // Match by exact session id. Revokes one browser session.
+    SESSION = 2;
+  }
+
+  Kind kind = 1;
+
+  // Required when kind is TOKEN or SESSION, recommended when kind is SUBJECT.
+  // The issuer scopes `jti` and `sid`, which are only unique within one issuer.
+  // A SUBJECT denial without an issuer matches any verifying issuer for this
+  // account, which is the intended "revoke this subject regardless of IdP"
+  // shape.
+  string issuer = 2;
+
+  // Glob pattern. SUBJECT denials require this; wildcard-only `**` is refused
+  // at write time, and the pattern must be at least three characters.
+  string subject = 3;
+
+  // Exact `jti`. Required for TOKEN denials.
+  string jti = 4;
+
+  // Exact session id. Required for SESSION denials.
+  string sid = 5;
+
+  string note = 6;
+  int64 created_at_ms = 7;
+  // When set, the denial itself stops applying after this instant.
+  int64 expires_at_ms = 8;
+}
+
+// Kubernetes-style namespace grants.
+//
+// A pod's projected service account token names its namespace in `sub`
+// (`system:serviceaccount:<namespace>:<name>`). When the verifying issuer is
+// the cluster, that namespace is a stable identity and treating it as a grant
+// over `<namespace>/**` is both convenient and safe. Doing so blindly for
+// third-party issuers would alias every subject that happens to have the
+// Kubernetes shape, so this grant always carries the issuer it is tied to.
+message NamespaceGrant {
+  // When false, the account-level namespace grant is disabled regardless of
+  // what the deployment env fallback says.
+  bool enabled = 1;
+
+  // Permissions auto-granted on `<namespace>/**`. Defaults to ["read","write"]
+  // when enabled is true and this is empty.
+  repeated string permissions = 2;
+
+  // Required: the verifying issuer this grant is tied to. The grant only
+  // applies to principals whose issuer equals this value. Empty disables.
+  string required_issuer = 3;
 }
 
 // One account's policy. The only mutable object per account, and the only one
@@ -59,4 +181,13 @@ message Policy {
   int64 created_at_ms = 4;
   int64 updated_at_ms = 5;
   string updated_by = 6;
+
+  // Issuers this account trusts to vouch for its subjects.
+  repeated Issuer issuers = 7;
+
+  // Denials, honored at authentication and authorization time.
+  repeated Denial denials = 8;
+
+  // Kubernetes-style namespace grant for this account, scoped to one issuer.
+  NamespaceGrant namespace_grant = 9;
 }

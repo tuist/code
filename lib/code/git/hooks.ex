@@ -83,6 +83,10 @@ defmodule Code.Git.Hooks do
       --header "X-Code-Git-Dir: $(pwd)" \\
       --header "X-Code-Push: ${CODE_PUSH_ID:-}" \\
       --header "X-Code-Actor: ${CODE_ACTOR:-}" \\
+      --header "X-Code-Principal-Issuer: ${CODE_PRINCIPAL_ISSUER:-}" \\
+      --header "X-Code-Principal-Jti: ${CODE_PRINCIPAL_JTI:-}" \\
+      --header "X-Code-Principal-Sid: ${CODE_PRINCIPAL_SID:-}" \\
+      --header "X-Code-Principal-Trust-Anchor: ${CODE_PRINCIPAL_TRUST_ANCHOR:-}" \\
       --data-binary @- \\
       --write-out '\\n%{http_code}' \\
       "${CODE_HOOK_URL:-#{callback_url()}}" 2>&1) || {

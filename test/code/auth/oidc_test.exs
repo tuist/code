@@ -101,8 +101,14 @@ defmodule Code.Auth.OIDCTest do
 
   describe "issuer" do
     test "a token from an unexpected issuer is rejected", %{jwk: jwk, config: config} do
+      # Issuer resolution now happens before signature verification. A token
+      # whose `iss` is neither the configured deployment issuer nor a known
+      # tenant issuer is refused as :unknown_issuer rather than reaching the
+      # claim-check layer and reporting :issuer_mismatch there.
       token = sign(jwk, %{"iss" => "https://evil.example.com"})
-      assert {:error, {:issuer_mismatch, _}} = OIDC.authenticate({:bearer, token}, config)
+
+      assert {:error, {:unknown_issuer, "https://evil.example.com"}} =
+               OIDC.authenticate({:bearer, token}, config)
     end
   end
 
@@ -128,10 +134,13 @@ defmodule Code.Auth.OIDCTest do
 
     test "no configured issuer refuses every token", %{jwk: jwk, config: config} do
       # Accepting any issuer because none was configured leaves only the key
-      # source between an attacker and a session.
+      # source between an attacker and a session. Issuer resolution now
+      # happens before signature verification, so an unknown issuer is
+      # named explicitly rather than reaching the claim check.
       config = Keyword.delete(config, :issuer)
 
-      assert {:error, :no_issuer_configured} = OIDC.authenticate({:bearer, sign(jwk, %{})}, config)
+      assert {:error, {:unknown_issuer, "https://kubernetes.default.svc"}} =
+               OIDC.authenticate({:bearer, sign(jwk, %{})}, config)
     end
 
     test "no configured audience refuses every token", %{jwk: jwk, config: config} do

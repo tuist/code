@@ -141,7 +141,7 @@ defmodule Code.HTTP.GitRouter do
           {"CODE_HOOK_TOKEN", Code.Config.hook_token()},
           {"CODE_PUSH_ID", push_id()},
           {"CODE_ACTOR", actor_header(conn)}
-        ]
+        ] ++ principal_env(conn)
 
     GitBackend.run(
       conn,
@@ -217,6 +217,31 @@ defmodule Code.HTTP.GitRouter do
       principal -> principal.subject
     end
   end
+
+  # The pre-receive hook callback does a last-mile denial recheck. That
+  # requires enough of the principal to evaluate the denial table — subject
+  # (already in CODE_ACTOR), issuer, and when known the token's `jti` and
+  # `sid`. We never send the token itself.
+  defp principal_env(conn) do
+    case conn.assigns[:principal] do
+      nil ->
+        []
+
+      principal ->
+        claims = principal.claims || %{}
+
+        [
+          {"CODE_PRINCIPAL_ISSUER", principal.issuer || ""},
+          {"CODE_PRINCIPAL_JTI", to_string(Map.get(claims, "jti", ""))},
+          {"CODE_PRINCIPAL_SID", to_string(Map.get(claims, "sid", ""))},
+          {"CODE_PRINCIPAL_TRUST_ANCHOR", trust_anchor_header(principal.trust_anchor)}
+        ]
+    end
+  end
+
+  defp trust_anchor_header(nil), do: ""
+  defp trust_anchor_header(:deployment), do: "deployment"
+  defp trust_anchor_header({:tenant, account}), do: "tenant:#{account}"
 
   defp push_id, do: Base.url_encode64(:crypto.strong_rand_bytes(9), padding: false)
 end
