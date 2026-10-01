@@ -109,6 +109,26 @@ defmodule Code.ObjectStoreTest do
     refute "other/c" in keys
   end
 
+  test "listing remains a valid result while keys are concurrently deleted" do
+    keys = Enum.map(1..1_000, &"race/#{&1}.pb")
+    for key <- keys, do: ObjectStore.put(key, "x")
+    overrides = Code.Config.overrides()
+
+    deletion =
+      Task.async(fn ->
+        Code.Config.put_overrides(overrides)
+        for key <- keys, do: ObjectStore.delete(key)
+      end)
+
+    for _ <- 1..20 do
+      assert {:ok, entries} = ObjectStore.list("race/")
+      assert Enum.all?(entries, &(&1.size == 1))
+    end
+
+    Task.await(deletion, 10_000)
+    assert {:ok, []} = ObjectStore.list("race/")
+  end
+
   test "list_prefixes/1 returns one level, as a delimiter listing does" do
     ObjectStore.put("repos/acme/index.pb", "1")
     ObjectStore.put("repos/acme/app/index.pb", "2")

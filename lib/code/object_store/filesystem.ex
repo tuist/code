@@ -118,17 +118,33 @@ defmodule Code.ObjectStore.Filesystem do
   def list(prefix, config) do
     root = root(config)
 
-    entries =
+    result =
       root
       |> Path.join(prefix <> "**")
       |> Path.wildcard(match_dot: true)
-      |> Enum.filter(&File.regular?/1)
-      |> Enum.map(fn path ->
-        %{key: Path.relative_to(path, root), size: File.stat!(path).size}
+      |> Enum.reduce_while({:ok, []}, fn path, {:ok, entries} ->
+        case listed_file(path, root) do
+          {:ok, nil} -> {:cont, {:ok, entries}}
+          {:ok, entry} -> {:cont, {:ok, [entry | entries]}}
+          error -> {:halt, error}
+        end
       end)
-      |> Enum.sort_by(& &1.key)
 
-    {:ok, entries}
+    case result do
+      {:ok, entries} -> {:ok, Enum.sort_by(entries, & &1.key)}
+      error -> error
+    end
+  end
+
+  # A key can disappear between enumerating the directory and inspecting it.
+  # Inspect each path once and omit concurrent deletions rather than raising.
+  defp listed_file(path, root) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, size: size}} -> {:ok, %{key: Path.relative_to(path, root), size: size}}
+      {:ok, _} -> {:ok, nil}
+      {:error, :enoent} -> {:ok, nil}
+      error -> error
+    end
   end
 
   @impl true
