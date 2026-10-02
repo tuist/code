@@ -50,6 +50,27 @@ defmodule Code.Recovery do
     end)
   end
 
+  @doc false
+  def select(source, target, point) do
+    with :ok <- enabled(),
+         :ok <- valid_id(source),
+         :ok <- valid_id(target),
+         :ok <- valid_point(point),
+         :ok <- unused(target),
+         {:ok, current, id} <- current(source) do
+      find_point(source, current, id, point, @max_snapshots)
+    end
+  end
+
+  @doc false
+  def execute(source, target, point, selected, reservation, version, marker_version, opts) do
+    observe(source, target, :restore, point, fn ->
+      with_slot(fn ->
+        restore_selected(source, target, point, selected, reservation, version, marker_version, opts)
+      end)
+    end)
+  end
+
   defp reserve_and_restore(source, target, point, selected) do
     with :ok <- stage(:storage_capability, fn -> ObjectStore.verify_conditional_deletes() end),
          {:ok, reservation, version, marker_version} <- stage(:reserve, fn -> reserve(target, selected) end) do
@@ -302,7 +323,10 @@ defmodule Code.Recovery do
       Regex.match?(~r/\A[0-9a-f]{64}\z/, pack.digest) and pack.size > 0
   end
 
-  defp reserve(target, selected) do
+  defp reserve(target, selected), do: reserve_index(reservation(target, selected))
+
+  @doc false
+  def reservation(target, selected, job_id \\ "", token \\ "") do
     index =
       Index.new(target,
         node_id: Config.node_id(),
@@ -310,12 +334,18 @@ defmodule Code.Recovery do
         replicas: selected.replicas
       )
 
-    reservation = %{
+    %{
       Index.tombstone(index, Config.node_id())
       | recovering: true,
-        storage_generation: index.incarnation
+        storage_generation: index.incarnation,
+        recovery_job_id: job_id,
+        recovery_token: token
     }
+  end
 
+  @doc false
+  def reserve_index(reservation) do
+    target = reservation.repo_id
     body = Index.encode(reservation)
 
     with {:ok, marker_version} <- recovery_marker(target, body) do
@@ -347,21 +377,29 @@ defmodule Code.Recovery do
     end
   end
 
-  defp restore_selected(source, target, point, selected, reservation, version, marker_version) do
-    scratch = Path.join(Config.data_dir(), ".recovery-" <> Base.encode16(:crypto.strong_rand_bytes(12)))
+  defp restore_selected(source, target, point, selected, reservation, version, marker_version, opts \\ []) do
+    scratch =
+      Path.join(
+        Config.data_dir(),
+        ".recovery-" <>
+          Keyword.get_lazy(opts, :scratch_name, fn -> Base.encode16(:crypto.strong_rand_bytes(12)) end)
+      )
+
     source_path = Path.join(scratch, "source")
     target_path = Path.join(scratch, "target")
 
     try do
       with :ok <- File.mkdir_p(scratch),
-           :ok <- stage(:capacity, fn -> capacity(scratch, selected) end),
-           :ok <- stage(:verify_source, fn -> verify(source, source_path, selected) end),
+           :ok <- work_stage(opts, :capacity, fn -> capacity(scratch, selected) end),
+           :ok <- work_stage(opts, :verify_source, fn -> verify(source, source_path, selected) end),
            {:ok, packs} <-
-             stage(:copy, fn -> copy_packs(target, source_path, selected, reservation.storage_generation) end),
+             work_stage(opts, :copy, fn ->
+               copy_packs(target, source_path, selected, reservation.storage_generation, opts)
+             end),
            restored = recovered_index(reservation, selected, packs),
-           :ok <- stage(:verify_destination, fn -> verify(target, target_path, restored) end),
+           :ok <- work_stage(opts, :verify_destination, fn -> verify(target, target_path, restored) end),
            :ok <- source_present(source, selected),
-           :ok <- stage(:publish, fn -> publish(target, restored, version, marker_version) end) do
+           :ok <- work_stage(opts, :publish, fn -> publish(target, restored, version, marker_version) end) do
         {:ok,
          %{
            repository: target,
@@ -378,6 +416,14 @@ defmodule Code.Recovery do
     after
       File.rm_rf(scratch)
     end
+  end
+
+  defp work_stage(opts, stage, fun) do
+    with :ok <- checkpoint(opts, stage, %{}), do: stage(stage, fun)
+  end
+
+  defp checkpoint(opts, stage, measurements) do
+    Keyword.get(opts, :checkpoint, fn _, _ -> :ok end).(stage, measurements)
   end
 
   defp stage(stage, fun) do
@@ -402,7 +448,11 @@ defmodule Code.Recovery do
   defp verify(repo, path, index) do
     Telemetry.span("code.recovery.verify", %{"code.repository.id" => repo}, fn ->
       result =
-        with {:ok, _} <- Sync.run(repo, path, index, 0, 0, purpose: :recovery),
+        with {:ok, _} <-
+               Sync.run(repo, path, index, 0, 0,
+                 purpose: :recovery,
+                 pack_timeout: Config.recovery_pack_timeout_ms()
+               ),
              {:ok, _} <-
                Git.run(path, ["fsck", "--full", "--no-reflogs"],
                  timeout: Config.recovery_verification_timeout_ms()
@@ -412,6 +462,7 @@ defmodule Code.Recovery do
           :ok
         else
           false -> {:error, {:verification_failed, :recovered_refs_mismatch}}
+          {:error, :pack_download_timeout} -> {:error, :recovery_pack_timeout}
           {:error, {:git, :timeout, _}} -> {:error, :recovery_verification_timeout}
           {:error, reason} -> {:error, {:verification_failed, reason}}
         end
@@ -420,13 +471,21 @@ defmodule Code.Recovery do
     end)
   end
 
-  defp copy_packs(target, path, selected, generation) do
+  defp copy_packs(target, path, selected, generation, opts) do
     Enum.reduce_while(Index.required_packs(selected), {:ok, []}, fn pack, {:ok, acc} ->
       file = Path.join([path, "objects", "pack", Path.basename(pack.key)])
 
       case WAL.put_pack(target, file, storage_generation: generation) do
         {:ok, copied} when copied.digest == pack.digest and copied.size == pack.size ->
-          {:cont, {:ok, [copied | acc]}}
+          copied_packs = [copied | acc]
+
+          case checkpoint(opts, :copy, %{
+                 copied_packs: length(copied_packs),
+                 copied_bytes: Enum.sum(Enum.map(copied_packs, & &1.size))
+               }) do
+            :ok -> {:cont, {:ok, copied_packs}}
+            {:error, reason} -> {:halt, {:error, reason}}
+          end
 
         {:ok, _} ->
           {:halt, {:error, :pack_metadata_mismatch}}

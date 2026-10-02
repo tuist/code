@@ -6,6 +6,8 @@ defmodule Code.RecoveryTest do
   alias Code.Git
   alias Code.ObjectStore
   alias Code.Recovery
+  alias Code.Recovery.Jobs
+  alias Code.Recovery.Runner
   alias Code.Replica
   alias Code.WAL
   alias Code.WAL.Entry
@@ -869,6 +871,193 @@ defmodule Code.RecoveryTest do
     assert {:ok, ids} = WAL.list_repositories()
     refute context.repo in ids
     refute successor.incarnation == original.index.incarnation
+  end
+
+  test "slow pack downloads return a stable timeout and release scratch and admission", context do
+    seed(context)
+    {:ok, %{points: [point]}} = Recovery.points(context.repo)
+    Config.put_overrides(Map.put(Config.overrides(), :recovery_pack_timeout_ms, 20))
+
+    stub(ObjectStore, :get_file, fn key, file ->
+      Process.sleep(100)
+      Mimic.call_original(ObjectStore, :get_file, [key, file])
+    end)
+
+    assert {:error, :recovery_pack_timeout} = Recovery.restore(context.repo, repo(context, "slow"), point.id)
+    assert Registry.lookup(Code.RecoveryRegistry, context.data) == []
+    assert Path.wildcard(Path.join(context.data, ".recovery-*"), match_dot: true) == []
+    Config.put_overrides(Map.put(Config.overrides(), :recovery_pack_timeout_ms, 1_000))
+    assert {:ok, _} = Recovery.restore(context.repo, repo(context, "fast"), point.id)
+  end
+
+  test "failed asynchronous downloads retry the pinned point and report pack progress", context do
+    original = seed(context)
+    {:ok, %{points: [point]}} = Recovery.points(context.repo)
+    target = repo(context, "retry-download")
+    {:ok, %{id: id}} = Jobs.submit(context.repo, target, point.id)
+    [pack] = original.packs
+    :ok = ObjectStore.delete(pack.key)
+    {:ok, job} = Jobs.claim(id)
+    assert {:error, _} = Jobs.run(job)
+    assert {:ok, %{state: "failed"}} = Jobs.status(id)
+    assert {:error, :not_found} = WAL.fetch(target)
+    {:ok, _} = ObjectStore.put_file(pack.key, original.file)
+    assert {:ok, %{state: "queued", attempt: 2}} = Jobs.retry(id)
+    {:ok, next} = Jobs.claim(id)
+    assert {:ok, _} = Jobs.run(next)
+    assert {:ok, %{state: "succeeded", copied_packs: 1, copied_bytes: bytes}} = Jobs.status(id)
+    assert bytes == pack.size
+    assert {:ok, restored, _} = WAL.fetch(target)
+    assert restored.refs == original.refs
+  end
+
+  test "cancellation during a verified pack copy prevents publication", context do
+    seed(context)
+    {:ok, %{points: [point]}} = Recovery.points(context.repo)
+    target = repo(context, "cancel-copy")
+    {:ok, %{id: id}} = Jobs.submit(context.repo, target, point.id)
+
+    stub(ObjectStore, :put_file, fn key, file, opts ->
+      if String.starts_with?(key, "repos/#{target}/packs/") do
+        assert {:ok, %{state: "cancelled"}} = Jobs.cancel(id)
+      end
+
+      Mimic.call_original(ObjectStore, :put_file, [key, file, opts])
+    end)
+
+    {:ok, job} = Jobs.claim(id)
+    assert {:error, :job_lost} = Jobs.run(job)
+    assert {:ok, %{state: "cancelled"}} = Jobs.status(id)
+    assert {:error, :not_found} = WAL.fetch(target)
+    assert Path.wildcard(Path.join(context.data, ".recovery-*"), match_dot: true) == []
+  end
+
+  test "runner cancellation kills blocked downloads and removes only its scratch", context do
+    seed(context)
+    {:ok, %{points: [point]}} = Recovery.points(context.repo)
+    parent = self()
+
+    stub(ObjectStore, :get_file, fn _key, _file ->
+      send(parent, {:blocked_download, self()})
+
+      receive do
+        :release -> {:error, :unavailable}
+      end
+    end)
+
+    overrides =
+      Map.merge(Config.overrides(), %{roles: [:maintain], recovery_job_poll_ms: 10, recovery_job_lease_ms: 90})
+
+    runner = start_supervised!({Runner, name: nil, overrides: overrides})
+    Mimic.allow(ObjectStore, self(), runner)
+    Config.put_overrides(Map.put(Config.overrides(), :recovery_runner, runner))
+    {:ok, %{id: id}} = Jobs.submit(context.repo, repo(context, "runner-cancel"), point.id)
+    assert_receive {:blocked_download, downloader}, 2_000
+    unrelated = Path.join(context.data, ".recovery-unrelated")
+    File.mkdir_p!(unrelated)
+    monitor = Process.monitor(downloader)
+    assert {:ok, %{state: "cancelled"}} = Jobs.cancel(id)
+    assert_receive {:DOWN, ^monitor, :process, ^downloader, _}, 2_000
+
+    assert File.dir?(unrelated)
+    File.rm_rf!(unrelated)
+
+    for _ <- 1..100, Path.wildcard(Path.join(context.data, ".recovery-*"), match_dot: true) != [] do
+      Process.sleep(10)
+    end
+
+    assert Path.wildcard(Path.join(context.data, ".recovery-*"), match_dot: true) == []
+    assert Registry.lookup(Code.RecoveryRegistry, context.data) == []
+    assert {:ok, %{state: "cancelled"}} = Jobs.status(id)
+  end
+
+  test "a transient controller heartbeat failure preserves its working download", context do
+    seed(context)
+    {:ok, %{points: [point]}} = Recovery.points(context.repo)
+    parent = self()
+    once = :counters.new(1, [])
+
+    stub(ObjectStore, :get_file, fn key, file ->
+      if :counters.get(once, 1) == 0 do
+        :counters.add(once, 1, 1)
+        send(parent, {:working_download, self()})
+        receive do: (:release -> :ok)
+      end
+
+      Mimic.call_original(ObjectStore, :get_file, [key, file])
+    end)
+
+    stub(ObjectStore, :get, fn key ->
+      if Process.delete(:fail_next_heartbeat) do
+        send(parent, :heartbeat_failed)
+        {:error, :unavailable}
+      else
+        Mimic.call_original(ObjectStore, :get, [key])
+      end
+    end)
+
+    overrides =
+      Map.merge(Config.overrides(), %{
+        roles: [:maintain],
+        recovery_job_poll_ms: 10,
+        recovery_job_lease_ms: 1_000
+      })
+
+    runner = start_supervised!({Runner, name: nil, overrides: overrides})
+    Mimic.allow(ObjectStore, self(), runner)
+    Config.put_overrides(Map.put(Config.overrides(), :recovery_runner, runner))
+    {:ok, %{id: id}} = Jobs.submit(context.repo, repo(context, "heartbeat-retry"), point.id)
+    assert_receive {:working_download, downloader}, 2_000
+
+    :sys.replace_state(runner, fn state ->
+      Process.put(:fail_next_heartbeat, true)
+      %{state | active: %{state.active | heartbeat_at: System.monotonic_time(:millisecond) - 1}}
+    end)
+
+    send(runner, :poll)
+    assert_receive :heartbeat_failed, 1_000
+    Process.sleep(150)
+    assert Process.alive?(downloader)
+    assert %{active: %{heartbeat_failures: 0}} = :sys.get_state(runner)
+    send(downloader, :release)
+
+    for _ <- 1..200, not match?({:ok, %{state: "succeeded"}}, Jobs.status(id)) do
+      Process.sleep(10)
+    end
+
+    assert {:ok, %{state: "succeeded", attempt: 1}} = Jobs.status(id)
+  end
+
+  test "graceful runner shutdown releases its job and kills the blocked download", context do
+    seed(context)
+    {:ok, %{points: [point]}} = Recovery.points(context.repo)
+    parent = self()
+    once = :counters.new(1, [])
+
+    stub(ObjectStore, :get_file, fn key, file ->
+      if :counters.get(once, 1) == 0 do
+        :counters.add(once, 1, 1)
+        send(parent, {:shutdown_download, self()})
+        receive do: (:release -> :ok)
+      end
+
+      Mimic.call_original(ObjectStore, :get_file, [key, file])
+    end)
+
+    overrides = Map.merge(Config.overrides(), %{roles: [:maintain], recovery_job_poll_ms: 10})
+    runner = start_supervised!({Runner, name: nil, overrides: overrides})
+    Mimic.allow(ObjectStore, self(), runner)
+    Config.put_overrides(Map.put(Config.overrides(), :recovery_runner, runner))
+    {:ok, %{id: id}} = Jobs.submit(context.repo, repo(context, "graceful-shutdown"), point.id)
+    assert_receive {:shutdown_download, downloader}, 2_000
+    monitor = Process.monitor(downloader)
+    stop_supervised!(Runner)
+    assert_receive {:DOWN, ^monitor, :process, ^downloader, _}, 2_000
+    assert {:ok, %{state: "queued", attempt: 1}} = Jobs.status(id)
+    assert Path.wildcard(Path.join(context.data, ".recovery-*"), match_dot: true) == []
+    {:ok, job} = Jobs.claim(id)
+    assert job.attempt == 1
+    assert {:ok, _} = Jobs.run(job)
   end
 
   defp seed(context) do

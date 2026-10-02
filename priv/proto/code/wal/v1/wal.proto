@@ -176,4 +176,8 @@ message Index {
   // subdirectory. Delayed cleanup of a previous incarnation cannot remove them.
   // Empty retains the original flat object layout.
   string storage_generation = 16;
+
+  // Durable recovery job and attempt fence. Empty for synchronous restores.
+  string recovery_job_id = 17;
+  string recovery_token = 18;
 }

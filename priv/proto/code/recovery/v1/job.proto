@@ -1,0 +1,27 @@
+syntax = "proto3";
+package code.recovery.v1;
+
+// Object storage is authoritative; scratch repositories are disposable.
+message Job {
+  uint32 format_version = 1;
+  string id = 2;
+  string source = 3;
+  string target = 4;
+  string point = 5;
+  bytes selected_index = 6;
+  bytes reservation_index = 7;
+  // queued, running, cancelling, succeeded, failed, cancelled
+  string state = 8;
+  string stage = 9;
+  uint64 attempt = 10;
+  string owner = 11;
+  string token = 12;
+  int64 lease_until_ms = 13;
+  int64 created_at_ms = 14;
+  int64 updated_at_ms = 15;
+  uint64 copied_packs = 16;
+  uint64 copied_bytes = 17;
+  string error = 18;
+  // Absolute attempt number at which automatic takeover stops. Explicit retry resets it.
+  uint64 attempt_limit = 19;
+}

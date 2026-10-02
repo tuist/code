@@ -46,6 +46,7 @@ defmodule Code.Application do
         {Registry, keys: :unique, name: Code.ReplicaRegistry},
         {Registry, keys: :unique, name: Code.RetentionRegistry},
         {Registry, keys: :unique, name: Code.RecoveryRegistry},
+        {Code.Recovery.Runner, []},
         # Work running against a local repository outside its replica process,
         # so eviction and pack pruning can wait for it. See Code.Replica.Lease.
         {Registry, keys: :duplicate, name: Code.LeaseRegistry},

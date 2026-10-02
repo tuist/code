@@ -15,6 +15,7 @@ defmodule Code.HTTP.AdminRouter do
 
   alias Code.Cluster
   alias Code.Control
+  alias Code.Recovery.Jobs
   alias Code.Replica
 
   plug(:match)
@@ -157,12 +158,29 @@ defmodule Code.HTTP.AdminRouter do
   post "/restore/*repo" do
     repo_id = Enum.join(conn.path_params["repo"], "/")
     params = conn.body_params
-    recovery_response(conn, Code.Recovery.restore(repo_id, params["repository"], params["point"]), 201)
+
+    recovery_response(
+      conn,
+      Jobs.submit(repo_id, params["repository"], params["point"], params["id"]),
+      202
+    )
   end
 
   delete "/restore/*repo" do
     repo_id = Enum.join(conn.path_params["repo"], "/")
     recovery_response(conn, Code.Recovery.discard(repo_id), 200)
+  end
+
+  get "/recovery-jobs/:id" do
+    recovery_response(conn, Jobs.status(id), 200)
+  end
+
+  post "/recovery-jobs/:id/retry" do
+    recovery_response(conn, Jobs.retry(id), 202)
+  end
+
+  post "/recovery-jobs/:id/cancel" do
+    recovery_response(conn, Jobs.cancel(id), 200)
   end
 
   put "/retention/*repo" do
@@ -416,6 +434,13 @@ defmodule Code.HTTP.AdminRouter do
     send_json(conn, status, %{error: error})
   end
 
+  defp recovery_error(:invalid_job_id), do: {422, "invalid_recovery_job_id"}
+  defp recovery_error(:invalid_job), do: {500, "recovery_job_invalid"}
+  defp recovery_error(:idempotency_conflict), do: {409, "recovery_job_id_conflict"}
+  defp recovery_error(:job_not_retryable), do: {409, "recovery_job_not_retryable"}
+  defp recovery_error(:job_not_running), do: {409, "recovery_job_not_running"}
+  defp recovery_error(:already_published), do: {409, "recovery_already_published"}
+  defp recovery_error(:recovery_pack_timeout), do: {503, "recovery_pack_timeout"}
   defp recovery_error(:invalid_repository), do: {422, "invalid_repository"}
   defp recovery_error(:invalid_recovery_point), do: {422, "invalid_recovery_point"}
   defp recovery_error(:not_found), do: {404, "repository_not_found"}
@@ -430,7 +455,7 @@ defmodule Code.HTTP.AdminRouter do
   defp recovery_error(:recovery_verification_timeout), do: {503, "recovery_verification_timeout"}
   defp recovery_error(:source_changed), do: {409, "recovery_source_changed"}
   defp recovery_error({:partial_cleanup, _}), do: {503, "recovery_cleanup_incomplete"}
-  defp recovery_error(:raced), do: {409, "recovery_changed_concurrently"}
+  defp recovery_error(reason) when reason in [:raced, :job_lost], do: {409, "recovery_changed_concurrently"}
   defp recovery_error(:history_too_large), do: {422, "recovery_history_limit_exceeded"}
   defp recovery_error(:invalid_history), do: {500, "recovery_history_invalid"}
   defp recovery_error({:invalid_history, _}), do: {500, "recovery_history_invalid"}

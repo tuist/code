@@ -74,7 +74,13 @@ defmodule Code.NativeTest do
   end
 
   test "recovery reservation and storage generation round-trip through both codecs" do
-    index = %{Index.new("acme/app") | recovering: true, storage_generation: String.duplicate("a", 32)}
+    index = %{
+      Index.new("acme/app")
+      | recovering: true,
+        storage_generation: String.duplicate("a", 32),
+        recovery_job_id: String.duplicate("b", 32),
+        recovery_token: String.duplicate("c", 32)
+    }
 
     for bytes <- [Index.encode(index), V1.Index.encode(index)] do
       assert {:ok, ^index} = Index.decode(bytes)
