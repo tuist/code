@@ -76,7 +76,7 @@ defmodule Code.Replica.Sync do
              purpose,
              Keyword.get(opts, :pack_timeout, :timer.minutes(30))
            ),
-         :ok <- Git.reset_refs(path, Index.refs(index)),
+         :ok <- Git.reset_refs(path, Index.refs(index), native_replay: true),
          :ok <- apply_symrefs(path, index),
          :ok <- prune(repo_id, path, required) do
       duration = System.monotonic_time(:millisecond) - started
@@ -171,7 +171,7 @@ defmodule Code.Replica.Sync do
   # last, so a pack without one is an interrupted install and is fetched again.
   defp install_packs(_repo_id, _path, [], _purpose, _timeout), do: {:ok, 0}
 
-  defp install_packs(repo_id, path, packs, purpose, timeout) do
+  defp install_packs(repo_id, path, packs, _purpose, timeout) do
     present = path |> Git.installed_packs() |> MapSet.new(&Path.basename/1)
     missing = Enum.reject(packs, &MapSet.member?(present, Path.basename(&1.key)))
 
@@ -180,7 +180,7 @@ defmodule Code.Replica.Sync do
     else
       scratch =
         Path.join(
-          if(purpose == :recovery, do: Path.dirname(path), else: System.tmp_dir!()),
+          Path.dirname(path),
           "code-packs-" <> Base.url_encode64(:crypto.strong_rand_bytes(9), padding: false)
         )
 
@@ -212,7 +212,7 @@ defmodule Code.Replica.Sync do
 
   defp fetch_and_install(repo_id, path, pack, scratch) do
     with {:ok, file} <- WAL.get_pack(repo_id, pack, scratch),
-         {:ok, _installed} <- Git.install_pack(path, file) do
+         {:ok, _installed} <- Git.install_pack(path, file, consume: true) do
       :ok
     end
   end

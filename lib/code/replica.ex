@@ -41,8 +41,10 @@ defmodule Code.Replica do
   alias Code.Replica.Lease
   alias Code.Replica.Sync
   alias Code.WAL
+  alias Code.WAL.Cursor
   alias Code.WAL.Index
 
+  @cursor_key {__MODULE__, :confirmed_cursor}
   @registry Code.ReplicaRegistry
   @supervisor Code.ReplicaSupervisor
 
@@ -238,6 +240,15 @@ defmodule Code.Replica do
         catch
           :exit, _reason -> :error
         end
+    end
+  end
+
+  @doc false
+  @spec confirmed_cursor(String.t()) :: Cursor.t() | nil
+  def confirmed_cursor(repo_id) do
+    case whereis(repo_id) do
+      nil -> nil
+      pid -> Cursor.peek(pid, @cursor_key)
     end
   end
 
@@ -456,6 +467,51 @@ defmodule Code.Replica do
   end
 
   defp refresh(state) do
+    cursor = Code.Ingest.Writer.confirmed_cursor(state.repo_id)
+    etag = Cursor.etag(cursor)
+
+    if etag && etag != state.etag do
+      case Cursor.open(state.repo_id, cursor) do
+        {:ok, index, etag} ->
+          if state.index && index.incarnation == state.index.incarnation &&
+               {index.epoch, index.seq} > {state.index.epoch, state.index.seq},
+             do: refresh_from_write(state, index, etag),
+             else: refresh_cached(state)
+
+        :miss ->
+          refresh_cached(state)
+      end
+    else
+      refresh_cached(state)
+    end
+  end
+
+  defp refresh_from_write(state, index, etag) do
+    Code.Telemetry.span("code.replica.write_cursor", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+
+      {outcome, result} =
+        case WAL.read(state.repo_id, etag) do
+          {:ok, :not_modified} -> {:not_modified, sync(state, index, etag)}
+          {:ok, current, current_etag} -> {:modified, sync(state, current, current_etag)}
+          {:error, :not_found} -> {:error, {:error, :no_such_repository}}
+          {:error, _} = error -> {:error, error}
+        end
+
+      outcome = if match?({:error, _}, result), do: :error, else: outcome
+
+      :telemetry.execute(
+        [:code, :replica, :write_cursor],
+        %{count: 1, duration_us: System.monotonic_time(:microsecond) - started},
+        %{outcome: outcome}
+      )
+
+      Code.Telemetry.put_span_attributes(%{"code.replica.cursor_outcome" => Atom.to_string(outcome)})
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp refresh_cached(state) do
     case WAL.read(state.repo_id, state.etag) do
       {:ok, :not_modified} ->
         if materialized?(state.path) do
@@ -485,6 +541,8 @@ defmodule Code.Replica do
   defp sync(state, index, etag) do
     case Sync.run(state.repo_id, state.path, index, state.epoch, state.seq) do
       {:ok, %{epoch: epoch, seq: seq}} ->
+        Process.put(@cursor_key, Cursor.from_index(index, etag))
+
         {:ok,
          %{
            state

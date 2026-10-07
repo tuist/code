@@ -158,6 +158,95 @@ defmodule Code.WALTest do
     end
   end
 
+  describe "preparation generation" do
+    defp observe_preparation do
+      handler = {__MODULE__, :prepare, self()}
+
+      :telemetry.attach_many(
+        handler,
+        [[:code, :object_store, :request], [:code, :wal, :prepare]],
+        fn event, measurements, meta, pid ->
+          if self() == pid, do: send(pid, {:preparation, event, measurements, meta})
+        end,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+    end
+
+    test "the index basis supplies the generation without another read", %{repo: repo} do
+      Code.Config.put_overrides(Map.put(Code.Config.overrides(), :recovery_enabled, true))
+      {:ok, index} = WAL.create(repo)
+      basis = WAL.basis(index, [])
+      observe_preparation()
+      entry = Entry.new(type: :ENTRY_TYPE_SYMREF, symrefs: %{"HEAD" => "refs/heads/main"})
+
+      assert {:ok, prepared} = WAL.prepare(repo, entry, fn _ -> :ok end, basis: basis)
+
+      assert prepared.key ==
+               WAL.object_prefix(repo, "wal", index.storage_generation) <> prepared.digest <> ".pb"
+
+      refute_received {:preparation, [:code, :object_store, :request], _, %{operation: :get}}
+
+      assert_receive {:preparation, [:code, :wal, :prepare], %{bytes: bytes},
+                      %{generation_source: :basis, outcome: :ok}}
+
+      assert bytes > 0
+      assert {:ok, [{:ok, _}]} = WAL.append_batch(repo, [prepared])
+    end
+
+    test "older bases without a generation still read it from storage", %{repo: repo} do
+      Code.Config.put_overrides(Map.put(Code.Config.overrides(), :recovery_enabled, true))
+      {:ok, index} = WAL.create(repo)
+      basis = index |> WAL.basis([]) |> Map.delete(:storage_generation)
+      observe_preparation()
+      entry = Entry.new(type: :ENTRY_TYPE_SYMREF, symrefs: %{"HEAD" => "refs/heads/main"})
+
+      assert {:ok, prepared} = WAL.prepare(repo, entry, fn _ -> :ok end, basis: basis)
+
+      assert prepared.key ==
+               WAL.object_prefix(repo, "wal", index.storage_generation) <> prepared.digest <> ".pb"
+
+      assert_receive {:preparation, [:code, :object_store, :request], _, %{operation: :get}}
+      assert_receive {:preparation, [:code, :wal, :prepare], _, %{generation_source: :read, outcome: :ok}}
+    end
+
+    test "a basis cannot publish across deletion and name reuse", %{repo: repo} do
+      Code.Config.put_overrides(Map.put(Code.Config.overrides(), :recovery_enabled, true))
+      {:ok, original} = WAL.create(repo)
+      basis = WAL.basis(original, [])
+      assert :ok = WAL.destroy(repo)
+      {:ok, replacement} = WAL.create(repo)
+      refute original.incarnation == replacement.incarnation
+      entry = Entry.new(type: :ENTRY_TYPE_SYMREF, symrefs: %{"HEAD" => "refs/heads/old"})
+
+      assert {:ok, prepared} = WAL.prepare(repo, entry, fn _ -> :ok end, basis: basis)
+
+      assert prepared.key ==
+               WAL.object_prefix(repo, "wal", original.storage_generation) <> prepared.digest <> ".pb"
+
+      assert {:ok, [{:error, :repository_replaced}]} = WAL.append_batch(repo, [prepared])
+      assert {:ok, live, _} = WAL.fetch(repo)
+      assert live.seq == 0
+      assert live.incarnation == replacement.incarnation
+    end
+
+    test "fallback failures emit bounded outcomes", %{repo: repo} do
+      observe_preparation()
+      entry = Entry.new(type: :ENTRY_TYPE_SYMREF, symrefs: %{"HEAD" => "refs/heads/main"})
+
+      expect(ObjectStore, :get, fn key ->
+        assert key == WAL.index_key(repo)
+        {:error, :storage_unavailable}
+      end)
+
+      assert {:error, :storage_unavailable} = WAL.prepare(repo, entry, fn _ -> :ok end)
+
+      assert_receive {:preparation, [:code, :wal, :prepare], %{bytes: 0},
+                      %{generation_source: :read, outcome: :error}}
+    end
+  end
+
   describe "compact/6" do
     test "bumps the epoch and clears the replayed entries", %{repo: repo} do
       {:ok, _} = WAL.create(repo)

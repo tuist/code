@@ -404,7 +404,7 @@ defmodule Code.Ingest do
         # Held from packing until the ref is applied locally: the new pack is
         # installed here before any index names it, and a sync must not prune
         # it in that window.
-        Lease.hold(view.path, fn -> agent_write(repo_id, view, commands, opts) end)
+        Lease.hold(view.path, fn -> agent_write(repo_id, view, commands, opts, attempt) end)
       end
 
     case result do
@@ -416,8 +416,12 @@ defmodule Code.Ingest do
     end
   end
 
-  defp agent_write(repo_id, view, commands, opts) do
-    with {:ok, index, _etag} <- WAL.fetch(repo_id),
+  defp agent_write(repo_id, view, commands, opts, attempt) do
+    # ensure_fresh already read and materialized an authoritative index.
+    # Packing against that snapshot is safe even if the log advances: the
+    # writer rechecks the basis under CAS. As on the Git push path, only a
+    # compaction retry needs a new unconditional basis read.
+    with {:ok, index} <- basis_index(repo_id, attempt),
          {:ok, packs, exclude} <- pack_new_objects(repo_id, view.path, commands, index),
          {:ok, result} <-
            append(repo_id, commands, packs, Keyword.get(opts, :actor, %V1.Actor{}),

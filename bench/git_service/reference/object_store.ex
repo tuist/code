@@ -1,0 +1,200 @@
+defmodule AutoReference.ObjectStore do
+  @moduledoc """
+  The contract Code needs from object storage.
+
+  Four things matter beyond plain reads and writes, and all four exist
+  in S3 and in every serious S3-compatible implementation:
+
+    * **Conditional GET.** `get/2` takes the ETag we last saw. A `:not_modified`
+      reply is a metadata-only operation, which is what makes "verify every
+      read against the source of truth" affordable.
+    * **Compare-and-swap.** `put/3` accepts `:if_match` and `:if_none_match`,
+      which is how pushes are linearized without a consensus protocol. A
+      rejected CAS is a `{:error, :precondition_failed}`, never a lost write.
+    * **Conditional deletion.** `delete_if_match/2` removes only the object
+      version the caller read. Recovery proves this behavior before reserving
+      a destination, so a backend that ignores the precondition fails closed.
+    * **Immutability by convention.** Packfiles are content-addressed, so they
+      are written once and never mutated. Only the WAL index is ever updated in
+      place among authoritative repository data, and only under CAS. Deletion
+      markers and isolated capability probes are auxiliary objects.
+
+  Backends receive their own configuration as the last argument, so a node can
+  in principle talk to more than one store.
+  """
+
+  @type key :: String.t()
+  @type etag :: String.t()
+  @type error :: {:error, term()}
+  @type entry :: %{key: key(), size: non_neg_integer()}
+
+  @typedoc """
+  Conditions for a write.
+
+    * `{:if_none_match, "*"}` creates the object only if it does not exist.
+    * `{:if_match, etag}` replaces the object only if it still has that ETag.
+  """
+  @type put_opt :: {:if_match, etag()} | {:if_none_match, String.t()} | {:content_type, String.t()}
+
+  @type get_result :: {:ok, binary(), etag()} | {:ok, :not_modified} | {:error, :not_found} | error()
+
+  @callback get(key(), opts :: keyword(), config :: keyword()) :: get_result()
+  @callback put(key(), iodata(), [put_opt()], config :: keyword()) ::
+              {:ok, etag()} | {:error, :precondition_failed} | error()
+  @callback delete(key(), config :: keyword()) :: :ok | error()
+  @callback delete_if_match(key(), etag(), config :: keyword()) :: :ok | error()
+  @callback list(prefix :: String.t(), config :: keyword()) :: {:ok, [entry()]} | error()
+  @callback list_bounded(String.t(), non_neg_integer(), keyword()) :: {:ok, [entry()]} | error()
+  @callback stat(key(), config :: keyword()) ::
+              {:ok, %{etag: etag(), size: non_neg_integer()}} | {:error, :not_found} | error()
+
+  @typedoc """
+  One level of a listing: the objects directly under a prefix, and the
+  next-level prefixes below it, each ending in `/`.
+  """
+  @type level :: %{keys: [entry()], prefixes: [String.t()]}
+
+  @doc """
+  List one level below `prefix`, treating `/` as a directory separator.
+
+  This is S3's delimiter listing. Its cost is proportional to what sits
+  directly under the prefix, not to everything beneath it, which is what lets
+  a caller walk a hierarchy without scanning every object in the bucket.
+  """
+  @callback list_prefixes(prefix :: String.t(), config :: keyword()) :: {:ok, level()} | error()
+
+  @doc """
+  Confirm the store is reachable and the configured credentials can use it.
+
+  A bounded, constant-cost request, whatever the bucket holds. Readiness probes
+  call this on every node every few seconds, so its cost must never grow with
+  the number of repositories.
+  """
+  @callback probe(config :: keyword()) :: :ok | error()
+
+  @doc """
+  Upload a local file without reading it into memory.
+
+  Packfiles are the only objects whose size is set by the user rather than by
+  us, and a repository's pack is as large as its history. Holding one in a
+  binary means a node's memory ceiling is a customer's repository size, which
+  is not a ceiling anyone can plan around.
+  """
+  @callback put_file(key(), Path.t(), [put_opt()], config :: keyword()) ::
+              {:ok, etag()} | {:error, :precondition_failed} | error()
+
+  @doc "Download an object straight to a local file, without buffering it."
+  @callback get_file(key(), Path.t(), opts :: keyword(), config :: keyword()) ::
+              {:ok, non_neg_integer()} | {:error, :not_found} | error()
+
+  @doc """
+  Read an object.
+
+  Pass `etag: previous` to make the read conditional; the reply is
+  `{:ok, :not_modified}` when nothing has changed since that ETag.
+  """
+  @spec get(key(), keyword()) :: get_result()
+  def get(key, opts \\ []), do: dispatch(:get, [key, opts])
+
+  @doc "Write an object, optionally under a compare-and-swap precondition."
+  @spec put(key(), iodata(), [put_opt()]) :: {:ok, etag()} | {:error, :precondition_failed} | error()
+  def put(key, body, opts \\ []), do: dispatch(:put, [key, body, opts])
+
+  @spec delete(key()) :: :ok | error()
+  def delete(key), do: dispatch(:delete, [key])
+
+  @doc "Delete only the exact object version read by the caller."
+  @spec delete_if_match(key(), etag()) :: :ok | error()
+  def delete_if_match(key, etag), do: dispatch(:delete_if_match, [key, etag])
+
+  @doc "Prove this backend enforces conditional deletes, rather than ignoring the header."
+  @spec verify_conditional_deletes() :: :ok | error()
+  def verify_conditional_deletes do
+    Code.ObjectStore.Capabilities.verify_conditional_deletes()
+  end
+
+  @spec list(String.t()) :: {:ok, [entry()]} | error()
+  def list(prefix), do: dispatch(:list, [prefix])
+
+  @doc "List at most limit objects; refuse larger inventories without collecting further pages."
+  def list_bounded(prefix, limit), do: dispatch(:list_bounded, [prefix, limit])
+
+  @spec stat(key()) :: {:ok, %{etag: etag(), size: non_neg_integer()}} | {:error, :not_found} | error()
+  def stat(key), do: dispatch(:stat, [key])
+
+  @doc "List one level below `prefix`: its direct objects and its child prefixes."
+  @spec list_prefixes(String.t()) :: {:ok, level()} | error()
+  def list_prefixes(prefix), do: dispatch(:list_prefixes, [prefix])
+
+  @doc "A constant-cost reachability check against the store."
+  @spec probe() :: :ok | error()
+  def probe, do: dispatch(:probe, [])
+
+  @doc "Upload a local file without reading it into memory."
+  @spec put_file(key(), Path.t(), [put_opt()]) :: {:ok, etag()} | {:error, :precondition_failed} | error()
+  def put_file(key, path, opts \\ []), do: dispatch(:put_file, [key, path, opts])
+
+  @doc "Download an object straight to a local file, without buffering it."
+  @spec get_file(key(), Path.t(), keyword()) :: {:ok, non_neg_integer()} | {:error, :not_found} | error()
+  def get_file(key, path, opts \\ []), do: dispatch(:get_file, [key, path, opts])
+
+  @doc """
+  The SHA-256 of a local file, read in chunks.
+
+  Used to describe a pack in the log without ever holding it whole.
+  """
+  @spec digest_file(Path.t()) :: {:ok, String.t(), non_neg_integer()} | {:error, term()}
+  def digest_file(path) do
+    case File.stat(path) do
+      {:ok, %{size: size}} ->
+        digest =
+          path
+          |> File.stream!(256 * 1024)
+          |> Enum.reduce(:crypto.hash_init(:sha256), &:crypto.hash_update(&2, &1))
+          |> :crypto.hash_final()
+          |> Base.encode16(case: :lower)
+
+        {:ok, digest, size}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc "The backend module and configuration this node is running with."
+  @spec backend() :: {module(), keyword()}
+  def backend, do: Code.Config.object_store()
+
+  defp dispatch(fun, args) do
+    {mod, config} = backend()
+    started = System.monotonic_time(:microsecond)
+
+    result =
+      Code.Telemetry.span(
+        "code.object_store.#{fun}",
+        %{
+          "code.object_store.operation" => Atom.to_string(fun),
+          "code.object_store.backend" => inspect(mod)
+        },
+        fn ->
+          apply(mod, fun, args ++ [config])
+          |> Code.Telemetry.put_span_outcome()
+        end
+      )
+
+    :telemetry.execute(
+      [:code, :object_store, :request],
+      %{duration_us: System.monotonic_time(:microsecond) - started},
+      %{operation: fun, outcome: operation_outcome(result)}
+    )
+
+    result
+  end
+
+  defp operation_outcome(:ok), do: :ok
+  defp operation_outcome({:ok, _}), do: :ok
+  defp operation_outcome({:ok, _, _}), do: :ok
+  defp operation_outcome({:error, :not_found}), do: :not_found
+  defp operation_outcome({:error, :precondition_failed}), do: :precondition_failed
+  defp operation_outcome({:error, _}), do: :error
+end

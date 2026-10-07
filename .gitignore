@@ -24,6 +24,9 @@ erl_crash.dump
 # Benchee snapshots and HTML reports
 /bench/results/
 
+# Local optimization sessions, discarded prototypes and profiling output.
+/.auto/
+
 # Rustler-compiled NIF artefacts: the shared library is built from
 # native/code_native/ on `mix compile`.
 /native/code_native/target/

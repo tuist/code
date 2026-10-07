@@ -145,20 +145,26 @@ defmodule Code.ObjectStore do
   """
   @spec digest_file(Path.t()) :: {:ok, String.t(), non_neg_integer()} | {:error, term()}
   def digest_file(path) do
-    case File.stat(path) do
-      {:ok, %{size: size}} ->
-        digest =
-          path
-          |> File.stream!(256 * 1024)
-          |> Enum.reduce(:crypto.hash_init(:sha256), &:crypto.hash_update(&2, &1))
-          |> :crypto.hash_final()
-          |> Base.encode16(case: :lower)
+    started = System.monotonic_time(:microsecond)
 
-        {:ok, digest, size}
+    result =
+      Code.Telemetry.span("code.object_store.digest", %{}, fn ->
+        Code.Native.file_sha256(path) |> Code.Telemetry.put_span_outcome()
+      end)
 
-      {:error, reason} ->
-        {:error, reason}
-    end
+    bytes =
+      case result do
+        {:ok, _digest, size} -> size
+        {:error, _} -> 0
+      end
+
+    :telemetry.execute(
+      [:code, :object_store, :digest],
+      %{duration_us: System.monotonic_time(:microsecond) - started, bytes: bytes},
+      %{outcome: operation_outcome(result)}
+    )
+
+    result
   end
 
   @doc "The backend module and configuration this node is running with."

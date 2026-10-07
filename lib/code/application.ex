@@ -36,6 +36,7 @@ defmodule Code.Application do
     # never race to publish different values.
     Config.hook_token()
     Code.Recovery.sweep_scratch()
+    Code.Replica.Scratch.sweep()
     log_boot()
     check_ports()
 

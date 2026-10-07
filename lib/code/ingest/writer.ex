@@ -34,7 +34,11 @@ defmodule Code.Ingest.Writer do
   content-addressed, so they never contend and they happen wherever the push
   arrived. Only installing the pointers in the index is serialized here, and
   doing that for a batch costs the same one read and one write as doing it for
-  a single push.
+  a single push. After a confirmed CAS the writer may retain one encoded index
+  cursor capped at 256 KiB, not one index per prepared request. Subsequent
+  batches can avoid the read, but the conditional write remains authoritative;
+  stale cursors re-read and revalidate, and cached rejections always re-read.
+  This never advances replica freshness or claims peer packs are local.
 
   The batching is implicit rather than timed: the writer commits whatever has
   arrived, and requests that arrive during that round trip form the next batch.
@@ -64,10 +68,13 @@ defmodule Code.Ingest.Writer do
   require Logger
 
   alias Code.Cluster
+  alias Code.Replica
   alias Code.WAL
+  alias Code.WAL.Cursor
 
   @registry Code.WriterRegistry
   @supervisor Code.WriterSupervisor
+  @cursor_key {__MODULE__, :confirmed_cursor}
 
   # How many pushes may be waiting on one repository's writer.
   #
@@ -254,12 +261,26 @@ defmodule Code.Ingest.Writer do
     end
   end
 
+  @doc false
+  @spec confirmed_cursor(String.t()) :: Code.WAL.Cursor.t() | nil
+  def confirmed_cursor(repo_id) do
+    # No call to a writer blocked in S3, and no 256 KiB message queued on a
+    # replica blocked downloading a pack. Binaries share ref-counted storage.
+    case Registry.lookup(@registry, repo_id) do
+      [{pid, _}] ->
+        Cursor.peek(pid, @cursor_key)
+
+      [] ->
+        nil
+    end
+  end
+
   # ----------------------------------------------------------------------
 
   @impl true
   def init({repo_id, overrides, {counter, _limit}}) do
     if map_size(overrides) > 0, do: Code.Config.put_overrides(overrides)
-    {:ok, %{repo_id: repo_id, counter: counter, pending: [], queued: 0, last_batch_size: 0}}
+    {:ok, %{repo_id: repo_id, counter: counter, pending: [], queued: 0, last_batch_size: 0, cursor: nil}}
   end
 
   @impl true
@@ -284,14 +305,25 @@ defmodule Code.Ingest.Writer do
     # Blocking here is the point: everything that arrives during the round trip
     # queues in the mailbox and becomes the next batch, so batch size grows with
     # load and is zero when idle.
-    case WAL.append_batch(state.repo_id, prepared) do
-      {:ok, results} ->
-        Enum.zip(froms, results)
-        |> Enum.each(fn {from, result} -> GenServer.reply(from, wrap(result)) end)
+    cursor =
+      case WAL.append_batch_cursor(
+             state.repo_id,
+             prepared,
+             state.cursor || Replica.confirmed_cursor(state.repo_id)
+           ) do
+        {:ok, results, cursor} ->
+          Process.put(@cursor_key, cursor)
 
-      {:error, reason} ->
-        Enum.each(froms, &GenServer.reply(&1, {:error, reason}))
-    end
+          Enum.zip(froms, results)
+          |> Enum.each(fn {from, result} -> GenServer.reply(from, wrap(result)) end)
+
+          cursor
+
+        {:error, reason} ->
+          Process.put(@cursor_key, nil)
+          Enum.each(froms, &GenServer.reply(&1, {:error, reason}))
+          nil
+      end
 
     # Every request in the batch has been answered, so none of them counts
     # against admission any longer.
@@ -300,7 +332,7 @@ defmodule Code.Ingest.Writer do
     # No re-arming needed. Requests that arrived during the commit are still
     # sitting in the mailbox as calls, and the first one handled will find an
     # empty queue and schedule the next flush itself.
-    {:noreply, %{state | pending: [], queued: 0, last_batch_size: length(batch)}}
+    {:noreply, %{state | pending: [], queued: 0, last_batch_size: length(batch), cursor: cursor}}
   end
 
   def handle_info(_message, state), do: {:noreply, state}

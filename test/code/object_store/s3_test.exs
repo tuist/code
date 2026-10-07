@@ -245,6 +245,34 @@ defmodule Code.ObjectStore.S3Test do
       refute_received {:s3, _, _}
     end
 
+    @tag size: 5 * 1024 * 1024 + 1
+    test "completion XML ETags match opaque header tokens without double decoding", %{source: source} do
+      cases = [
+        {"&#34;final-2&#34;", ~s("final-2")},
+        {"&#x22;final-2&#x22;", ~s("final-2")},
+        {"&quot;final-2&quot;", ~s("final-2")},
+        {"&quot;a&amp;b&lt;c&gt;d&apos;e&quot;", ~s("a&b<c>d'e")},
+        {"&quot;&#x3bb;&#955;&quot;", ~s("λλ")},
+        {"&quot;literal&amp;#34;&quot;", ~s("literal&#34;")},
+        {"&quot;&#0;&#xD800;&#x110000;&unknown;&quot;", ~s("&#0;&#xD800;&#x110000;&unknown;")},
+        {"&quot;&#12345678901234567890;&quot;", ~s("&#12345678901234567890;")}
+      ]
+
+      for {xml_token, wanted} <- cases do
+        body = "<CompleteMultipartUploadResult><ETag>#{xml_token}</ETag></CompleteMultipartUploadResult>"
+        fake_s3(%{complete: status(200, body)})
+        assert {:ok, ^wanted} = S3.put_file("packs/p.pack", source, [], @multipart_config)
+
+        stub(Req, :request, fn request ->
+          assert request.method == :get
+          assert Req.Request.get_header(request, "if-none-match") == [wanted]
+          {:ok, %Req.Response{status: 304, body: ""}}
+        end)
+
+        assert {:ok, :not_modified} = S3.get("packs/p.pack", [etag: wanted], @config)
+      end
+    end
+
     @tag size: 10 * 1024 * 1024
     test "a size divisible by the part size has no empty trailing part", %{source: source} do
       fake_s3()
