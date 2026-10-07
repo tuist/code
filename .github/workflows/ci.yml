@@ -30,9 +30,13 @@ jobs:
           install_args: "erlang elixir rust protoc"
       - uses: actions/cache@v6
         with:
+          # priv/native holds the NIF that `mix compile` builds. _build's
+          # priv is a symlink to it, so caching _build alone restores a
+          # Code.Native beam that will not recompile, without its .so.
           path: |
             deps
             _build
+            priv/native
           key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-
       - run: mix deps.get
@@ -52,9 +56,13 @@ jobs:
           install_args: "erlang elixir rust protoc"
       - uses: actions/cache@v6
         with:
+          # priv/native holds the NIF that `mix compile` builds. _build's
+          # priv is a symlink to it, so caching _build alone restores a
+          # Code.Native beam that will not recompile, without its .so.
           path: |
             deps
             _build
+            priv/native
           key: ${{ runner.os }}-mix-test-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-test-
       - run: mix deps.get
@@ -71,9 +79,13 @@ jobs:
           install_args: "erlang elixir rust protoc"
       - uses: actions/cache@v6
         with:
+          # priv/native holds the NIF that `mix compile` builds. _build's
+          # priv is a symlink to it, so caching _build alone restores a
+          # Code.Native beam that will not recompile, without its .so.
           path: |
             deps
             _build
+            priv/native
           key: ${{ runner.os }}-mix-typecheck-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-typecheck-
       - run: mix deps.get
@@ -90,9 +102,13 @@ jobs:
           install_args: "erlang elixir shellspec rust protoc"
       - uses: actions/cache@v6
         with:
+          # priv/native holds the NIF that `mix compile` builds. _build's
+          # priv is a symlink to it, so caching _build alone restores a
+          # Code.Native beam that will not recompile, without its .so.
           path: |
             deps
             _build
+            priv/native
           key: ${{ runner.os }}-mix-e2e-${{ hashFiles('mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-e2e-
       - run: mix deps.get
