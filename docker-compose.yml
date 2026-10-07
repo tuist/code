@@ -65,7 +65,7 @@ services:
   createbucket:
     # The vanilla AWS CLI works against RustFS and against real S3 and is
     # anonymously pullable, unlike MinIO's `mc`.
-    image: amazon/aws-cli:2.37.7
+    image: amazon/aws-cli:2.37.10
     depends_on:
       storage:
         condition: service_healthy
