@@ -87,6 +87,13 @@ defmodule Code.GitTest do
     out |> String.split("\n") |> Enum.any?(&String.contains?(&1, marker))
   end
 
+  defp await_replay_gate(repository, attempts) do
+    case Code.Native.replay_gate(repository, 10_000) do
+      :busy when attempts > 0 -> Process.sleep(20) && await_replay_gate(repository, attempts - 1)
+      result -> result
+    end
+  end
+
   defp eventually(fun, attempts \\ 100) do
     cond do
       fun.() -> true
@@ -295,7 +302,9 @@ defmodule Code.GitTest do
       assert_receive {:DOWN, ^monitor, :process, ^owner, :killed}
       assert :busy = Code.Native.replay_gate(repository, 10_000)
       assert :ok = Code.Native.replay_lease_release(lease)
-      assert {:ok, successor} = Code.Native.replay_gate(repository, 10_000)
+      # The dead owner's gate is released when the VM frees its heap, which
+      # can trail the :DOWN message, so the successor may briefly see :busy.
+      assert {:ok, successor} = await_replay_gate(repository, 100)
       assert :ok = Code.Native.replay_release(successor)
     end
 
