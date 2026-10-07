@@ -15,7 +15,7 @@ shellspec = "0.28.1"
 # A Rustler NIF accelerates the WAL encode/decode hot path. The toolchain is
 # pinned so cross-machine builds produce identical native artifacts; see
 # native/code_native/ for the crate itself.
-rust = "1.97"
+rust = "1.99"
 # Releases are cut from conventional commits; see mise/tasks/release.
 git-cliff = "2.14.2"
 helm = "4.3.0"
