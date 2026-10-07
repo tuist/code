@@ -626,13 +626,18 @@ defmodule Code.GitTest do
     |> Enum.flat_map(fn chunk ->
       case String.split(String.trim_leading(chunk, "\n"), <<31>>, parts: 7) do
         [oid, name, email, authored, committed, subject, body] ->
-          [{oid, name, email, authored, committed, subject, body}]
+          [{oid, name, email, canonical_log_date(authored), canonical_log_date(committed), subject, body}]
 
         _ ->
           []
       end
     end)
   end
+
+  # Git 2.55 renders strict ISO 8601 UTC as Z; older Git and the native
+  # formatter use +00:00. Normalize only this equivalent UTC spelling so
+  # the oracle still compares every date component and nonzero offset exactly.
+  defp canonical_log_date(date), do: String.replace_suffix(date, "Z", "+00:00")
 
   defp refs_repository(root) do
     source = fixture_repository()
@@ -711,6 +716,13 @@ defmodule Code.GitTest do
   end
 
   describe "bounded linear history" do
+    test "the log oracle normalizes only the equivalent UTC spelling" do
+      assert canonical_log_date("2000-01-01T00:00:00Z") == "2000-01-01T00:00:00+00:00"
+      assert canonical_log_date("2000-01-01T00:00:00+00:00") == "2000-01-01T00:00:00+00:00"
+      assert canonical_log_date("2000-01-01T05:30:00+05:30") == "2000-01-01T05:30:00+05:30"
+      assert canonical_log_date("1999-12-31T19:00:00-05:00") == "1999-12-31T19:00:00-05:00"
+    end
+
     test "canonical fields and count limits match real Git", %{root: root} do
       source = fixture_repository()
 
