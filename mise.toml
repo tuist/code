@@ -18,7 +18,7 @@ shellspec = "0.28.1"
 rust = "1.97"
 # Releases are cut from conventional commits; see mise/tasks/release.
 git-cliff = "2.14.2"
-helm = "4.2.4"
+helm = "4.3.0"
 # The project website is a static Zola site deployed to Cloudflare Workers.
 zola = "0.23.6"
 # Cloudflare deployment tooling for the static website.
