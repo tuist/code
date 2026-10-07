@@ -91,14 +91,35 @@ this is the kind of property that quietly regresses.
 A download is written under a temporary name and renamed only after its digest
 matches what the log recorded, so a truncated transfer can never be mistaken
 for a verified pack. Installing it into a local repository is atomic in the
-same way: the pack is copied into a staging directory Git never reads, given a
-verified `.idx` there, and renamed into place pack first and index last. Git
+same way: the pack is staged in a directory Git never reads, given a
+verified `.idx` there, and renamed into place pack first and index last.
+Replica downloads use disposable scratch beside the repository and transfer
+ownership of regular, singly-linked files to staging with a rename. General
+callers still copy their source independently; crossing filesystems also
+falls back to copying. Consumed sources may be gone even on failure, but all
+metadata is a disposable cache and interruption is retried from the WAL.
+Serial node startup removes abandoned reserved pack-download and native-init
+scratch directories before starting workers, refusing symlinks and unrelated
+names. Git
 only considers a pack that has an index, and so does a replica deciding what it
 still has to download, so an install interrupted at any point is simply
 repeated. The `.idx` uploaded beside a pack is reused when it checks out
 against the pack (its own checksum, the pack checksum it records, its object
 count) and rebuilt with `git index-pack` otherwise; it carries no digest in the
 log, so it is a hint rather than something to trust.
+
+A separate index hint is omitted for packs whose bytes do not exceed even the
+minimum possible Git index: 1024 fanout bytes, 24 bytes per object and 40
+checksum bytes (v1 SHA1; v2/SHA256 are larger). The decision reads only the
+12-byte pack header and regular-file metadata on a dirty I/O scheduler. It is
+a byte/request policy, not a fixture-size threshold or an integrity proof.
+The pack is still streamed, SHA-256 verified and installed using Git's normal
+index rebuild when needed. Local indexes are never removed. Data-dominated
+packs retain uploaded/downloaded hints. New readers can infer the same policy
+from the verified pack without changing the schema; old readers tolerate the
+missing hint and rebuild as before. The tradeoff is one rebuild on a cold
+materialization in exchange for fewer stored bytes and requests, not a claim
+that rebuilding is always faster.
 
 A single `PUT` cannot exceed **5 GiB** on S3, so packs above the configured
 multipart threshold (100 MiB by default) are uploaded through S3 multipart
@@ -192,7 +213,9 @@ So every write records the index version its omission was relative to — its
 *basis* — and is proved against it before it is proposed:
 
 - the agent API packs everything reachable from the new values and not from
-  the basis's refs, which is closed by construction;
+  the basis's refs, which is closed by construction. The first attempt reuses
+  the real index snapshot the replica holds after its normal read revalidation,
+  not the local Git ref map; a compaction retry reads a new basis;
 - a Git push is checked with `rev-list`: every object reachable from the new
   values and not from the basis's tips must be in the push's quarantine, with
   the repository's own objects deliberately not counted.
@@ -206,7 +229,12 @@ still a tip of the winning index; otherwise the entry is refused as
 `basis_compacted` and redone against the new index — automatically for the
 agent API and, a bounded number of times, for a push, whose client is told to
 retry after that. A basis from a different `incarnation` belongs to a deleted
-repository and is refused outright.
+repository and is refused outright. The basis also carries its index's storage
+generation, letting immutable entry preparation choose its key without another
+index read. Preparation is not publication: the winning CAS still checks the
+basis incarnation and the entry's generation. A stale preparation may leave an
+unreferenced object but cannot publish into a replacement repository. Older
+callers whose basis omits the generation still read it from object storage.
 
 ## How a replica converges
 
@@ -254,6 +282,21 @@ converge on that decision, not to re-adjudicate it. The one local ref update
 that does check is the agent API applying its own just-committed write: by then
 a sync may already have applied a later push, and moving the ref back would be
 wrong, so the update is refused and the next read converges instead.
+
+Reference convergence first waits for any outstanding native replay on the same
+physical cache directory. A native dirty-I/O callback can outlive its caller,
+so a successor replica must not compute its ref diff until that work and its
+lock cleanup have finished. Each native callback's work guard holds a resource
+reference that pins the replay gate; its release is deferred while work is active. The native path is
+restricted to small ordinary flat-tag creates/deletes without hooks or tag
+reflogs, plus a first HEAD branch with no existing logs. That initial branch
+path stages both branch and HEAD reflogs with the same explicit service
+committer identity used by Git. It acquires Git-compatible ref locks and anchors all publication and
+cleanup to directory descriptors. Recreated directories cannot be overwritten;
+partial publication fails without advancing the local WAL position. Everything
+else still uses supervised Git, and the ingest old-value checks are unchanged.
+This coordination is only for disposable local materialization, never a new
+commit authority.
 
 ## Compaction
 
@@ -493,6 +536,45 @@ them on one process, and that process can then batch:
     push B ─┼─► writer ──► one read, one compare-and-swap ──► seqs 7, 8, 9
     push C ─┘
 ```
+
+A writer may retain the encoded index bytes and ETag from its last successful
+conditional publication, capped at 256 KiB plus a bounded ETag. Its next batch
+can speculate from that exact authoritative snapshot without another GET.
+Validation, incarnation/generation fencing and omission proofs still run, and
+the same `If-Match` CAS is the only commit authority. A stale cursor loses CAS
+and the complete batch is re-read and revalidated. If every entry is rejected
+or already installed, a cached result is never returned without a fresh read:
+there would otherwise be no CAS confirming the state used for the answer.
+Ambiguous failures discard the cursor and use the existing reconciliation.
+A stale speculative cursor triggers an immediate authoritative reread without
+consuming the real contention retry budget or sleeping. A no-change answer
+confirmed by a fresh read retains that bounded snapshot for the next batch.
+Cursor construction uses a bounded, yielding Elixir preflight walk (256 KiB
+conservative term budget and 64 nested levels) before encoding; it does not run
+an unbounded `external_size/1` BIF. Each resident replica can retain up to one
+additional 256 KiB encoded snapshot to seed a future local writer, a deliberate
+memory tradeoff for avoiding that writer's initial read. Oversized/deep snapshots
+use the normal read path. There is only one encoded cursor
+per writer, never a copy in each prepared request or a claim that a replica
+has peers' packs locally. The first batch may seed this cursor from a local
+replica's successfully revalidated and fully materialized snapshot. This is
+also a nonblocking peek, with the same conditional write and cached-rejection
+rules, not a promise the replica remains current. Replica metadata is size
+checked before encoding so an oversized index cannot cause an unbounded
+extra snapshot allocation. Each replica retains at most one bounded encoded
+slot, never a large payload per prepared request or mailbox message.
+
+A local replica may non-blockingly peek that confirmed bounded writer cursor,
+without queueing a large snapshot message or waiting behind a stalled writer.
+It still revalidates against object storage using the cursor's ETag. A `304`
+only confirms the snapshot: the replica then runs normal convergence against
+its complete pack/ref set before serving. A changed index supersedes the
+cursor: only a same-incarnation writer snapshot strictly ahead of the replica
+is considered. Older or equal writer cursors cannot replace the replica's own
+revalidation token, and unavailable storage cannot be bypassed. Publication alone never
+advances the replica's cached index or freshness; missing peer packs and lost
+local caches must still be materialized. Other nodes without that local cursor
+use the ordinary read path.
 
 Each push still uploads its own packs and its own entry object first — those
 are content-addressed, so they never contend and they happen wherever the push

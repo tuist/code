@@ -20,6 +20,24 @@
 //   * Panics abort (Cargo.toml); unwinding across the NIF boundary would
 //     tear a scheduler down halfway through a decode.
 
+mod bootstrap;
+mod branch_replay;
+mod config;
+mod delta;
+mod files;
+mod grep;
+mod history;
+mod pack_index;
+mod pack_stream_copy;
+mod presence;
+mod refs;
+mod replay;
+mod resolve;
+#[cfg(test)]
+mod test_support;
+mod trees;
+mod walk;
+
 use std::collections::HashMap;
 
 use prost::Message;
@@ -32,8 +50,12 @@ pub mod proto {
 rustler::atoms! {
     ok,
     error,
+    busy,
     malformed_index,
     malformed_entry,
+    fallback_git,
+    need_attribute_paths,
+    timeout,
 
     // Returned when the NIF decoded a value whose re-encoding is shorter than
     // the input — meaning the input carried fields prost does not know about.

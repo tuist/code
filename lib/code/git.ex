@@ -59,6 +59,8 @@ defmodule Code.Git do
 
   require Logger
 
+  alias Code.Git.AttributePaths
+  alias Code.Git.Ref
   alias Code.WAL.Entry
   alias Code.Wal.V1
 
@@ -108,43 +110,181 @@ defmodule Code.Git do
   @spec init_bare(path(), keyword()) :: :ok | {:error, term()}
   def init_bare(path, opts \\ []) do
     head = Keyword.get(opts, :head, "refs/heads/main")
-    File.mkdir_p!(path)
+    File.mkdir_p!(Path.dirname(path))
 
-    with {:ok, _} <- run(nil, ["init", "--bare", "--quiet", path]),
-         :ok <- configure_bare(path) do
-      set_head(path, head)
+    Code.Telemetry.span("code.git.init_bare", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+
+      native =
+        Code.Native.fresh_bare(
+          Path.expand(path),
+          head,
+          IO.iodata_to_binary(bare_template()),
+          ".code-init-" <> random_suffix(),
+          @default_timeout
+        )
+
+      {source, result} =
+        case native do
+          :ok -> {:native, configure_bare(path)}
+          :fallback_git -> {:git, init_bare_with_git(path, head)}
+        end
+
+      outcome = if result == :ok, do: :ok, else: :error
+      Code.Telemetry.put_span_attributes(%{"code.git.init_source" => Atom.to_string(source)})
+
+      :telemetry.execute(
+        [:code, :git, :init_bare],
+        %{duration_us: System.monotonic_time(:microsecond) - started},
+        %{source: source, outcome: outcome}
+      )
+
+      if outcome == :error,
+        do:
+          Logger.warning("Git cache initialization failed",
+            path: path,
+            operation: :init_bare,
+            outcome: outcome,
+            detail: source
+          )
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp init_bare_with_git(path, head) do
+    File.mkdir_p!(path)
+    template = Path.join(System.tmp_dir!(), "code-git-template-" <> random_suffix())
+
+    try do
+      File.mkdir!(template)
+      File.write!(Path.join(template, "config"), bare_template())
+      # Do not import HEAD: Git treats an imported HEAD as reinitialization
+      # and skips its filesystem case/symlink/Unicode probes. Set the requested
+      # target after initialization instead, on all supported Git versions.
+
+      # Git imports the template config during init, then fills in its own
+      # repository-format settings. Existing configs are left untouched by
+      # init, so the normal check below also handles reinitialization.
+      with {:ok, _} <- run(nil, ["init", "--bare", "--quiet", "--template", template, path]),
+           :ok <- configure_bare(path) do
+        set_head(path, head)
+      end
+    after
+      File.rm_rf(template)
     end
+  end
+
+  @bare_settings [
+    {"receive.unpackLimit", "1"},
+    {"receive.denyDeletes", "false"},
+    {"receive.denyNonFastForwards", "false"},
+    {"receive.denyCurrentBranch", "ignore"},
+    {"gc.auto", "0"},
+    {"maintenance.auto", "false"},
+    {"core.logAllRefUpdates", "true"},
+    {"repack.writeBitmaps", "true"},
+    {"uploadpack.allowFilter", "true"},
+    # Private forge state shares this object database with source code, but
+    # it is not part of the Git transport. Do not advertise it, accept an
+    # update to it, or allow an object id to bypass the hidden reference.
+    {"uploadpack.allowAnySHA1InWant", "false"},
+    {"transfer.hideRefs", "refs/code"},
+    {"uploadpack.hideRefs", "refs/code"},
+    {"receive.hideRefs", "refs/code"}
+  ]
+
+  defp bare_template do
+    Enum.map(@bare_settings, fn {key, value} ->
+      [section, name] = String.split(key, ".", parts: 2)
+      ["[", section, "]\n\t", name, " = ", value, "\n"]
+    end)
   end
 
   @doc false
   @spec configure_bare(path()) :: :ok | {:error, term()}
   def configure_bare(path) do
-    settings = [
-      {"receive.unpackLimit", "1"},
-      {"receive.denyDeletes", "false"},
-      {"receive.denyNonFastForwards", "false"},
-      {"receive.denyCurrentBranch", "ignore"},
-      {"gc.auto", "0"},
-      {"maintenance.auto", "false"},
-      {"core.logAllRefUpdates", "true"},
-      {"repack.writeBitmaps", "true"},
-      {"uploadpack.allowFilter", "true"},
-      # Private forge state shares this object database with source code, but
-      # it is not part of the Git transport. Do not advertise it, accept an
-      # update to it, or allow an object id to bypass the hidden reference.
-      {"uploadpack.allowAnySHA1InWant", "false"},
-      {"transfer.hideRefs", "refs/code"},
-      {"uploadpack.hideRefs", "refs/code"},
-      {"receive.hideRefs", "refs/code"}
-    ]
+    Code.Telemetry.span("code.git.configure", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
 
-    Enum.reduce_while(settings, :ok, &apply_setting(path, &1, &2))
+      source =
+        if Code.Native.file_config_matches(Path.join(path, "config"), @bare_settings), do: :native, else: :git
+
+      result = if source == :native, do: :ok, else: configure_with_git(path)
+      outcome = if result == :ok, do: :ok, else: :error
+
+      Code.Telemetry.put_span_attributes(%{"code.git.configuration_source" => Atom.to_string(source)})
+
+      :telemetry.execute(
+        [:code, :git, :configuration],
+        %{duration_us: System.monotonic_time(:microsecond) - started},
+        %{source: source, outcome: outcome}
+      )
+
+      if outcome == :error do
+        Logger.warning("Git cache configuration failed",
+          path: path,
+          operation: :configure_bare,
+          outcome: outcome,
+          detail: source
+        )
+      end
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
   end
 
-  defp apply_setting(path, {key, value}, _acc) do
-    case config(path, key, value) do
-      :ok -> {:cont, :ok}
-      error -> {:halt, error}
+  defp configure_with_git(path) do
+    with {:ok, current} <- effective_config(path) do
+      if settings_match?(current) do
+        :ok
+      else
+        with :ok <- Enum.reduce_while(@bare_settings, :ok, &apply_setting(path, current, &1, &2)) do
+          verify_configuration(path)
+        end
+      end
+    end
+  end
+
+  defp verify_configuration(path) do
+    # A successful local config write cannot remove an unsafe value supplied
+    # by an include or command configuration. Prove the effective result.
+    with {:ok, current} <- effective_config(path) do
+      if settings_match?(current), do: :ok, else: {:error, :unsafe_git_configuration}
+    end
+  end
+
+  defp settings_match?(current) do
+    Enum.all?(@bare_settings, fn {key, value} -> Map.get(current, String.downcase(key)) == [value] end)
+  end
+
+  defp effective_config(path) do
+    # Preserve duplicates: multi-valued settings (hideRefs in particular)
+    # are not equivalent to their last value alone.
+    with {:ok, out} <- run(path, ["config", "--null", "--list"]) do
+      current =
+        out
+        |> String.split(<<0>>, trim: true)
+        |> Enum.map(fn record ->
+          case String.split(record, "\n", parts: 2) do
+            [key, value] -> {key, value}
+            [key] -> {key, nil}
+          end
+        end)
+        |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+
+      {:ok, current}
+    end
+  end
+
+  defp apply_setting(path, current, {key, value}, _acc) do
+    if Map.get(current, String.downcase(key)) == [value] do
+      {:cont, :ok}
+    else
+      case config(path, key, value) do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
     end
   end
 
@@ -156,7 +296,18 @@ defmodule Code.Git do
   @doc "Point `HEAD` at a branch, whether or not that branch exists yet."
   @spec set_head(path(), String.t()) :: :ok | {:error, term()}
   def set_head(path, ref) do
-    with {:ok, _} <- run(path, ["symbolic-ref", "HEAD", ref]), do: :ok
+    # HEAD is a loose symbolic ref even when other refs are packed. A byte-
+    # exact match means there is no cache work to do. Validate first: a corrupt
+    # HEAD spelling an invalid target must not bypass Git's validation.
+    unchanged? =
+      String.starts_with?(ref, "refs/") and Ref.valid?(ref) and
+        Code.Native.file_matches(Path.join(path, "HEAD"), "ref: " <> ref <> "\n")
+
+    if unchanged? do
+      :ok
+    else
+      with {:ok, _} <- run(path, ["symbolic-ref", "HEAD", ref]), do: :ok
+    end
   end
 
   @spec head(path()) :: {:ok, String.t()} | {:error, term()}
@@ -167,6 +318,45 @@ defmodule Code.Git do
   @doc "Every ref in the repository as a `ref => oid` map."
   @spec refs(path()) :: {:ok, %{optional(String.t()) => oid()}} | {:error, term()}
   def refs(path) do
+    Code.Telemetry.span("code.git.refs", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+
+      {source, result} =
+        case Code.Native.loose_refs(path) do
+          {:ok, refs} -> {:native, {:ok, refs}}
+          :fallback_git -> {:git, refs_with_git(path)}
+        end
+
+      outcome = if match?({:ok, _}, result), do: :ok, else: :error
+
+      count =
+        case result do
+          {:ok, refs} -> map_size(refs)
+          _ -> 0
+        end
+
+      Code.Telemetry.put_span_attributes(%{"code.git.refs_source" => Atom.to_string(source)})
+
+      :telemetry.execute(
+        [:code, :git, :refs],
+        %{duration_us: System.monotonic_time(:microsecond) - started, refs: count},
+        %{source: source, outcome: outcome}
+      )
+
+      if outcome == :error,
+        do:
+          Logger.warning("Git cache ref listing failed",
+            path: path,
+            operation: :refs,
+            outcome: outcome,
+            detail: source
+          )
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp refs_with_git(path) do
     with {:ok, out} <- run(path, ["for-each-ref", "--format=%(refname) %(objectname)"]) do
       refs =
         out
@@ -216,8 +406,16 @@ defmodule Code.Git do
   Used when a replica adopts a compaction base: the base states the ref set in
   full, so anything left locally is stale by definition.
   """
-  @spec reset_refs(path(), %{optional(String.t()) => oid()}) :: :ok | {:error, term()}
-  def reset_refs(path, refs) do
+  @spec reset_refs(path(), %{optional(String.t()) => oid()}, keyword()) :: :ok | {:error, term()}
+  def reset_refs(path, refs, opts \\ []) do
+    if Keyword.get(opts, :native_replay, false) do
+      replay_refs(path, refs)
+    else
+      with {:ok, commands} <- ref_changes(path, refs), do: update_refs(path, commands)
+    end
+  end
+
+  defp ref_changes(path, refs) do
     with {:ok, current} <- refs(path) do
       zero = Entry.zero_oid()
 
@@ -232,7 +430,109 @@ defmodule Code.Git do
         |> Enum.reject(fn {ref, oid} -> Map.get(current, ref) == oid end)
         |> Enum.map(fn {ref, oid} -> %V1.RefCommand{ref: ref, old_oid: zero, new_oid: oid} end)
 
-      update_refs(path, deletions ++ updates)
+      {:ok, deletions ++ updates}
+    end
+  end
+
+  defp replay_refs(path, refs) do
+    Code.Telemetry.span("code.git.replay_refs", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+      {source, result} = replay_converge(path, refs)
+      outcome = if result == :ok, do: :ok, else: :error
+      Code.Telemetry.put_span_attributes(%{"code.git.replay_source" => Atom.to_string(source)})
+
+      :telemetry.execute(
+        [:code, :git, :replay_refs],
+        %{duration_us: System.monotonic_time(:microsecond) - started},
+        %{source: source, outcome: outcome}
+      )
+
+      if outcome == :error,
+        do:
+          Logger.warning("Git reference replay failed",
+            path: path,
+            operation: :replay_refs,
+            outcome: outcome,
+            detail: source
+          )
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp replay_converge(path, refs) do
+    case await_replay_gate(Path.expand(path), System.monotonic_time(:microsecond)) do
+      {:ok, gate} ->
+        case prepare_replay(path, refs, gate) do
+          {:fallback_git, commands} -> {:git, update_refs(path, commands)}
+          :ok -> {:native, :ok}
+          {:error, _} = error -> {:native, error}
+        end
+
+      :timeout ->
+        {:native, {:error, {:git, :timeout, "reference replay gate timed out"}}}
+
+      :error ->
+        {:native, {:error, :reference_replay_gate_unavailable}}
+    end
+  end
+
+  defp prepare_replay(path, refs, gate) do
+    with {:ok, commands} <- ref_changes(path, refs) do
+      if length(commands) <= 2, do: replay_small(gate, commands), else: {:fallback_git, commands}
+    end
+  after
+    Code.Native.replay_release(gate)
+  end
+
+  defp await_replay_gate(path, started, delay \\ 5) do
+    remaining = remaining_time(started, @default_timeout)
+
+    case Code.Native.replay_gate(path, remaining) do
+      :busy ->
+        Process.sleep(min(delay, max(remaining, 0)))
+        await_replay_gate(path, started, min(delay * 2, 100))
+
+      result ->
+        result
+    end
+  end
+
+  defp replay_small(_gate, []), do: :ok
+
+  defp replay_small(gate, commands) do
+    updates = Enum.map(commands, fn command -> {command.ref, command.old_oid, command.new_oid} end)
+
+    result =
+      case Code.Native.replay_tags(gate, updates, @default_timeout) do
+        :fallback_git -> replay_first_branch(gate, updates)
+        result -> result
+      end
+
+    case result do
+      :ok -> :ok
+      :fallback_git -> {:fallback_git, commands}
+      :timeout -> {:error, {:git, :timeout, "reference replay timed out"}}
+      :error -> {:error, :reference_replay_failed}
+    end
+  end
+
+  defp replay_first_branch(gate, updates) do
+    case Code.Native.local_git_date() do
+      {:ok, seconds, zone} ->
+        Code.Native.replay_branch(
+          gate,
+          updates,
+          reflog_identity(:git_committer_name, "GIT_COMMITTER_NAME", "Code"),
+          reflog_identity(:git_committer_email, "GIT_COMMITTER_EMAIL", "code@localhost"),
+          seconds,
+          zone,
+          ".code-reflog-" <> random_suffix(),
+          @default_timeout
+        )
+
+      :fallback_git ->
+        :fallback_git
     end
   end
 
@@ -253,9 +553,16 @@ defmodule Code.Git do
   cache like everything else here: anything that does not check out is
   discarded and the index rebuilt with `git index-pack`, which also verifies
   every object in the pack.
+
+  With `consume: true`, the caller transfers ownership of the source pack:
+  it is moved into staging when on the same filesystem, avoiding a full copy.
+  The source may be gone even on failure. Use this only for disposable downloads,
+  not a quarantine or a pack that another operation could still be reading.
+  Only regular, singly-linked sources are accepted for ownership transfer.
+  Cross-filesystem sources fall back to copying.
   """
-  @spec install_pack(path(), Path.t()) :: {:ok, Path.t()} | {:error, term()}
-  def install_pack(repo_path, pack_file) do
+  @spec install_pack(path(), Path.t(), keyword()) :: {:ok, Path.t()} | {:error, term()}
+  def install_pack(repo_path, pack_file, opts \\ []) do
     pack_dir = Path.join([repo_path, "objects", "pack"])
     name = Path.basename(pack_file)
     destination = Path.join(pack_dir, name)
@@ -266,13 +573,13 @@ defmodule Code.Git do
       # can be missing.
       if File.exists?(index_path(destination)),
         do: {:ok, destination},
-        else: stage_and_publish(repo_path, pack_file, pack_dir, name)
+        else: stage_and_publish(repo_path, pack_file, pack_dir, name, Keyword.put(opts, :consume, false))
     else
-      stage_and_publish(repo_path, pack_file, pack_dir, name)
+      stage_and_publish(repo_path, pack_file, pack_dir, name, opts)
     end
   end
 
-  defp stage_and_publish(repo_path, pack_file, pack_dir, name) do
+  defp stage_and_publish(repo_path, pack_file, pack_dir, name, opts) do
     # A dot-directory inside objects/pack: on the same filesystem, so the
     # renames below are atomic, and invisible both to Git (which never
     # descends into subdirectories there) and to `packs/1`.
@@ -283,14 +590,79 @@ defmodule Code.Git do
     try do
       File.mkdir_p!(staging)
 
-      with :ok <- File.cp(pack_file, staged),
-           :ok <- stage_index(repo_path, pack_file, staged) do
-        publish(staged, destination)
+      with :ok <- stage_pack(pack_file, staged, Keyword.get(opts, :consume, false)),
+           :ok <- stage_index(repo_path, pack_file, staged),
+           {:ok, _} = result <- publish(staged, destination) do
+        if Keyword.get(opts, :consume, false) and pack_file != destination, do: File.rm(pack_file)
+        result
       else
         {:error, reason} -> {:error, reason}
       end
     after
       File.rm_rf(staging)
+    end
+  end
+
+  defp stage_pack(source, staged, consume?) do
+    started = System.monotonic_time(:microsecond)
+
+    Code.Telemetry.span("code.git.pack_stage", %{}, fn ->
+      {result, method} = stage_pack_file(source, staged, consume?)
+      outcome = if result == :ok, do: method, else: :error
+      bytes = if result == :ok, do: File.stat!(staged).size, else: 0
+
+      :telemetry.execute(
+        [:code, :git, :pack_stage],
+        %{duration_us: System.monotonic_time(:microsecond) - started, bytes: bytes},
+        %{outcome: outcome}
+      )
+
+      if outcome == :error do
+        Logger.warning("pack staging failed",
+          operation: :pack_stage,
+          outcome: :error,
+          detail: inspect(result)
+        )
+      end
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp stage_pack_file(source, staged, false) do
+    result =
+      case File.lstat(Path.dirname(staged)) do
+        {:ok, %{type: :directory, major_device: device, inode: inode}} ->
+          case Code.Native.file_copy_regular(source, staged, device, inode) do
+            :fallback_git -> File.cp(source, staged)
+            result -> result
+          end
+
+        {:ok, _} ->
+          {:error, :enotdir}
+
+        {:error, _} = error ->
+          error
+      end
+
+    {result, :copied}
+  end
+
+  defp stage_pack_file(source, staged, true) do
+    # Ownership transfer is only safe for a disposable ordinary download,
+    # never a symlink or an externally aliased inode. General installs copy.
+    case File.lstat(source) do
+      {:ok, %{type: :regular, links: 1}} ->
+        case File.rename(source, staged) do
+          {:error, :exdev} -> {File.cp(source, staged), :copied_cross_device}
+          result -> {result, :moved}
+        end
+
+      {:ok, _} ->
+        {{:error, :einval}, :moved}
+
+      {:error, _} = error ->
+        {error, :moved}
     end
   end
 
@@ -343,6 +715,33 @@ defmodule Code.Git do
   @doc false
   @spec valid_index?(Path.t(), Path.t()) :: boolean()
   def valid_index?(pack, idx) do
+    Code.Telemetry.span("code.git.pack_index_validate", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+
+      {source, valid?} =
+        case Code.Native.file_index_matches(pack, idx) do
+          :fallback_git -> {:elixir, valid_index_elixir?(pack, idx)}
+          valid? -> {:native, valid?}
+        end
+
+      outcome = if valid?, do: :valid, else: :invalid
+
+      :telemetry.execute(
+        [:code, :git, :pack_index_validate],
+        %{duration_us: System.monotonic_time(:microsecond) - started, count: 1},
+        %{source: source, outcome: outcome}
+      )
+
+      Code.Telemetry.put_span_attributes(%{
+        "code.git.index_source" => Atom.to_string(source),
+        "code.git.index_outcome" => Atom.to_string(outcome)
+      })
+
+      Code.Telemetry.put_span_outcome(valid?)
+    end)
+  end
+
+  defp valid_index_elixir?(pack, idx) do
     with {:ok, %{size: idx_size}} when idx_size >= 1072 <- File.stat(idx),
          {:ok, %{size: pack_size}} when pack_size >= 32 <- File.stat(pack),
          {:ok, <<0xFF, ?t, ?O, ?c, 2::32, _::binary>> = head} <- pread(idx, 0, 1032),
@@ -491,7 +890,47 @@ defmodule Code.Git do
   @doc "Resolve a revision (branch, tag, oid, `HEAD`) to a full object id."
   @spec resolve(path(), String.t()) :: {:ok, oid()} | {:error, term()}
   def resolve(repo_path, rev) do
-    with {:ok, out} <- run(repo_path, ["rev-parse", "--verify", "--end-of-options", rev <> "^{commit}"]) do
+    Code.Telemetry.span("code.git.resolve", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+
+      {source, result} =
+        case Code.Native.resolve_commit(repo_path, rev, @default_timeout) do
+          {:ok, oid} ->
+            {:native, {:ok, oid}}
+
+          :timeout ->
+            {:native, {:error, {:git, :timeout, "commit resolution timed out"}}}
+
+          :fallback_git ->
+            remaining = max(@default_timeout - div(System.monotonic_time(:microsecond) - started, 1000), 1)
+            {:git, resolve_with_git(repo_path, rev, remaining)}
+        end
+
+      outcome = if match?({:ok, _}, result), do: :ok, else: :error
+      Code.Telemetry.put_span_attributes(%{"code.git.resolve_source" => Atom.to_string(source)})
+
+      :telemetry.execute(
+        [:code, :git, :resolve],
+        %{duration_us: System.monotonic_time(:microsecond) - started},
+        %{source: source, outcome: outcome}
+      )
+
+      if outcome == :error,
+        do:
+          Logger.warning("Git commit resolution failed",
+            path: repo_path,
+            operation: :resolve,
+            outcome: outcome,
+            detail: source
+          )
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp resolve_with_git(repo_path, rev, timeout) do
+    with {:ok, out} <-
+           run(repo_path, ["rev-parse", "--verify", "--end-of-options", rev <> "^{commit}"], timeout: timeout) do
       {:ok, String.trim(out)}
     end
   end
@@ -503,7 +942,7 @@ defmodule Code.Git do
       {:ok, output} ->
         output
         |> String.split("\n", trim: true)
-        |> Enum.any?(&(not Code.Git.Ref.internal?(&1)))
+        |> Enum.any?(&(not Ref.internal?(&1)))
 
       {:error, _reason} ->
         false
@@ -513,12 +952,95 @@ defmodule Code.Git do
   @doc "Read a blob's contents at a revision."
   @spec read_file(path(), String.t(), String.t()) :: {:ok, binary()} | {:error, term()}
   def read_file(repo_path, rev, file) do
-    run(repo_path, ["cat-file", "blob", "#{rev}:#{file}"])
+    Code.Telemetry.span("code.git.read_file", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+
+      {source, result} =
+        case Code.Native.read_blob(repo_path, rev, file, @default_timeout) do
+          {:ok, body} ->
+            {:native, {:ok, body}}
+
+          :timeout ->
+            {:native, {:error, {:git, :timeout, "blob read timed out"}}}
+
+          :fallback_git ->
+            remaining = max(@default_timeout - div(System.monotonic_time(:microsecond) - started, 1000), 1)
+            {:git, run(repo_path, ["cat-file", "blob", "#{rev}:#{file}"], timeout: remaining)}
+        end
+
+      outcome = if match?({:ok, _}, result), do: :ok, else: :error
+      Code.Telemetry.put_span_attributes(%{"code.git.read_file_source" => Atom.to_string(source)})
+
+      :telemetry.execute(
+        [:code, :git, :read_file],
+        %{duration_us: System.monotonic_time(:microsecond) - started},
+        %{source: source, outcome: outcome}
+      )
+
+      if outcome == :error,
+        do:
+          Logger.warning("Git blob read failed",
+            path: repo_path,
+            operation: :read_file,
+            outcome: outcome,
+            detail: source
+          )
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
   end
 
   @doc "List a tree at a revision, one level deep unless `recursive: true`."
   @spec list_tree(path(), String.t(), String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def list_tree(repo_path, rev, dir \\ "", opts \\ []) do
+    Code.Telemetry.span("code.git.tree", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+
+      native =
+        if dir in [nil, "", "/"],
+          do: Code.Native.root_tree(repo_path, rev, !!Keyword.get(opts, :recursive, false), @default_timeout),
+          else: :fallback_git
+
+      {source, result} =
+        case native do
+          {:ok, entries} ->
+            {:native,
+             {:ok,
+              Enum.map(entries, fn {mode, type, oid, size, path} ->
+                %{mode: mode, type: type, oid: oid, size: size, path: path}
+              end)}}
+
+          :timeout ->
+            {:native, {:error, {:git, :timeout, "tree listing timed out"}}}
+
+          :fallback_git ->
+            remaining = max(@default_timeout - div(System.monotonic_time(:microsecond) - started, 1000), 1)
+            {:git, list_tree_with_git(repo_path, rev, dir, opts, remaining)}
+        end
+
+      outcome = if match?({:ok, _}, result), do: :ok, else: :error
+      Code.Telemetry.put_span_attributes(%{"code.git.tree_source" => Atom.to_string(source)})
+
+      :telemetry.execute(
+        [:code, :git, :tree],
+        %{duration_us: System.monotonic_time(:microsecond) - started},
+        %{source: source, outcome: outcome}
+      )
+
+      if outcome == :error,
+        do:
+          Logger.warning("Git tree listing failed",
+            path: repo_path,
+            operation: :list_tree,
+            outcome: outcome,
+            detail: source
+          )
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp list_tree_with_git(repo_path, rev, dir, opts, timeout) do
     # An empty pathspec is an error in git rather than a synonym for the root,
     # so the `--` is omitted entirely when listing the top level.
     pathspec = if dir in [nil, "", "/"], do: [], else: ["--", dir]
@@ -528,7 +1050,7 @@ defmodule Code.Git do
         if(Keyword.get(opts, :recursive, false), do: ["-r"], else: []) ++
         [rev] ++ pathspec
 
-    with {:ok, out} <- run(repo_path, args) do
+    with {:ok, out} <- run(repo_path, args, timeout: timeout) do
       entries =
         out
         |> String.split(<<0>>, trim: true)
@@ -555,6 +1077,62 @@ defmodule Code.Git do
   @doc "Commit history, newest first."
   @spec log(path(), String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def log(repo_path, rev, opts \\ []) do
+    Code.Telemetry.span("code.git.log", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+      limit = Keyword.get(opts, :limit, 50)
+
+      native =
+        if is_integer(limit) and limit in 0..256 and opts[:path] in [nil, false],
+          do: Code.Native.linear_log(repo_path, rev, limit, @default_timeout),
+          else: :fallback_git
+
+      {source, result} =
+        case native do
+          {:ok, commits} ->
+            {:native,
+             {:ok,
+              Enum.map(commits, fn {oid, name, email, authored, committed, subject, body} ->
+                %{
+                  oid: oid,
+                  author: %{name: name, email: email},
+                  authored_at: authored,
+                  committed_at: committed,
+                  subject: subject,
+                  body: body
+                }
+              end)}}
+
+          :timeout ->
+            {:native, {:error, {:git, :timeout, "commit history timed out"}}}
+
+          :fallback_git ->
+            remaining = max(@default_timeout - div(System.monotonic_time(:microsecond) - started, 1000), 1)
+            {:git, log_with_git(repo_path, rev, opts, remaining)}
+        end
+
+      outcome = if match?({:ok, _}, result), do: :ok, else: :error
+      Code.Telemetry.put_span_attributes(%{"code.git.log_source" => Atom.to_string(source)})
+
+      :telemetry.execute(
+        [:code, :git, :log],
+        %{duration_us: System.monotonic_time(:microsecond) - started},
+        %{source: source, outcome: outcome}
+      )
+
+      if outcome == :error,
+        do:
+          Logger.warning("Git history read failed",
+            path: repo_path,
+            operation: :log,
+            outcome: outcome,
+            detail: source
+          )
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp log_with_git(repo_path, rev, opts, timeout) do
     limit = Keyword.get(opts, :limit, 50)
     sep = "\x1f"
     rec = "\x1e"
@@ -563,7 +1141,7 @@ defmodule Code.Git do
     args = ["log", "--max-count=#{limit}", "--format=#{format}"]
     args = args ++ if(path = opts[:path], do: ["--", path], else: [])
 
-    with {:ok, out} <- run(repo_path, (args ++ [rev]) |> reorder_rev(rev)) do
+    with {:ok, out} <- run(repo_path, (args ++ [rev]) |> reorder_rev(rev), timeout: timeout) do
       commits =
         out
         |> String.split(rec, trim: true)
@@ -610,6 +1188,86 @@ defmodule Code.Git do
   @doc "Search the tree at a revision. Returns `path:line:text` matches."
   @spec grep(path(), String.t(), String.t(), keyword()) :: {:ok, [map()]} | {:error, term()}
   def grep(repo_path, rev, pattern, opts \\ []) do
+    Code.Telemetry.span("code.git.grep", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+      timeout = Keyword.get(opts, :timeout, @default_timeout)
+      native = grep_native(repo_path, rev, pattern, opts, started, timeout)
+
+      {source, result} =
+        case native do
+          {:ok, rows} ->
+            {:native,
+             {:ok, Enum.map(rows, fn {path, line, text} -> %{path: path, line: line, text: text} end)}}
+
+          :timeout ->
+            {:native, {:error, {:git, :timeout, "tree search timed out"}}}
+
+          :fallback_git ->
+            {:git, grep_with_git(repo_path, rev, pattern, opts, remaining_time(started, timeout))}
+        end
+
+      outcome = if match?({:ok, _}, result), do: :ok, else: :error
+      hash_backend = if source == :native, do: :sha1dc, else: :git
+
+      Code.Telemetry.put_span_attributes(%{
+        "code.git.grep_source" => Atom.to_string(source),
+        "code.git.grep_hash_backend" => Atom.to_string(hash_backend)
+      })
+
+      :telemetry.execute(
+        [:code, :git, :grep],
+        %{duration_us: System.monotonic_time(:microsecond) - started},
+        %{source: source, outcome: outcome, hash_backend: hash_backend}
+      )
+
+      if outcome == :error,
+        do:
+          Logger.warning("Git tree search failed",
+            path: repo_path,
+            operation: :grep,
+            outcome: outcome,
+            detail: source
+          )
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp remaining_time(started, timeout),
+    do: max(timeout - div(System.monotonic_time(:microsecond) - started, 1000), 0)
+
+  defp grep_native(repo, rev, pattern, opts, started, timeout) do
+    limit = Keyword.get(opts, :limit, 100)
+    paths = AttributePaths.cached()
+
+    if paths == :fallback_git || not native_grep_options?(opts, limit) do
+      :fallback_git
+    else
+      case Code.Native.fixed_grep(repo, rev, pattern, limit, paths, remaining_time(started, timeout)) do
+        :need_attribute_paths ->
+          case AttributePaths.discover(repo, remaining_time(started, timeout)) do
+            {:ok, paths} ->
+              Code.Native.fixed_grep(repo, rev, pattern, limit, paths, remaining_time(started, timeout))
+
+            :fallback_git ->
+              :fallback_git
+          end
+
+        result ->
+          result
+      end
+    end
+  end
+
+  defp native_grep_options?(opts, limit) do
+    is_integer(limit) and limit in 1..256 and is_nil(opts[:path]) and
+      not Keyword.get(opts, :ignore_case, false) and Keyword.get(opts, :fixed, true)
+  end
+
+  defp grep_with_git(_repo, _rev, _pattern, _opts, timeout) when timeout <= 0,
+    do: {:error, {:git, :timeout, "tree search timed out"}}
+
+  defp grep_with_git(repo_path, rev, pattern, opts, timeout) do
     limit = Keyword.get(opts, :limit, 100)
 
     args =
@@ -619,7 +1277,7 @@ defmodule Code.Git do
         ["-e", pattern, rev] ++
         if(path = opts[:path], do: ["--", path], else: [])
 
-    case run(repo_path, args) do
+    case run(repo_path, args, timeout: timeout) do
       {:ok, out} ->
         matches =
           out
@@ -729,6 +1387,27 @@ defmodule Code.Git do
   """
   @spec pack_objects(path(), [oid()], [oid()], Path.t()) :: {:ok, Path.t() | nil} | {:error, term()}
   def pack_objects(repo_path, include, exclude, dir) do
+    Code.Telemetry.span("code.git.pack_objects", %{}, fn ->
+      result = do_pack_objects(repo_path, include, exclude, dir)
+
+      outcome =
+        case result do
+          {:ok, nil} -> :empty
+          {:ok, _pack} -> :nonempty
+          {:error, _reason} -> :error
+        end
+
+      :telemetry.execute([:code, :git, :pack_objects], %{count: 1}, %{outcome: outcome})
+
+      if outcome == :error do
+        Logger.warning("Git object packing failed", operation: :pack_objects, reason: inspect(result))
+      end
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp do_pack_objects(repo_path, include, exclude, dir) do
     File.mkdir_p!(dir)
 
     revs =
@@ -752,7 +1431,14 @@ defmodule Code.Git do
 
         hash ->
           pack = base <> "-" <> String.trim(hash) <> ".pack"
-          if File.exists?(pack), do: {:ok, pack}, else: {:ok, nil}
+          # Git writes a valid zero-object pack even when every included
+          # object is excluded. Such a ref-only operation has no pack to log,
+          # upload or materialize. Inspect only the fixed header in Rust.
+          case Code.Native.file_pack_count(pack) do
+            {:ok, 0} -> {:ok, nil}
+            {:ok, _count} -> {:ok, pack}
+            {:error, _} = error -> error
+          end
       end
     end
   end
@@ -798,18 +1484,63 @@ defmodule Code.Git do
     try do
       File.write!(revs, Enum.map_join(tips, &"#{&1}\n") <> Enum.map_join(exclude, &"^#{&1}\n"))
 
-      with {:ok, _} <-
-             run(repo_path, ["rev-list", "--objects", "--no-object-names", "--stdin"],
-               stdin_file: revs,
-               stdout_file: listed,
-               env: walk_env,
-               timeout: timeout
-             ) do
+      with {:ok, _} <- closure_walk(repo_path, tips, exclude, revs, listed, walk_env, timeout) do
         count_absent(repo_path, listed, object_dir, timeout)
       end
     after
       File.rm_rf(scratch)
     end
+  end
+
+  defp closure_walk(repo, tips, exclude, revs, listed, walk_env, timeout) do
+    Code.Telemetry.span("code.git.closure_walk", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+
+      native =
+        if exclude == [] and walk_env == [],
+          do: Code.Native.plain_walk(repo, tips, listed, timeout),
+          else: :fallback_git
+
+      {source, result} =
+        case native do
+          {:ok, count} ->
+            {:native, {:ok, count}}
+
+          :timeout ->
+            {:native, {:error, {:git, :timeout, "closure walk timed out"}}}
+
+          :fallback_git ->
+            remaining = max(timeout - div(System.monotonic_time(:microsecond) - started, 1000), 1)
+
+            {:git,
+             run(repo, ["rev-list", "--objects", "--no-object-names", "--stdin"],
+               stdin_file: revs,
+               stdout_file: listed,
+               env: walk_env,
+               timeout: remaining
+             )}
+        end
+
+      outcome = if match?({:ok, _}, result), do: :ok, else: :error
+      Code.Telemetry.put_span_attributes(%{"code.git.closure_walk_source" => Atom.to_string(source)})
+
+      :telemetry.execute(
+        [:code, :git, :closure_walk],
+        %{duration_us: System.monotonic_time(:microsecond) - started},
+        %{source: source, outcome: outcome}
+      )
+
+      if outcome == :error,
+        do:
+          Logger.warning("Git closure walk failed",
+            path: repo,
+            operation: :closure_walk,
+            outcome: outcome,
+            detail: source
+          )
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
   end
 
   defp count_absent(repo_path, listed, object_dir, timeout) do
@@ -821,17 +1552,65 @@ defmodule Code.Git do
         {:ok, listed |> File.stream!() |> Enum.count()}
 
       true ->
-        # An empty format prints an empty line per object found and
-        # "<oid> missing" per object not found, so the output stays a byte per
-        # object however large the push.
-        with {:ok, out} <-
-               run(repo_path, ["cat-file", "--batch-check="],
-                 stdin_file: listed,
-                 env: [{"GIT_OBJECT_DIRECTORY", object_dir}, {"GIT_ALTERNATE_OBJECT_DIRECTORIES", nil}],
-                 timeout: timeout
-               ) do
-          {:ok, out |> String.split("\n", trim: true) |> Enum.count(&String.ends_with?(&1, " missing"))}
+        closure_presence(repo_path, listed, object_dir, timeout)
+    end
+  end
+
+  defp closure_presence(repo_path, listed, object_dir, timeout) do
+    Code.Telemetry.span("code.git.closure_presence", %{}, fn ->
+      started = System.monotonic_time(:microsecond)
+
+      {source, result} =
+        case Code.Native.packed_missing(repo_path, listed, object_dir, timeout) do
+          {:ok, count} ->
+            {:native, {:ok, count}}
+
+          :timeout ->
+            {:native, presence_timeout()}
+
+          :fallback_git ->
+            remaining = timeout - div(System.monotonic_time(:microsecond) - started, 1000)
+            {:git, presence_with_git(repo_path, listed, object_dir, remaining)}
         end
+
+      outcome = if match?({:ok, _}, result), do: :ok, else: :error
+      Code.Telemetry.put_span_attributes(%{"code.git.closure_presence_source" => Atom.to_string(source)})
+
+      :telemetry.execute(
+        [:code, :git, :closure_presence],
+        %{duration_us: System.monotonic_time(:microsecond) - started},
+        %{source: source, outcome: outcome}
+      )
+
+      if outcome == :error,
+        do:
+          Logger.warning("Git closure presence check failed",
+            path: repo_path,
+            operation: :closure_presence,
+            outcome: outcome,
+            detail: source
+          )
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
+  end
+
+  defp presence_timeout, do: {:error, {:git, :timeout, "closure presence check timed out"}}
+  defp presence_with_git(_repo, _listed, _objects, timeout) when timeout <= 0, do: presence_timeout()
+
+  defp presence_with_git(repo_path, listed, object_dir, timeout) do
+    checked = listed <> ".checked"
+    # Keep fallback stdout on disk too: an empty line per present object can
+    # still become millions of bytes, and missing rows are larger still.
+    with {:ok, _} <-
+           run(repo_path, ["cat-file", "--batch-check="],
+             stdin_file: listed,
+             stdout_file: checked,
+             env: [{"GIT_OBJECT_DIRECTORY", object_dir}, {"GIT_ALTERNATE_OBJECT_DIRECTORIES", nil}],
+             timeout: timeout
+           ),
+         {:ok, _total, missing} <- Code.Native.file_line_counts(checked) do
+      {:ok, missing}
     end
   end
 
@@ -1178,7 +1957,14 @@ defmodule Code.Git do
     parent = self()
     tag = make_ref()
 
-    {pid, monitor} = spawn_monitor(fn -> send(parent, {tag, fun.()}) end)
+    overrides = Code.Config.overrides()
+
+    {pid, monitor} =
+      spawn_monitor(fn ->
+        Code.Config.put_overrides(overrides)
+        send(parent, {tag, fun.()})
+      end)
+
     watch(parent, pid)
 
     receive do
@@ -1276,6 +2062,13 @@ defmodule Code.Git do
     _, _ -> :ok
   end
 
+  defp reflog_identity(key, environment, default) do
+    case Map.fetch(Code.Config.overrides(), key) do
+      {:ok, value} -> value
+      :error -> Application.get_env(:code, key, System.get_env(environment) || default)
+    end
+  end
+
   defp env(opts) do
     [
       # Determinism: never read the operator's git configuration.
@@ -1284,7 +2077,11 @@ defmodule Code.Git do
       {"GIT_TERMINAL_PROMPT", "0"},
       {"GIT_ASKPASS", ""},
       {"HOME", System.tmp_dir!()},
-      {"LC_ALL", "C"}
+      {"LC_ALL", "C"},
+      # Cache reflogs are service metadata, not the node operator's identity.
+      # Explicit per-command identities (commit_tree) remain last and win.
+      {"GIT_COMMITTER_NAME", reflog_identity(:git_committer_name, "GIT_COMMITTER_NAME", "Code")},
+      {"GIT_COMMITTER_EMAIL", reflog_identity(:git_committer_email, "GIT_COMMITTER_EMAIL", "code@localhost")}
     ] ++ Keyword.get(opts, :env, [])
   end
 

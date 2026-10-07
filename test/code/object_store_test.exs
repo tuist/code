@@ -186,6 +186,37 @@ defmodule Code.ObjectStoreTest do
       refute File.exists?(destination)
     end
 
+    test "digest errors are returned and observable", %{root: root} do
+      handler = {__MODULE__, :digest, self()}
+
+      :telemetry.attach(
+        handler,
+        [:code, :object_store, :digest],
+        fn _, measurements, meta, pid ->
+          if self() == pid, do: send(pid, {:digest, measurements, meta})
+        end,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      assert {:error, :enoent} = ObjectStore.digest_file(Path.join(root, "missing"))
+      assert_receive {:digest, %{bytes: 0, duration_us: duration}, %{outcome: :error}}
+      assert duration >= 0
+      assert {:error, :eisdir} = ObjectStore.digest_file(root)
+    end
+
+    test "digest handles empty files and chunk boundaries", %{root: root} do
+      path = Path.join(root, "boundaries")
+
+      for size <- [0, 1, 65_535, 65_536, 65_537, 196_621] do
+        bytes = :crypto.strong_rand_bytes(size)
+        File.write!(path, bytes)
+        expected = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+        assert {:ok, ^expected, ^size} = ObjectStore.digest_file(path)
+      end
+    end
+
     @tag :tmp_dir
     test "digest_file agrees with hashing the whole body", %{tmp_dir: tmp} do
       path = Path.join(tmp, "hash.bin")

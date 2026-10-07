@@ -47,6 +47,127 @@ defmodule Code.Native do
 
   @dirty_threshold 16_384
 
+  @doc "Hash a regular file in Rust using a bounded buffer on a dirty I/O scheduler."
+  @spec file_sha256(Path.t()) :: {:ok, String.t(), non_neg_integer()} | {:error, atom()}
+  def file_sha256(path) do
+    with {:ok, resource} <- file_sha256_start(path), do: hash_file_step(resource)
+  end
+
+  defp hash_file_step(resource) do
+    case file_sha256_step(resource) do
+      :more -> hash_file_step(resource)
+      result -> result
+    end
+  end
+
+  @doc false
+  def file_sha256_start(_path), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  def file_sha256_step(_resource), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec file_copy_regular(Path.t(), Path.t(), non_neg_integer(), non_neg_integer()) ::
+          :ok | :fallback_git | {:error, atom()}
+  def file_copy_regular(_source, _destination, _device, _inode), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec file_index_matches(Path.t(), Path.t()) :: boolean() | :fallback_git
+  def file_index_matches(_pack, _index), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec file_pack_hint_omit(Path.t()) :: boolean()
+  def file_pack_hint_omit(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec file_pack_count(Path.t()) :: {:ok, non_neg_integer()} | {:error, atom()}
+  def file_pack_count(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec file_matches(Path.t(), binary()) :: boolean()
+  def file_matches(_path, _expected), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec file_config_matches(Path.t(), [{binary(), binary()}]) :: boolean()
+  def file_config_matches(_path, _settings), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec loose_refs(Path.t()) :: {:ok, %{binary() => binary()}} | :fallback_git
+  def loose_refs(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec file_line_counts(Path.t()) :: {:ok, non_neg_integer(), non_neg_integer()} | {:error, term()}
+  def file_line_counts(_path), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec packed_missing(Path.t(), Path.t(), Path.t(), non_neg_integer()) ::
+          {:ok, non_neg_integer()} | :fallback_git | :timeout
+  def packed_missing(_repo, _listed, _objects, _timeout), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec resolve_commit(Path.t(), binary(), non_neg_integer()) :: {:ok, binary()} | :fallback_git | :timeout
+  def resolve_commit(_repo, _revision, _timeout), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec root_tree(Path.t(), binary(), boolean(), non_neg_integer()) ::
+          {:ok, [tuple()]} | :fallback_git | :timeout
+  def root_tree(_repo, _revision, _recursive, _timeout), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec read_blob(Path.t(), binary(), binary(), non_neg_integer()) ::
+          {:ok, binary()} | :fallback_git | :timeout
+  def read_blob(_repo, _revision, _path, _timeout), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec linear_log(Path.t(), binary(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, [tuple()]} | :fallback_git | :timeout
+  def linear_log(_repo, _revision, _limit, _timeout), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec plain_walk(Path.t(), [binary()], Path.t(), non_neg_integer()) ::
+          {:ok, non_neg_integer()} | :fallback_git | :timeout
+  def plain_walk(_repo, _tips, _output, _timeout), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec fresh_bare(Path.t(), binary(), binary(), binary(), non_neg_integer()) :: :ok | :fallback_git
+  def fresh_bare(_path, _head, _config, _sibling, _timeout), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec fixed_grep(Path.t(), binary(), binary(), pos_integer(), [binary()], non_neg_integer()) ::
+          {:ok, [tuple()]} | :fallback_git | :need_attribute_paths | :timeout
+  def fixed_grep(_repo, _rev, _pattern, _limit, _paths, _timeout), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec replay_gate(Path.t(), non_neg_integer()) :: {:ok, reference()} | :busy | :timeout | :error
+  def replay_gate(_path, _timeout), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  @spec replay_release(reference()) :: :ok
+  def replay_release(_gate), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  @spec replay_tags(reference(), [tuple()], non_neg_integer()) :: :ok | :error | :fallback_git | :timeout
+  def replay_tags(_gate, _updates, _timeout), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  @spec replay_lease(reference()) :: {:ok, reference()} | :fallback_git
+  def replay_lease(_gate), do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  @spec replay_lease_release(reference()) :: :ok
+  def replay_lease_release(_lease), do: :erlang.nif_error(:nif_not_loaded)
+
+  @doc false
+  @spec local_git_date() :: {:ok, non_neg_integer(), binary()} | :fallback_git
+  def local_git_date, do: :erlang.nif_error(:nif_not_loaded)
+  @doc false
+  @spec replay_branch(
+          reference(),
+          [tuple()],
+          binary(),
+          binary(),
+          non_neg_integer(),
+          binary(),
+          binary(),
+          non_neg_integer()
+        ) :: :ok | :error | :timeout | :fallback_git
+  def replay_branch(_gate, _updates, _name, _email, _seconds, _zone, _stage, _timeout),
+    do: :erlang.nif_error(:nif_not_loaded)
+
   @spec index_encode(V1.Index.t()) :: binary()
   def index_encode(_index), do: :erlang.nif_error(:nif_not_loaded)
 

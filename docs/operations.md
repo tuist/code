@@ -39,6 +39,12 @@ last-writer-wins, which is harmless for packs because two writers of the same
 pack key write the same bytes; a store that rejects it fails every pack above
 the threshold, so check before raising a deployment's pack sizes past it.
 
+Multipart completion returns an opaque ETag from XML text. Code decodes
+standard named and numeric XML entities once, retaining the quotes, so the
+returned token matches the HTTP `ETag` header and can be used for conditional
+requests. This does not expand DTDs or external entities. Unrecognized or
+invalid numeric entities remain literal rather than becoming control bytes.
+
 A `409` from the store on a pack upload means a concurrent write or delete of
 the same key, not that the pack is there. Code checks whether it is, and
 fails the push, for the client to retry, when it is not. Before starting one, Code sends a `HEAD` for the pack so that a
@@ -66,6 +72,47 @@ not, so add an incomplete-upload rule to the bucket's lifecycle policy:
 An abort that itself fails is logged as a warning with
 `operation=multipart_abort`, the object key and the upload identifier, and
 leaves those parts to the same rule.
+
+### Tigris cost reference
+
+[Tigris's published pricing](https://www.tigrisdata.com/pricing/) (checked
+2026-10-05) provides a useful marginal-cost model for the Standard tier:
+$0.02 per binary GB-month, $0.005 per 1,000 Class A requests and $0.0005 per
+1,000 Class B requests, with no egress or Standard retrieval fee. Account-wide
+free allowances apply before billing: 5 GB, 10,000 Class A and 100,000 Class B
+requests monthly. Storage uses average daily peaks, not only end-of-month size.
+Confirm current rates and your agreement before budgeting.
+
+A ref-only update introducing no new objects does not upload a pack or index:
+Rust checks the fixed header of Git's generated pack and a zero object count
+means nothing needs to be logged. `code_git_pack_objects_count{outcome}` records
+`empty`, `nonempty` and `error`; packing also has a `code.git.pack_objects` trace
+span, and failures log `operation=pack_objects`.
+
+A new incremental pack normally needs two Class A writes (pack and index),
+plus the entry and conditional WAL-index writes. Group commit shares the last
+write across a batch, not the pack or entry writes. Preparing an entry can reuse
+its basis's authoritative storage generation instead of paying for another GET;
+publication still validates against the live index and conditional write.
+Agent writes also reuse the replica's authoritative index snapshot as their
+first packing basis after ordinary `ensure_fresh` revalidation. A compaction
+retry reads a new basis. Neither optimization makes local Git refs authoritative
+or changes the default zero staleness budget.
+
+Default read revalidation must not be disabled merely to reduce the bill.
+Tigris lists `304 Not Modified`, `409 Conflict` and `412 Precondition Failed`
+among uncharged responses, so a conditional GET confirming a warm replica is
+not a billed successful GET. Revalidation still costs latency and node resources.
+Count actual S3 requests when estimating costs: multipart initiation/parts,
+listing pages and retries can make one logical Code operation several requests.
+The exported operation counters are not an invoice.
+
+Retained packs, entries and canonical history snapshots continue to consume
+storage. Retention reporting is dry-run only; there is no automatic expiration
+or garbage collector. Do not apply blanket deletion or archive lifecycle rules
+to objects the live index or retained snapshots need. Infrequent Access and
+Archive tiers have different retrieval/minimum-retention rules and cannot be
+substituted for Standard without considering availability and recovery.
 
 ### Behaviour
 
@@ -270,6 +317,47 @@ jobs a sweep started without anyone waiting for the result. Credentials,
 object keys, and request
 bodies are never logged.
 
+## Native object decoding
+
+Native Git object decoding uses the pure-Rust `zlib-rs` streaming DEFLATE backend
+with runtime CPU feature detection. Existing decoded-size budgets, fixed 64 KiB
+streaming chunks, dirty-I/O scheduling, cancellation/deadlines and full SHA-1
+collision-checked object verification remain unchanged. The inflater uses a
+fixed DEFLATE window, not a pack-sized allocation. Packed non-delta blob streams
+use fixed compressed input read-ahead of 4 KiB for objects at most 4 KiB and
+64 KiB otherwise, independent of pack size; output chunks stay at most 64 KiB.
+Loose objects and bounded delta decoding retain their existing buffer policy.
+Streaming blob SHA1 verification uses pure-Rust `sha1dc` with runtime CPU
+feature detection and mandatory collision detection on hardware and scalar
+backends. Finalization errors reject detected collisions; full binary bodies
+remain verified. Bounded delta/tree/commit and native pack-index checks use
+the same `sha1dc` detector; `sha1-checked` remains an independent test oracle,
+not a production verifier. Native/Git source, outcome and latency events retain
+the same contract; search spans include `code.git.grep_hash_backend` with
+`sha1dc` for native work or `git` for fallback.
+The grep telemetry event also carries the same bounded `hash_backend` metadata;
+Prometheus source/outcome labels are unchanged.
+
+## Git cache metadata
+
+Service Git commands now use `Code <code@localhost>` for the default committer
+identity instead of Git guessing the node operator's name and host-derived
+email. This intentionally changes new cache reflog entries; existing entries
+are not rewritten. Reflogs remain disposable cache metadata, not commit
+provenance or the source of truth. An explicitly inherited
+`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` is still honored. Application settings
+`:git_committer_name` and `:git_committer_email` can override them, through the
+same process-local `Code.Config.put_overrides/1` mechanism used by tests and
+replicas. Explicit per-command identities, including `commit_tree`'s author,
+remain authoritative for that command. No commit messages or author fields
+are rewritten.
+
+Initial native branch replay creates both the branch and HEAD reflogs with
+that same identity and local Git-compatible timestamp/offset. It only handles
+a first flat HEAD branch with no existing logs; all later updates retain Git.
+A failure after publishing log metadata is an error, not a successful sync,
+and ordinary WAL revalidation/convergence repairs the disposable cache.
+
 ## Ports
 
 | Port | Surface | Exposure |
@@ -306,20 +394,40 @@ replicas are doing real catch-up work on the read path, and latency will follow.
 | `code_wal_cas_retry_count` | Is there write contention the writer could not absorb? A few are normal; many mean pushes are arriving at several nodes at once, so routing to the preferred writer is not taking effect |
 | `code_wal_append_batch_size` | Pushes absorbed per compare-and-swap. Rising with load is group commit doing its job |
 | `code_wal_append_count`, `code_wal_append_attempts` | Entries committed, and the compare-and-swap attempts each needed |
+| `code_wal_prepare_count{generation_source,outcome}`, `code_wal_prepare_duration{generation_source,outcome}`, `code_wal_prepare_bytes` | Immutable entry preparation volume, latency (seconds) and successful bytes. Generation source is `basis` when an existing authoritative index snapshot supplies it, otherwise `read` for callers without that metadata. Failures log `operation=wal_prepare`; traces include a `code.wal.prepare` span. |
 | `code_wal_ambiguous_commit_count` | A lost compare-and-swap turned out to be this node's own write whose reply was lost. Harmless, but a rising rate means the store is dropping replies |
 | `code_wal_compact_count` | Compactions this node performed |
+| `code_wal_cursor_stale_count` | Speculative writer cursors rejected by conditional publication. They trigger an immediate authoritative reread without consuming the real contention retry budget or backoff. |
+| `code_replica_scratch_sweep_count{outcome}`, `code_replica_scratch_sweep_duration` | Reserved abandoned pack-download/native-init scratch removed at serial startup, `ok`/`error` outcomes and sweep latency. Symlinks and unrelated names are untouched. This sweep must never run against a live node's data directory. |
+| `code_wal_batch_basis_count{source,outcome}`, `code_wal_batch_basis_duration{source,outcome}` | Batch CAS bases from `cursor` or authoritative `read`, with `ok`/`error` outcomes (unknown sources normalize to `other`). The `code.wal.batch_basis` span includes `code.wal.basis_source`; failures log `operation=batch_basis`, `repo_id`, `outcome` and source in `detail`. A writer retains at most 256 KiB of encoded index bytes and a 1 KiB ETag from its own confirmed CAS. Its first batch may seed that cursor from a local replica's already-revalidated, successfully materialized snapshot through a nonblocking peek; the same CAS/rejection rules apply. Each replica retains one bounded encoded slot, with metadata size checked before encoding, not an index in every prepared request or mailbox message. A cursor is speculative, not freshness or authority: stale CAS attempts re-read and revalidate, cached no-change/rejection answers require a fresh read, and ambiguous results clear it. Larger indexes keep the ordinary read path. Default replica read revalidation, closure/incarnation/generation checks and provenance retention are unchanged. |
+| `code_wal_pack_index_hint_count{phase,outcome}`, `code_wal_pack_index_hint_duration{phase,outcome}` | Optional index hint work by `upload`/`download` and `present`/`missing`/`omitted`/`error` (unknown phases normalize to `other`, outcomes to `error`). The `code.wal.pack_index_hint` span includes `code.wal.hint_phase` and `code.wal.hint_outcome`; exceptional transfers log `operation=pack_index_hint`, `repo_id`, `outcome` and phase in `detail`. Hints are omitted when their minimum possible Git fanout/OID/offset/checksum bytes already exceed the pack's bytes (`1064 + 24 * object_count`, v1 SHA1 lower bound). The classifier reads only 12 header bytes and regular-file metadata with no-follow/nonblocking flags on dirty I/O; unsupported metadata retains the existing hint path. Packs remain streamed/verified, local indexes remain intact and missing hints rebuild normally with Git. This saves stored bytes and PUT/GETs for metadata-dominated packs, trading cold rebuild CPU/processes, not eliminating pack validation or provenance. |
 | `code_wal_pack_upload_bytes`, `code_wal_pack_download_bytes` | Pack bytes streamed into and out of the log. Sustained download growth means caches are rebuilt more often than they are used |
 | `code_replica_sync_entries_behind` | How far behind is this node? Persistent non-zero means hints are not arriving, or the store is slow |
 | `code_replica_sync_duration`, `code_replica_sync_packs_downloaded` | Time (seconds) and packs needed to bring a replica into agreement with the log |
 | `code_replica_evict_count` | Cache churn. High values with high sync duration means the working set does not fit |
 | `code_replica_evict_deferred_count` | Evictions postponed because a clone or push still held the repository. They are retried on the reaper's next pass |
+| `code_replica_write_cursor_count{outcome}`, `code_replica_write_cursor_duration{outcome}` | Revalidate a local writer's confirmed bounded encoded snapshot and fully converge before serving, by `not_modified`, `modified`, or `error`. The `code.replica.write_cursor` span has `code.replica.cursor_outcome`; normal refresh failures retain their structured repository/reason logs. A `304` against the writer ETag saves an index body GET but does not prove the local Git cache has the packs or refs: ordinary sync still checks/downloads/installs/converges them. Only same-incarnation writer snapshots strictly ahead of the replica are considered, so peer writes and compaction supersede stale cursors on every subsequent read. Errors fail closed, and replica freshness is never advanced merely by publication. Peeking uses a single replaceable process-local slot, not a blocking writer call or a large message per batch in the replica mailbox. Remote writers or absent/oversized cursors use the normal read path. |
 | `code_replica_rematerialize_count` | Replicas rebuilt from the log because their local copy disappeared. Expected after someone clears the cache; otherwise, look for what is deleting it |
 | `code_replica_prune_packs`, `code_replica_prune_deferred_packs` | Superseded packfiles removed from local disk, and those kept for now because the repository was in use |
+| `code_git_pack_objects_count{outcome}` | Object packing results: `empty` skips pack/index upload, `nonempty` needs one, `error` failed. |
+| `code_git_pack_stage_count{outcome}`, `code_git_pack_stage_duration{outcome}`, `code_git_pack_stage_bytes{outcome}` | Local staging count/latency/bytes by `moved`, `copied`, `copied_cross_device` or `error` (unknown values normalize to `error`). Disposable replica downloads move on the repository filesystem; general callers copy through a dirty-I/O native reader with one fixed 64 KiB buffer (256 KiB for regular files at least 1 MiB), independent of customer pack size, trading a fixed extra 192 KiB per active bulk copy for fewer read/write syscalls, an identity-checked directory descriptor and an exclusively created owned destination descriptor. Source symlinks or unsupported source layouts retain Elixir copying, and cross-filesystem moves fall back to copying. Native copy checks caller liveness between chunks, preserves ordinary source permissions and fails closed on source-size/mtime or staging-directory changes; cancellation only removes its own still-linked output inode, never a replacement leaf. No hard links or pathname-only CoW clones are used. Ownership transfer rejects symlinks and multiply linked sources. Consumed sources may disappear even on failure; an interrupted cache rebuild retries from the WAL. The `code.git.pack_stage` span and failures logged with `operation=pack_stage`, `outcome=error`, `detail` explain staging separately from index validation/publication. |
+| `code_git_pack_index_validate_count{source,outcome}`, `code_git_pack_index_validate_duration{source,outcome}` | Pack index validation by `native`/`elixir` and `valid`/`invalid` (unknown labels normalize to `elixir`/`invalid`). SHA1 v2 metadata up to 4 MiB uses a dirty-I/O native validator with one index and one pack descriptor, fixed 64 KiB hash chunks, cancellation and runtime-dispatched collision-checked SHA1 (`sha1dc`); only the pack header/trailer are read. Oversized or unsupported formats retain the bounded Elixir path. The `code.git.pack_index_validate` span records `code.git.index_source` and `code.git.index_outcome`. Pack digest verification remains a prerequisite; an invalid hint still emits the existing rebuild warning and is rebuilt with Git. |
 | `code_git_pack_index_count{outcome}` | Pack indexes installed; `reused` means the downloaded index was verified and kept; `rebuilt` (none was downloaded) and `rebuilt_invalid` (it did not match the pack) mean `index-pack` had to run |
 | `code_git_requests_in_flight` | Should we scale? See below |
 | `code_git_served_duration{service}`, `code_git_served_bytes{service}` | How long Git protocol requests take (seconds), and how much they send |
 | `code_git_aborted_count{service}` | Clients disconnecting mid-clone |
-| `code_git_command_duration{subcommand,outcome}`, `code_git_command_count{subcommand,outcome}` | Are git plumbing commands slow or failing? `outcome` is `ok`, `error` or `timeout` |
+| `code_git_log_count{source,outcome}`, `code_git_log_duration{source,outcome}` | Commit histories by bounded source (`native`, `git`, `other`) and outcome (`ok`, `error`). The `code.git.log` span identifies the source; failures log `operation=log`, `path`, `outcome` and source in `detail`. Native history is limited to 256 plain linear commits, canonical ASCII names/messages/date fields and no path filtering; shallow repos, merges, extended headers/encoding and log/i18n/mailmap/notes configuration retain Git. Verified commit bodies are capped at 64 KiB each, decoded/delta allocations at 4 MiB cumulative, returned strings at 1 MiB and index snapshots at 4 MiB/64 files; all existing object/delta guards apply. Unsupported or missing/corrupt history falls back completely with the remaining timeout, never returns a partial log. |
+| `code_git_read_file_count{source,outcome}`, `code_git_read_file_duration{source,outcome}` | Blob reads by bounded source (`native`, `git`, `other`) and outcome (`ok`, `error`). The `code.git.read_file` span identifies the source; failures log `operation=read_file`, `path`, `outcome` and source in `detail`. Native plain ASCII relative paths use verified trees and collision-checked blob IDs. Object and delta-instruction bodies/base/result sizes are capped at 512 KiB each, all expanded/instruction/result allocations at 4 MiB cumulative, compressed input at 1 MiB, indexes at 4 MiB/64 and chains/path depth at 64. Delta base/result size fields are checked before following any base; copy/insert offsets and lengths are checked before growing output. Large or unsupported paths/objects/layouts retain Git. This caps only native work, not the existing binary-returning Git fallback for large blobs; no whole-pack or unbounded delta-base buffering is introduced. |
+| `code_git_tree_count{source,outcome}`, `code_git_tree_duration{source,outcome}` | Root tree listings by bounded source (`native`, `git`, `other`) and outcome (`ok`, `error`). The `code.git.tree` span identifies the source; failures log `operation=list_tree`, `path`, `outcome` and source in `detail`. Native listings use verified loose/non-delta trees capped at 512 KiB each/4 MiB cumulative, 4096 output entries/1 MiB strings, 8192 visited entries, 2048-byte paths and depth 64. Blob sizes use metadata only, including bounded delta header/base-type traversal, never blob or delta-base bodies. Owned index snapshots remain capped at 4 MiB/64 indexes. Non-root pathspecs, tree/commit deltas, Unicode paths, large/uncertain/corrupt layouts and the resolver's unsupported features retain Git; no partial listings are returned. |
+| `code_git_resolve_count{source,outcome}`, `code_git_resolve_duration{source,outcome}` | Commit resolution by bounded source (`native`, `git`, `other`) and outcome (`ok`, `error`). The `code.git.resolve` span identifies the source; failures log `operation=resolve`, `path`, `outcome` and source in `detail`. Native resolution supports HEAD, exact full refs and full lowercase SHA1 IDs in plain bare caches; it validates a small loose or non-delta commit's syntax and collision-checked object ID. Decompressed commit bodies are capped at 64 KiB, compressed input at 1 MiB, index work at 4 MiB/64 indexes, and metadata leaf reads at 1024 bytes. Tags, deltas, revision expressions, missing/corrupt/large objects, SHA256, packed refs, includes, replacements, grafts, alternates, remotes and MIDX retain Git with the remaining timeout. No whole-pack or delta-base allocation. This is only revision resolution, not authorization or a substitute for the normal WAL read revalidation. |
+| `code_git_replay_refs_count{source,outcome}`, `code_git_replay_refs_duration{source,outcome}` | Replica reference convergence by bounded source (`native`, `git`, `other`) and outcome (`ok`, `error`). The `code.git.replay_refs` span identifies the source; failures log `operation=replay_refs`, `path`, `outcome` and source in `detail`. Replay acquires a physical-inode-keyed native gate before computing ref changes; successors wait for outstanding dirty-I/O work even if its caller died. The weak registry is capped at 4096 live roots and pruned; waits are cancellable/deadlined, with exponential polling backoff from 5 ms to a 100 ms cap. Unavailable admission fails closed rather than assuming that no predecessor exists. One/two flat SHA1 tag creates/deletes with ordinary configuration, no hooks/tag reflogs/packed refs and verified commit targets may use native replay. A first flat HEAD branch with no existing logs may also use native replay: branch and HEAD locks are held while both initial reflogs are staged under private directory descriptors and published without replacing anything, followed by the branch ref. Existing logs, non-HEAD branches, updates and inherited custom reflog dates/actions retain Git. All tag locks are acquired before checking old values/preparing files, publication and cleanup are directory-fd-anchored, lock cleanup checks ownership and is disarmed after rename. Native replay root or descendant-directory replacement, including before its eligibility/fallback checks, and partial publication fail closed and cannot advance the cached WAL position. Final descriptor/path-chain checks also reject detached ref or log directories. Other branches, larger batches, updates, unsupported targets/configuration and uncertainty retain supervised Git after native work has finished. Direct/ingest `update_refs` and old-value CAS checks are unchanged; the gate does not replace WAL revalidation, closure, CAS or provenance. |
+| `code_git_grep_count{source,outcome}`, `code_git_grep_duration{source,outcome}` | Tree searches by bounded source (`native`, `git`, `other`) and outcome (`ok`, `error`). The `code.git.grep` span identifies the source; failures log `operation=grep`, `path`, `outcome` and source in `detail`. Native search handles plain ASCII fixed case-sensitive patterns without path filtering and at most 256 matches. Non-delta blobs stream with one 64 KiB buffer, capped at 64 MiB each/128 MiB total; small deltas retain 512 KiB object/base/result and 4 MiB decode bounds. All scanned blobs are SHA1 collision-checked even when binary, never skipped merely because an unverified prefix contains NUL. Streams and bounded deltas use the runtime-dispatched pure-Rust `sha1dc` detector. `code.git.grep_hash_backend` distinguishes `sha1dc` and `git` without introducing metric labels. Lines cap at 64 KiB and output at 1 MiB. Tree/index/timeout/cancellation bounds still apply. Attribute files or grep/diff/attribute configuration, rich revisions, regex/case/path options, unsupported/corrupt/oversized objects and uncertain encodings retain Git. Installation/global attribute paths are discovered lazily through an observed `git var -l` command and kept in a single bounded installation/environment-fingerprinted slot, not inferred from package prefixes; file existence is rechecked each search and no configuration/content is cached. This adds one initial Git discovery command on supported installations; steady-state plain searches avoid grep launches. Its fingerprint includes the effective temporary HOME used by Git, not merely the operator's HOME. |
+| `code_git_init_bare_count{source,outcome}`, `code_git_init_bare_duration{source,outcome}` | Bare cache initialization by bounded source (`native`, `git`, `other`) and outcome (`ok`, `error`). The `code.git.init_bare` span identifies the source; failures log `operation=init_bare`, `path`, `outcome` and source in `detail`. Fresh plain SHA1 branch caches on Linux/macOS can be assembled under a private sibling with directory-fd-anchored writes and capability probes, then atomically published without replacing any existing directory. The standard configuration check still runs. Existing paths, unsupported targets/formats/environment or publication uncertainty retain Git's private-template init. Native initialization never writes into an existing cache or overwrites a replacement, and published-stage cleanup is disarmed. Its small bounded layout is disposable, not a new source of truth; subsequent sync still installs WAL packs/refs normally. |
+| `code_git_closure_walk_count{source,outcome}`, `code_git_closure_walk_duration{source,outcome}` | Reachability walks by bounded source (`native`, `git`, `other`) and outcome (`ok`, `error`). The `code.git.closure_walk` span identifies the source; failures log `operation=closure_walk`, `path`, `outcome` and source in `detail`. No-exclusion/no-overlay plain SHA1 walks may use capped native commit/tree decoding and metadata-only blob checks. Native walks cap IDs and pending work at 8192, decoded metadata/deltas at 4 MiB, commit bodies at 64 KiB and tree bodies at 512 KiB; verified object hashes, index bounds, deadlines and caller cancellation apply. Gitlinks are skipped. Shallow histories, exclusions, quarantine union walks, unsupported or corrupt layouts fall back completely to Git with the remaining timeout. IDs go straight to an exclusively created scratch file, not a repository-scale VM list. Presence is still checked independently against the provided object directory, never inferred from the walk's local cache. WAL basis/CAS/closure rules are unchanged. |
+| `code_git_closure_presence_count{source,outcome}`, `code_git_closure_presence_duration{source,outcome}` | Nonempty provided-object checks, by bounded source (`native`, `git`, `other`) and outcome (`ok`, `error`). The `code.git.closure_presence` span identifies the source; failures log `operation=closure_presence`, `path`, `outcome` and source in `detail`. The independently observed reachability walk is native or Git; its local object availability never proves provision. A native presence-only path uses owned SHA1 v2 index snapshots capped at 4 MiB total/64 indexes, runtime-dispatched `sha1dc` collision-checked index checksums, fanout/order/offset checks and fixed pack header/footer checks. It never reads pack contents. Loose objects, alternates, replacements, remotes, MIDX, unsupported formats, corruption and oversized metadata fall back to Git using the remaining timeout. Fallback stdout is streamed to a scratch file and scanned with a 64 KiB buffer plus an eight-byte suffix, not buffered in the VM. Scratch is removed by the existing scoped cleanup. This does not replace pack validation, provenance or WAL CAS checks. |
+| `code_git_refs_count{source,outcome}`, `code_git_refs_duration{source,outcome}` | Complete local ref listings and latency. The `code.git.refs` span identifies `native` or `git`; labels normalize unknown sources to `other` and outcomes to `ok`/`error`. A read-only dirty-I/O scanner handles ordinary loose ASCII SHA1 refs: each leaf has a 128-byte limit plus one sentinel byte, traversal at 8,192 entries/64 levels, and output at 4,096 refs/1 MiB. It returns a complete map or falls back, never truncates. Packed/symbolic/non-ASCII/SHA256 refs, includes, inherited discovery/namespace overrides, symlinks and uncertain layouts use Git. Failures log `path`, `operation=refs`, `outcome` and the source in `detail`. This lists cache state for replay, not authoritative repository state; WAL revalidation/publication are unchanged. |
+| `code_git_configuration_count{source,outcome}`, `code_git_configuration_duration{source,outcome}` | Bare cache configuration volume, failures and latency, including native checks that launch no Git command. `source` is `native`, `git` or `other`; `outcome` is `ok` or `error`. The `code.git.configure` trace span records the source; failures log `path`, `operation=configure_bare`, `outcome=error` and the source in `detail`, without config contents. |
+| `code_git_command_duration{subcommand,outcome}`, `code_git_command_count{subcommand,outcome}` | Are git plumbing commands slow or failing? `outcome` is `ok`, `error` or `timeout`. Cold caches import Code's settings through a private Git init template; new plain caches with valid branch targets import both settings and `HEAD`, needing only one `init` command plus native configuration/HEAD checks. Non-branch or invalid targets and changed reinitialization targets still go through Git's validating `symbolic-ref` write. Sync checks plain local configuration through a bounded Rust Git-config parser (64 KiB input cap) on a dirty I/O scheduler. Includes, conditional includes, worktree configuration, inherited command configuration, oversized files and uncertain parses fall back to Git's effective `config` read and normal repairs. Duplicate settings are never accepted merely because their last value matches. After repairs, Git's effective configuration is read again; if an included or inherited override still prevents the required singleton values, configuration fails closed with `unsafe_git_configuration` rather than serving private refs. Valid byte-exact `HEAD` matches use a Rust file comparison with a 1 KiB buffer on a dirty I/O scheduler; unchanged targets do not launch `symbolic-ref`, and mismatches/errors still use Git's validating write. |
 | `code_push_committed_duration`, `code_push_committed_count` | Time (seconds) from receiving a push to it being durable, and how many landed |
 | `code_push_rejected_count{reason}` | `non_fast_forward` is users; `storage`, `contention`, `overloaded` and `timeout` are yours (`timeout` pushes may still have committed). `incomplete_push` is a push naming objects it neither carried nor could rely on the log for; `deleted` is a write to a repository being deleted |
 | `code_push_closure_check_duration{outcome}` | Time spent proving a push carries every object its new refs need. `incomplete` is a push that was refused for it |
@@ -329,6 +437,7 @@ replicas are doing real catch-up work on the read path, and latency will follow.
 | `code_maintenance_job_duration{kind,outcome}`, `code_maintenance_job_count{kind,outcome}` | Is maintenance keeping up, and is any of it failing? Counts every job, including unattended ones; `outcome` is `ok`, `not_due`, `error` or `crashed` |
 | `code_object_store_request_duration_seconds{operation,outcome}` | Is the source of truth slow or failing? |
 | `code_object_store_request_count{operation,outcome}` | Is object-store traffic or a particular failure outcome rising? |
+| `code_object_store_digest_duration_seconds{outcome}`, `code_object_store_digest_count{outcome}`, `code_object_store_digest_bytes` | Local file SHA-256 latency, failures and successful bytes. Runs in Rust on dirty I/O schedulers with a 64 KiB buffer; each callback processes at most 4 MiB before returning to Elixir. The owner-scoped resource retains the descriptor/hash state across calls, checks caller liveness and a 30-minute deadline between chunks, and closes on completion/error or resource destruction; no file chunks enter BEAM memory. Digest work also has a `code.object_store.digest` trace span. |
 | `code_http_request_duration_seconds{listener,method,status}` | Is any public, hook, or administration listener slow or returning errors? `status` is a response class such as `5xx` |
 | `code_http_request_count{listener,method,status}`, `code_http_request_bytes{listener}` | Request volume, and response bytes sent |
 | `code_http_exception_count{listener}` | Did a request terminate unexpectedly before it could return a response? |

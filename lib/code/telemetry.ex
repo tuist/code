@@ -35,6 +35,28 @@ defmodule Code.Telemetry do
     * `[:code, :http, :exception]` — an unhandled request exception
     * `[:code, :push, :committed]` — `duration_ms`, `refs`, `packs`
     * `[:code, :push, :rejected]` — meta `reason`
+    * `[:code, :git, :log]` — `duration_us`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); commit histories
+    * `[:code, :git, :read_file]` — `duration_us`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); blob reads
+    * `[:code, :git, :tree]` — `duration_us`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); tree listings
+    * `[:code, :git, :resolve]` — `duration_us`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); commit resolution
+    * `[:code, :git, :replay_refs]` — `duration_us`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); reference convergence
+    * `[:code, :git, :grep]` — `duration_us`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); tree searches
+    * `[:code, :git, :init_bare]` — `duration_us`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); bare cache initialization
+    * `[:code, :git, :closure_walk]` — `duration_us`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); reachability walks
+    * `[:code, :git, :closure_presence]` — `duration_us`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); nonempty provided-object checks
+    * `[:code, :git, :refs]` — `duration_us`, `refs`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); complete listings only
+    * `[:code, :git, :configuration]` — `duration_us`, bounded meta `source`
+      (`native`, `git`), `outcome` (`ok`, `error`); includes no-process checks
     * `[:code, :git, :command]` — `duration_us`, meta `subcommand`, `status`
       (exported with a bounded `outcome` of `ok`, `error` or `timeout`)
     * `[:code, :writer, :fallback]` — meta `reason` (`exception` or `exit`);

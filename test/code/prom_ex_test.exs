@@ -32,11 +32,39 @@ defmodule Code.PromExTest do
     code_cluster_observed_size
     code_git_aborted_count
     code_git_command_count
+    code_git_replay_refs_count
+    code_git_replay_refs_duration
+    code_git_grep_count
+    code_git_grep_duration
+    code_git_init_bare_count
+    code_git_init_bare_duration
+    code_git_closure_walk_count
+    code_git_closure_walk_duration
+    code_git_closure_presence_count
+    code_git_closure_presence_duration
     code_git_command_duration
+    code_git_configuration_count
+    code_git_configuration_duration
     code_git_encoding_rejected_count
     code_git_request_decoded_bytes
+    code_git_pack_stage_count
+    code_git_pack_stage_duration
+    code_git_pack_stage_bytes
+    code_git_pack_index_validate_count
+    code_git_pack_index_validate_duration
     code_git_pack_index_count
+    code_git_pack_objects_count
     code_git_requests_in_flight
+    code_git_refs_count
+    code_git_refs_duration
+    code_git_log_count
+    code_git_log_duration
+    code_git_read_file_count
+    code_git_read_file_duration
+    code_git_resolve_count
+    code_git_resolve_duration
+    code_git_tree_count
+    code_git_tree_duration
     code_git_served_bytes
     code_git_served_duration
     code_http_exception_count
@@ -47,6 +75,9 @@ defmodule Code.PromExTest do
     code_maintenance_job_duration
     code_mcp_request_count
     code_mcp_request_duration
+    code_object_store_digest_bytes
+    code_object_store_digest_count
+    code_object_store_digest_duration_seconds
     code_object_store_multipart_upload_bytes
     code_object_store_multipart_upload_count
     code_object_store_multipart_upload_parts
@@ -67,9 +98,13 @@ defmodule Code.PromExTest do
     code_replica_prune_deferred_packs
     code_replica_prune_packs
     code_replica_rematerialize_count
+    code_replica_scratch_sweep_count
+    code_replica_scratch_sweep_duration
     code_replica_sync_duration
     code_replica_sync_entries_behind
     code_replica_sync_packs_downloaded
+    code_replica_write_cursor_count
+    code_replica_write_cursor_duration
     code_retention_operation_count
     code_retention_operation_duration
     code_retention_report_eligible_bytes
@@ -77,10 +112,18 @@ defmodule Code.PromExTest do
     code_wal_append_attempts
     code_wal_append_batch_size
     code_wal_append_count
+    code_wal_batch_basis_count
+    code_wal_batch_basis_duration
     code_wal_cas_retry_count
+    code_wal_cursor_stale_count
     code_wal_compact_count
     code_wal_pack_download_bytes
     code_wal_pack_upload_bytes
+    code_wal_pack_index_hint_count
+    code_wal_pack_index_hint_duration
+    code_wal_prepare_bytes
+    code_wal_prepare_count
+    code_wal_prepare_duration
     code_wal_read_count
     code_wal_read_duration
     code_writer_fallback_count
@@ -124,6 +167,7 @@ defmodule Code.PromExTest do
         method: :get,
         status: 0,
         operation: :get,
+        generation_source: :basis,
         outcome: :ok,
         reason: :overloaded,
         subcommand: "cat-file",
@@ -154,6 +198,16 @@ defmodule Code.PromExTest do
   test "the exporter emits exactly the documented series", %{name: name, metrics: metrics} do
     emit_every_event(metrics)
     assert scraped_names(name) == Enum.sort(@expected)
+  end
+
+  test "configuration labels remain bounded" do
+    assert Plugin.git_configuration_tags(%{source: :native, outcome: :ok}) == %{source: :native, outcome: :ok}
+    assert Plugin.git_configuration_tags(%{source: :git, outcome: :error}) == %{source: :git, outcome: :error}
+
+    assert Plugin.git_configuration_tags(%{source: "unbounded path", outcome: "unknown"}) == %{
+             source: :other,
+             outcome: :error
+           }
   end
 
   test "git command outcomes are bounded to ok, error and timeout", %{name: name} do

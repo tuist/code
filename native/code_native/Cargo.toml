@@ -18,6 +18,23 @@ crate-type = ["cdylib"]
 [dependencies]
 rustler = "0.36"
 prost = "0.13"
+sha2 = "0.11"
+gix-config = { version = "0.60", features = ["sha1"] }
+gix-validate = "0.11"
+bstr = { version = "1", default-features = false, features = ["std"] }
+libc = "0.2"
+# Hardware acceleration with mandatory collision detection, not plain SHA1.
+sha1dc = "=0.1.4"
+# Pure-Rust optimized streaming DEFLATE; retain runtime CPU detection.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+gix-object = { version = "0.64", features = ["sha1"] }
+gix-hash = { version = "0.26", features = ["sha1"] }
+gix-date = "0.16"
+
+[dev-dependencies]
+tempfile = "3"
+# Independent collision/digest oracle, not shipped in the NIF.
+sha1-checked = "0.10"
 
 [build-dependencies]
 prost-build = "0.13"

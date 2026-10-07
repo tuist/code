@@ -145,6 +145,27 @@ defmodule Code.PromEx.Plugin do
   defp object_store_metrics do
     Event.build(:code_object_store_event_metrics, [
       distribution(
+        [:code, :object_store, :digest, :duration_seconds],
+        event_name: [:code, :object_store, :digest],
+        measurement: :duration_us,
+        description: "Local SHA-256 file hashing duration, using a bounded Rust buffer.",
+        unit: {:microsecond, :second},
+        tags: [:outcome],
+        reporter_options: [buckets: [0.001, 0.005, 0.025, 0.1, 0.5, 1, 5, 30, 300]]
+      ),
+      counter(
+        [:code, :object_store, :digest, :count],
+        event_name: [:code, :object_store, :digest],
+        description: "Local file digest attempts by bounded outcome.",
+        tags: [:outcome]
+      ),
+      sum(
+        [:code, :object_store, :digest, :bytes],
+        event_name: [:code, :object_store, :digest],
+        measurement: :bytes,
+        description: "Bytes hashed successfully without allocating BEAM file chunks."
+      ),
+      distribution(
         [:code, :object_store, :request, :duration_seconds],
         event_name: [:code, :object_store, :request],
         measurement: :duration_us,
@@ -185,6 +206,27 @@ defmodule Code.PromEx.Plugin do
 
   defp wal_metrics do
     Event.build(:code_wal_event_metrics, [
+      counter(
+        [:code, :wal, :prepare, :count],
+        event_name: [:code, :wal, :prepare],
+        description: "Immutable entry preparation attempts, by generation source and outcome.",
+        tags: [:generation_source, :outcome]
+      ),
+      distribution(
+        [:code, :wal, :prepare, :duration],
+        event_name: [:code, :wal, :prepare],
+        measurement: :duration_us,
+        unit: {:microsecond, :second},
+        description: "Entry encoding, generation selection and immutable upload latency.",
+        tags: [:generation_source, :outcome],
+        reporter_options: [buckets: [0.001, 0.005, 0.025, 0.1, 0.5, 1, 5, 30]]
+      ),
+      sum(
+        [:code, :wal, :prepare, :bytes],
+        event_name: [:code, :wal, :prepare],
+        measurement: :bytes,
+        description: "Successfully prepared entry bytes (including immutable deduplication)."
+      ),
       distribution(
         [:code, :wal, :read, :duration],
         event_name: [:code, :wal, :read],
@@ -212,6 +254,23 @@ defmodule Code.PromEx.Plugin do
         description: "Compare-and-swap attempts needed to commit an entry.",
         reporter_options: [buckets: [1, 2, 3, 5, 8, 12]]
       ),
+      counter(
+        [:code, :wal, :batch_basis, :count],
+        event_name: [:code, :wal, :batch_basis],
+        description: "Writer batch CAS bases from a bounded cursor or authoritative read.",
+        tags: [:source, :outcome],
+        tag_values: &batch_basis_tags/1
+      ),
+      distribution(
+        [:code, :wal, :batch_basis, :duration],
+        event_name: [:code, :wal, :batch_basis],
+        measurement: :duration_us,
+        unit: {:microsecond, :second},
+        description: "Batch CAS basis decode/read latency.",
+        tags: [:source, :outcome],
+        tag_values: &batch_basis_tags/1,
+        reporter_options: [buckets: [0.001, 0.005, 0.025, 0.1, 0.5, 1, 5, 30]]
+      ),
       distribution(
         [:code, :wal, :append_batch, :size],
         event_name: [:code, :wal, :append_batch],
@@ -220,6 +279,11 @@ defmodule Code.PromEx.Plugin do
           "Entries committed per compare-and-swap. This is group commit working: " <>
             "rising with load is the system absorbing contention rather than retrying through it.",
         reporter_options: [buckets: [1, 2, 4, 8, 16, 32, 64]]
+      ),
+      counter(
+        [:code, :wal, :cursor_stale, :count],
+        event_name: [:code, :wal, :cursor_stale],
+        description: "Speculative cursor bases rejected before an immediate authoritative reread."
       ),
       counter(
         [:code, :wal, :cas_retry, :count],
@@ -237,6 +301,23 @@ defmodule Code.PromEx.Plugin do
         [:code, :wal, :compact, :count],
         event_name: [:code, :wal, :compact],
         description: "Compactions performed by this node."
+      ),
+      counter(
+        [:code, :wal, :pack_index_hint, :count],
+        event_name: [:code, :wal, :pack_index_hint],
+        description: "Optional pack index hints uploaded, downloaded, absent, omitted or failed.",
+        tags: [:phase, :outcome],
+        tag_values: &pack_hint_tags/1
+      ),
+      distribution(
+        [:code, :wal, :pack_index_hint, :duration],
+        event_name: [:code, :wal, :pack_index_hint],
+        measurement: :duration_us,
+        unit: {:microsecond, :second},
+        description: "Optional pack index hint planning/transfer latency.",
+        tags: [:phase, :outcome],
+        tag_values: &pack_hint_tags/1,
+        reporter_options: [buckets: [0.001, 0.005, 0.025, 0.1, 0.5, 1, 5, 30]]
       ),
       sum(
         [:code, :wal, :pack_upload, :bytes],
@@ -257,8 +338,79 @@ defmodule Code.PromEx.Plugin do
     ])
   end
 
+  defp index_validate_tags(metadata) do
+    %{
+      source: if(metadata[:source] in [:native, :elixir], do: metadata[:source], else: :elixir),
+      outcome: if(metadata[:outcome] == :valid, do: :valid, else: :invalid)
+    }
+  end
+
+  defp pack_stage_tags(metadata) do
+    %{
+      outcome:
+        if(metadata[:outcome] in [:moved, :copied, :copied_cross_device, :error],
+          do: metadata[:outcome],
+          else: :error
+        )
+    }
+  end
+
+  defp pack_hint_tags(metadata) do
+    %{
+      phase: if(metadata[:phase] in [:upload, :download], do: metadata[:phase], else: :other),
+      outcome:
+        if(metadata[:outcome] in [:present, :missing, :omitted, :error], do: metadata[:outcome], else: :error)
+    }
+  end
+
+  defp batch_basis_tags(metadata) do
+    %{
+      source: if(metadata[:source] in [:cursor, :read], do: metadata[:source], else: :other),
+      outcome: if(metadata[:outcome] == :ok, do: :ok, else: :error)
+    }
+  end
+
+  defp write_cursor_tags(metadata) do
+    %{
+      outcome:
+        if(metadata[:outcome] in [:not_modified, :modified, :error], do: metadata[:outcome], else: :error)
+    }
+  end
+
   defp replica_metrics do
     Event.build(:code_replica_event_metrics, [
+      counter(
+        [:code, :replica, :scratch_sweep, :count],
+        event_name: [:code, :replica, :scratch_sweep],
+        tags: [:outcome],
+        tag_values: fn meta -> %{outcome: if(meta[:outcome] == :ok, do: :ok, else: :error)} end,
+        description: "Abandoned reserved scratch directories removed or failed at startup."
+      ),
+      distribution(
+        [:code, :replica, :scratch_sweep, :duration],
+        event_name: [:code, :replica, :scratch_sweep_duration],
+        measurement: :duration_us,
+        unit: {:microsecond, :second},
+        description: "Startup cache-scratch sweep latency.",
+        reporter_options: [buckets: [0.001, 0.005, 0.025, 0.1, 0.5, 1, 5, 30]]
+      ),
+      counter(
+        [:code, :replica, :write_cursor, :count],
+        event_name: [:code, :replica, :write_cursor],
+        description: "Confirmed writer cursor revalidation and full replica convergence.",
+        tags: [:outcome],
+        tag_values: &write_cursor_tags/1
+      ),
+      distribution(
+        [:code, :replica, :write_cursor, :duration],
+        event_name: [:code, :replica, :write_cursor],
+        measurement: :duration_us,
+        unit: {:microsecond, :second},
+        description: "Revalidate and materialize a confirmed bounded writer snapshot.",
+        tags: [:outcome],
+        tag_values: &write_cursor_tags/1,
+        reporter_options: [buckets: [0.001, 0.005, 0.025, 0.1, 0.5, 1, 5, 30]]
+      ),
       distribution(
         [:code, :replica, :sync, :duration],
         event_name: [:code, :replica, :sync],
@@ -306,6 +458,23 @@ defmodule Code.PromEx.Plugin do
         event_name: [:code, :replica, :prune_deferred],
         measurement: :packs,
         description: "Superseded packfiles kept because the repository was in use."
+      ),
+      counter(
+        [:code, :git, :pack_index_validate, :count],
+        event_name: [:code, :git, :pack_index_validate],
+        description: "Bounded pack index validations by source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &index_validate_tags/1
+      ),
+      distribution(
+        [:code, :git, :pack_index_validate, :duration],
+        event_name: [:code, :git, :pack_index_validate],
+        measurement: :duration_us,
+        unit: {:microsecond, :second},
+        description: "Pack index metadata/hash validation latency.",
+        tags: [:source, :outcome],
+        tag_values: &index_validate_tags/1,
+        reporter_options: [buckets: [0.0001, 0.001, 0.01, 0.1, 1, 10]]
       ),
       counter(
         [:code, :git, :pack_index, :count],
@@ -397,8 +566,234 @@ defmodule Code.PromEx.Plugin do
   defp git_outcome(:timeout), do: :timeout
   defp git_outcome(_status), do: :error
 
+  @doc false
+  def git_configuration_tags(meta) do
+    %{
+      source: if(meta[:source] in [:native, :git], do: meta[:source], else: :other),
+      outcome: if(meta[:outcome] == :ok, do: :ok, else: :error)
+    }
+  end
+
   defp git_metrics do
     Event.build(:code_git_event_metrics, [
+      counter(
+        [:code, :git, :pack_stage, :count],
+        event_name: [:code, :git, :pack_stage],
+        description: "Pack staging attempts: moved, copied, copied_cross_device or error.",
+        tags: [:outcome],
+        tag_values: &pack_stage_tags/1
+      ),
+      distribution(
+        [:code, :git, :pack_stage, :duration],
+        event_name: [:code, :git, :pack_stage],
+        measurement: :duration_us,
+        unit: {:microsecond, :second},
+        description: "Local pack staging latency, excluding index validation/publication.",
+        tags: [:outcome],
+        tag_values: &pack_stage_tags/1,
+        reporter_options: [buckets: [0.001, 0.01, 0.1, 1, 10, 60, 300]]
+      ),
+      sum(
+        [:code, :git, :pack_stage, :bytes],
+        event_name: [:code, :git, :pack_stage],
+        measurement: :bytes,
+        description: "Successfully staged pack bytes, by move or copy.",
+        tags: [:outcome],
+        tag_values: &pack_stage_tags/1
+      ),
+      counter(
+        [:code, :git, :log, :count],
+        event_name: [:code, :git, :log],
+        description: "Commit histories by bounded source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :log, :duration],
+        event_name: [:code, :git, :log],
+        measurement: :duration_us,
+        description: "Commit history latency, native or Git fallback.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.001, 0.01, 0.1, 1, 10, 60, 600]]
+      ),
+      counter(
+        [:code, :git, :read_file, :count],
+        event_name: [:code, :git, :read_file],
+        description: "Blob reads by bounded source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :read_file, :duration],
+        event_name: [:code, :git, :read_file],
+        measurement: :duration_us,
+        description: "Blob read latency, bounded native or Git fallback.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.001, 0.01, 0.1, 1, 10, 60, 600]]
+      ),
+      counter(
+        [:code, :git, :tree, :count],
+        event_name: [:code, :git, :tree],
+        description: "Tree listings by bounded source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :tree, :duration],
+        event_name: [:code, :git, :tree],
+        measurement: :duration_us,
+        description: "Tree listing latency, native or Git fallback.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.001, 0.01, 0.1, 1, 10, 60, 600]]
+      ),
+      counter(
+        [:code, :git, :resolve, :count],
+        event_name: [:code, :git, :resolve],
+        description: "Commit resolution checks by bounded source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :resolve, :duration],
+        event_name: [:code, :git, :resolve],
+        measurement: :duration_us,
+        description: "Commit resolution latency, native or Git fallback.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.001, 0.01, 0.1, 1, 10, 60, 600]]
+      ),
+      counter(
+        [:code, :git, :replay_refs, :count],
+        event_name: [:code, :git, :replay_refs],
+        description: "Reference convergence by bounded source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :replay_refs, :duration],
+        event_name: [:code, :git, :replay_refs],
+        measurement: :duration_us,
+        description: "Reference convergence latency including pending native replay.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.001, 0.01, 0.1, 1, 10, 60, 600]]
+      ),
+      counter(
+        [:code, :git, :grep, :count],
+        event_name: [:code, :git, :grep],
+        description: "Tree searches by bounded source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :grep, :duration],
+        event_name: [:code, :git, :grep],
+        measurement: :duration_us,
+        description: "Tree search latency, native or Git fallback.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.001, 0.01, 0.1, 1, 10, 60, 600]]
+      ),
+      counter(
+        [:code, :git, :init_bare, :count],
+        event_name: [:code, :git, :init_bare],
+        description: "Bare cache initialization by bounded source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :init_bare, :duration],
+        event_name: [:code, :git, :init_bare],
+        measurement: :duration_us,
+        description: "Bare cache initialization latency, native or Git fallback.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.001, 0.01, 0.1, 1, 10, 60, 600]]
+      ),
+      counter(
+        [:code, :git, :closure_walk, :count],
+        event_name: [:code, :git, :closure_walk],
+        description: "Reachability walks by bounded source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :closure_walk, :duration],
+        event_name: [:code, :git, :closure_walk],
+        measurement: :duration_us,
+        description: "Reachability walk latency, native or streamed Git fallback.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.001, 0.01, 0.1, 1, 10, 60, 600]]
+      ),
+      counter(
+        [:code, :git, :closure_presence, :count],
+        event_name: [:code, :git, :closure_presence],
+        description: "Nonempty closure presence checks by bounded source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :closure_presence, :duration],
+        event_name: [:code, :git, :closure_presence],
+        measurement: :duration_us,
+        description: "Closure presence check latency, native or streamed Git fallback.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.001, 0.01, 0.1, 1, 10, 60, 600]]
+      ),
+      counter(
+        [:code, :git, :refs, :count],
+        event_name: [:code, :git, :refs],
+        description: "Complete local ref listings by bounded source/outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :refs, :duration],
+        event_name: [:code, :git, :refs],
+        measurement: :duration_us,
+        description: "Local ref listing latency including native and Git fallback paths.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.0001, 0.001, 0.01, 0.05, 0.25, 1, 5]]
+      ),
+      counter(
+        [:code, :git, :configuration, :count],
+        event_name: [:code, :git, :configuration],
+        description: "Bare cache configuration checks, by bounded source and outcome.",
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1
+      ),
+      distribution(
+        [:code, :git, :configuration, :duration],
+        event_name: [:code, :git, :configuration],
+        measurement: :duration_us,
+        description: "Bare cache configuration check/repair latency.",
+        unit: {:microsecond, :second},
+        tags: [:source, :outcome],
+        tag_values: &git_configuration_tags/1,
+        reporter_options: [buckets: [0.0001, 0.001, 0.01, 0.05, 0.25, 1, 5]]
+      ),
+      counter(
+        [:code, :git, :pack_objects, :count],
+        event_name: [:code, :git, :pack_objects],
+        description: "Object packing outcomes: empty (no objects to upload), nonempty or error.",
+        tags: [:outcome]
+      ),
       distribution(
         [:code, :git, :command, :duration],
         event_name: [:code, :git, :command],
