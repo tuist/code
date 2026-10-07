@@ -24,7 +24,7 @@ gix-validate = "0.11"
 bstr = { version = "1", default-features = false, features = ["std"] }
 libc = "0.2"
 # Hardware acceleration with mandatory collision detection, not plain SHA1.
-sha1dc = "=0.1.4"
+sha1dc = "=0.1.5"
 # Pure-Rust optimized streaming DEFLATE; retain runtime CPU detection.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 gix-object = { version = "0.64", features = ["sha1"] }
