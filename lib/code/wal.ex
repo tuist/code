@@ -47,6 +47,7 @@ defmodule Code.WAL do
 
   alias Code.Config
   alias Code.ObjectStore
+  alias Code.WAL.Cursor
   alias Code.WAL.Entry
   alias Code.WAL.Index
 
@@ -66,7 +67,12 @@ defmodule Code.WAL do
   the object ids the omission was relative to, `epoch` and `incarnation` the
   index they came from. See `check_basis/2` for how it is judged.
   """
-  @type basis :: %{incarnation: String.t(), epoch: non_neg_integer(), tips: [String.t()]}
+  @type basis :: %{
+          required(:incarnation) => String.t(),
+          required(:epoch) => non_neg_integer(),
+          required(:tips) => [String.t()],
+          optional(:storage_generation) => String.t()
+        }
 
   @typedoc """
   An entry whose object is already stored, ready to be installed in the index.
@@ -352,42 +358,71 @@ defmodule Code.WAL do
   @spec append_batch(repo_id(), [prepared()]) ::
           {:ok, [{:ok, %{seq: non_neg_integer(), epoch: non_neg_integer()}} | {:error, term()}]}
           | {:error, term()}
-  def append_batch(repo_id, prepared), do: append_batch(repo_id, prepared, @cas_attempts)
+  def append_batch(repo_id, prepared) do
+    case append_batch_cursor(repo_id, prepared, nil) do
+      {:ok, results, _cursor} -> {:ok, results}
+      error -> error
+    end
+  end
 
-  defp append_batch(_repo_id, _prepared, 0), do: {:error, :cas_exhausted}
+  @doc false
+  @spec append_batch_cursor(repo_id(), [prepared()], Cursor.t() | nil) ::
+          {:ok, list(), Cursor.t() | nil} | {:error, term()}
+  def append_batch_cursor(repo_id, prepared, cursor),
+    do: append_batch_cursor(repo_id, prepared, @cas_attempts, cursor)
 
-  defp append_batch(repo_id, prepared, attempts) do
-    with {:ok, index, etag} <- fetch_live(repo_id) do
+  defp append_batch_cursor(_repo_id, _prepared, 0, _cursor), do: {:error, :cas_exhausted}
+
+  defp append_batch_cursor(repo_id, prepared, attempts, cursor) do
+    {source, basis} = Cursor.resolve(repo_id, cursor, fn -> fetch_live(repo_id) end)
+
+    with {:ok, index, etag} <- basis do
       {updated, results} = apply_batch(index, prepared)
+      publish_batch(repo_id, prepared, attempts, source, index, etag, updated, results)
+    end
+  end
 
-      if updated == index do
-        # Every entry in the batch was rejected, so there is nothing to write.
-        {:ok, results}
-      else
-        case ObjectStore.put(index_key(repo_id), Index.encode(updated),
-               if_match: etag,
-               content_type: @content_type
-             ) do
-          {:ok, _etag} ->
-            :telemetry.execute(
-              [:code, :wal, :append_batch],
-              %{size: length(prepared), seq: updated.seq},
-              %{repo_id: repo_id}
-            )
+  # A cached rejection is not evidence about current authority. If no CAS
+  # would be sent (rejected or already installed), re-read before answering.
+  defp publish_batch(repo_id, prepared, attempts, :cursor, index, _etag, index, _results),
+    do: append_batch_cursor(repo_id, prepared, attempts, nil)
 
-            {:ok, results}
+  defp publish_batch(_repo_id, _prepared, _attempts, :read, index, etag, index, results),
+    do: {:ok, results, Cursor.from_index(index, etag)}
 
-          {:error, :precondition_failed} ->
-            # The retry folds the batch again against the index that won, and
-            # `apply_batch/2` recognises entries of ours that are already in it.
-            :telemetry.execute([:code, :wal, :cas_retry], %{attempts: 1}, %{repo_id: repo_id})
-            backoff(@cas_attempts - attempts)
-            append_batch(repo_id, prepared, attempts - 1)
+  defp publish_batch(repo_id, prepared, attempts, source, _index, etag, updated, results) do
+    body = Index.encode(updated)
 
-          {:error, reason} ->
-            reconcile_batch(repo_id, prepared, results, reason)
+    case ObjectStore.put(index_key(repo_id), body,
+           if_match: etag,
+           content_type: @content_type
+         ) do
+      {:ok, new_etag} ->
+        :telemetry.execute(
+          [:code, :wal, :append_batch],
+          %{size: length(prepared), seq: updated.seq},
+          %{repo_id: repo_id}
+        )
+
+        {:ok, results, Cursor.from_write(repo_id, body, new_etag)}
+
+      {:error, :precondition_failed} ->
+        # The retry folds the batch again against the index that won, and
+        # `apply_batch/2` recognises entries of ours that are already in it.
+        if source == :cursor do
+          :telemetry.execute([:code, :wal, :cursor_stale], %{count: 1}, %{repo_id: repo_id})
+          append_batch_cursor(repo_id, prepared, attempts, nil)
+        else
+          :telemetry.execute([:code, :wal, :cas_retry], %{attempts: 1}, %{repo_id: repo_id})
+          backoff(@cas_attempts - attempts)
+          append_batch_cursor(repo_id, prepared, attempts - 1, nil)
         end
-      end
+
+      {:error, reason} ->
+        case reconcile_batch(repo_id, prepared, results, reason) do
+          {:ok, reconciled} -> {:ok, reconciled, nil}
+          error -> error
+        end
     end
   end
 
@@ -548,7 +583,12 @@ defmodule Code.WAL do
   """
   @spec basis(Index.t(), Enumerable.t()) :: basis()
   def basis(index, tips) do
-    %{incarnation: index.incarnation, epoch: index.epoch, tips: Enum.uniq(tips)}
+    %{
+      incarnation: index.incarnation,
+      epoch: index.epoch,
+      tips: Enum.uniq(tips),
+      storage_generation: index.storage_generation
+    }
   end
 
   @doc """
@@ -564,10 +604,56 @@ defmodule Code.WAL do
   @spec prepare(repo_id(), Entry.t(), (Index.t() -> :ok | {:error, term()}), keyword()) ::
           {:ok, prepared()} | {:error, term()}
   def prepare(repo_id, entry, validate, opts \\ []) do
+    started = System.monotonic_time(:microsecond)
+    {source, generation} = preparation_generation(repo_id, Keyword.get(opts, :basis))
+
+    result =
+      Code.Telemetry.span(
+        "code.wal.prepare",
+        %{"code.repository.id" => repo_id, "code.wal.generation_source" => Atom.to_string(source)},
+        fn -> do_prepare(repo_id, entry, validate, opts, generation) |> Code.Telemetry.put_span_outcome() end
+      )
+
+    {outcome, bytes} =
+      case result do
+        {:ok, prepared} -> {:ok, prepared.size}
+        {:error, _} -> {:error, 0}
+      end
+
+    :telemetry.execute(
+      [:code, :wal, :prepare],
+      %{duration_us: System.monotonic_time(:microsecond) - started, bytes: bytes},
+      %{generation_source: source, outcome: outcome}
+    )
+
+    if outcome == :error do
+      Logger.warning("WAL entry preparation failed",
+        repo_id: repo_id,
+        operation: :wal_prepare,
+        reason: inspect(result)
+      )
+    end
+
+    result
+  end
+
+  # This generation came from an authoritative index read when computing the
+  # basis. Re-reading just to choose an immutable key adds a round trip but
+  # cannot make the write safer: append_batch still revalidates incarnation,
+  # basis closure and generation against the index that wins the CAS. A stale
+  # basis can at worst leave an unreferenced entry, never publish into a new
+  # incarnation. Older callers without the generation retain the read path.
+  defp preparation_generation(_repo_id, %{incarnation: incarnation, storage_generation: generation})
+       when is_binary(incarnation) and is_binary(generation),
+       do: {:basis, fn -> {:ok, generation} end}
+
+  defp preparation_generation(repo_id, _basis), do: {:read, fn -> storage_generation(repo_id) end}
+
+  defp do_prepare(repo_id, entry, validate, opts, generation) do
     body = Entry.encode(entry)
     digest = digest(body)
 
-    with {:ok, generation} <- storage_generation(repo_id),
+    with {:ok, generation} <- generation.(),
          key = object_prefix(repo_id, "wal", generation) <> digest <> ".pb",
          {:ok, _} <- write_immutable(key, body) do
       {:ok,
@@ -669,7 +755,7 @@ defmodule Code.WAL do
          key = object_prefix(repo_id, "packs", generation) <> name,
          {:ok, digest, size} <- ObjectStore.digest_file(pack_path),
          {:ok, _} <- stream_immutable(key, pack_path),
-         :ok <- put_pack_index(Path.dirname(key), pack_path) do
+         :ok <- put_pack_index(repo_id, Path.dirname(key), pack_path) do
       :telemetry.execute([:code, :wal, :pack_upload], %{bytes: size}, %{repo_id: repo_id})
       {:ok, %Code.Wal.V1.Pack{key: key, size: size, digest: digest}}
     end
@@ -682,15 +768,24 @@ defmodule Code.WAL do
     end
   end
 
-  defp put_pack_index(prefix, pack_path) do
-    idx = Path.rootname(pack_path) <> ".idx"
+  defp put_pack_index(repo_id, prefix, pack_path) do
+    index_hint(repo_id, :upload, fn ->
+      idx = Path.rootname(pack_path) <> ".idx"
 
-    if File.exists?(idx) do
-      with {:ok, _} <- stream_immutable(prefix <> "/" <> Path.basename(idx), idx), do: :ok
-    else
-      # Not fatal: a replica can rebuild the index locally with `index-pack`.
-      :ok
-    end
+      cond do
+        Code.Native.file_pack_hint_omit(pack_path) ->
+          {:omitted, :ok}
+
+        File.exists?(idx) ->
+          case stream_immutable(prefix <> "/" <> Path.basename(idx), idx) do
+            {:ok, _} -> {:present, :ok}
+            {:error, _} = error -> {:error, error}
+          end
+
+        true ->
+          {:missing, :ok}
+      end
+    end)
   end
 
   @doc """
@@ -719,7 +814,7 @@ defmodule Code.WAL do
           :ok ->
             File.rename!(partial, destination)
             :telemetry.execute([:code, :wal, :pack_download], %{bytes: size}, %{repo_id: repo_id})
-            fetch_pack_index(pack, dir, name)
+            fetch_pack_index(repo_id, pack, dir, name, destination)
             {:ok, destination}
 
           {:error, reason} ->
@@ -745,17 +840,66 @@ defmodule Code.WAL do
     end
   end
 
-  defp fetch_pack_index(pack, dir, name) do
+  defp fetch_pack_index(repo_id, pack, dir, name, pack_path) do
+    index_hint(repo_id, :download, fn ->
+      if Code.Native.file_pack_hint_omit(pack_path) do
+        {:omitted, :ok}
+      else
+        get_pack_index(pack, dir, name)
+      end
+    end)
+  end
+
+  defp get_pack_index(pack, dir, name) do
     idx_key = Path.rootname(pack.key) <> ".idx"
     destination = Path.join(dir, Path.rootname(name) <> ".idx")
     partial = destination <> ".part"
 
     case ObjectStore.get_file(idx_key, partial) do
-      {:ok, _size} -> File.rename(partial, destination)
-      _ -> File.rm(partial)
-    end
+      {:ok, _size} ->
+        case File.rename(partial, destination) do
+          :ok ->
+            {:present, :ok}
 
-    :ok
+          {:error, _} = error ->
+            File.rm(partial)
+            {:error, error}
+        end
+
+      {:error, :not_found} ->
+        File.rm(partial)
+        {:missing, :ok}
+
+      {:error, _} = error ->
+        File.rm(partial)
+        {:error, error}
+    end
+  end
+
+  defp index_hint(repo_id, phase, work) do
+    Code.Telemetry.span("code.wal.pack_index_hint", %{"code.wal.hint_phase" => Atom.to_string(phase)}, fn ->
+      started = System.monotonic_time(:microsecond)
+      {outcome, result} = work.()
+
+      :telemetry.execute(
+        [:code, :wal, :pack_index_hint],
+        %{count: 1, duration_us: System.monotonic_time(:microsecond) - started},
+        %{phase: phase, outcome: outcome}
+      )
+
+      Code.Telemetry.put_span_attributes(%{"code.wal.hint_outcome" => Atom.to_string(outcome)})
+
+      if outcome == :error do
+        Logger.warning("Optional pack index hint failed",
+          repo_id: repo_id,
+          operation: :pack_index_hint,
+          outcome: outcome,
+          detail: phase
+        )
+      end
+
+      Code.Telemetry.put_span_outcome(result)
+    end)
   end
 
   # ----------------------------------------------------------------------
