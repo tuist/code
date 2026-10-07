@@ -375,7 +375,7 @@ defmodule Code.ObjectStore.S3 do
         {:error, {:multipart_complete_no_etag, String.slice(body, 0, 500)}}
 
       true ->
-        {:ok, extract(body, "ETag")}
+        {:ok, decode_xml_text(extract(body, "ETag"))}
     end
   end
 
@@ -666,6 +666,36 @@ defmodule Code.ObjectStore.S3 do
     case Regex.run(~r{<#{tag}>(.*?)</#{tag}>}s, xml) do
       [_, value] -> value
       nil -> ""
+    end
+  end
+
+  # CompleteMultipartUpload ETags are XML text, not HTTP header values. Go's
+  # encoding/xml (MinIO) uses &#34; for quotes; return the same opaque token a
+  # HEAD returns. A single substitution pass avoids double-decoding &amp;#34;.
+  # No DTD or external entities are evaluated, and numeric parsing is bounded.
+  @xml_entities %{"&quot;" => "\"", "&apos;" => "'", "&amp;" => "&", "&lt;" => "<", "&gt;" => ">"}
+  defp decode_xml_text(text) do
+    Regex.replace(~r/&(?:quot|apos|amp|lt|gt|#[0-9]{1,7}|#x[0-9a-fA-F]{1,6});/, text, fn entity ->
+      case Map.fetch(@xml_entities, entity) do
+        {:ok, value} -> value
+        :error -> decode_xml_number(entity)
+      end
+    end)
+  end
+
+  defp decode_xml_number(entity) do
+    {digits, base} =
+      case entity do
+        "&#x" <> digits -> {digits, 16}
+        "&#" <> digits -> {digits, 10}
+      end
+
+    {codepoint, ";"} = Integer.parse(digits, base)
+
+    if codepoint in 0x20..0xD7FF or codepoint in 0xE000..0xFFFD or codepoint in 0x10000..0x10FFFF do
+      <<codepoint::utf8>>
+    else
+      entity
     end
   end
 
