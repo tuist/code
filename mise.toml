@@ -48,10 +48,9 @@ description = "Run the unit test suite"
 run = "mix test"
 
 [tasks."e2e:up"]
-description = "Start MinIO and two clustered Code nodes"
-# MinIO comes from a pinned container image rather than a mise tool: upstream
-# no longer publishes per-version archives for every platform, and a pinned
-# image is what CI runs anyway.
+description = "Start RustFS and two clustered Code nodes"
+# The object store (RustFS) comes from a pinned container image rather than a
+# mise tool; a pinned image is also what CI runs.
 run = "./spec/support/stack.sh up"
 
 [tasks."e2e:down"]
