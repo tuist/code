@@ -92,7 +92,7 @@ dependencies = [
  "gix-date",
  "gix-hash",
  "gix-object",
- "gix-validate",
+ "gix-validate 0.13.0",
  "libc",
  "prost",
  "prost-build",
@@ -308,7 +308,7 @@ checksum = "e37efa99929ac62f980fb1a7dcd09dea85b3aa6ead6ba0498362add3f4e698de"
 dependencies = [
  "bstr",
  "gix-date",
- "gix-error",
+ "gix-error 0.3.2",
 ]
 
 [[package]]
@@ -350,7 +350,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e63d9aa18f29facd571c8953e66224ee0075b9e16622024794555ed4acceea85"
 dependencies = [
  "bstr",
- "gix-error",
+ "gix-error 0.3.2",
  "itoa",
  "jiff",
 ]
@@ -363,6 +363,12 @@ checksum = "4a1ba536602db507119eb5f3cdf80bef3ca5a5ec0dfc6e9c7f46dc70ade7c112"
 dependencies = [
  "bstr",
 ]
+
+[[package]]
+name = "gix-error"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aef6406003c4117d640329fe2c35386f4e137a628bb28d3f50209db159b48bc4"
 
 [[package]]
 name = "gix-features"
@@ -450,7 +456,7 @@ dependencies = [
  "gix-hash",
  "gix-hashtable",
  "gix-utils",
- "gix-validate",
+ "gix-validate 0.11.4",
  "itoa",
  "smallvec",
  "thiserror",
@@ -464,7 +470,7 @@ checksum = "38fc6f029ea67de83cbcbd33fd98c05a48360d2932b39d9fdacbc6eae802d475"
 dependencies = [
  "bstr",
  "gix-trace",
- "gix-validate",
+ "gix-validate 0.11.4",
  "thiserror",
 ]
 
@@ -483,7 +489,7 @@ dependencies = [
  "gix-path",
  "gix-tempfile",
  "gix-utils",
- "gix-validate",
+ "gix-validate 0.11.4",
  "memmap2",
  "thiserror",
 ]
@@ -537,6 +543,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4dae8780f63ed8a803b8bdabbd7aa5f5c5d74592c8b50eed875c1bb4f6545a6a"
 dependencies = [
  "bstr",
+]
+
+[[package]]
+name = "gix-validate"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbcd59cc52742468bc5c8a0e7123390d154f45e6cbd37461b0dcecdc681f2179"
+dependencies = [
+ "bstr",
+ "gix-error 0.5.0",
 ]
 
 [[package]]
