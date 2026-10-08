@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 rustler = "0.36"
-prost = "0.13"
+prost = "0.14"
 sha2 = "0.11"
 gix-config = { version = "0.60", features = ["sha1"] }
 gix-validate = "0.11"
@@ -37,7 +37,7 @@ tempfile = "3"
 sha1-checked = "0.10"
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
 
 [profile.release]
 # A NIF is loaded into the BEAM; a panic there is a VM crash. `abort` makes
