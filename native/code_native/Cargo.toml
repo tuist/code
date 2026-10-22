@@ -20,7 +20,7 @@ rustler = "0.36"
 prost = "0.13"
 sha2 = "0.11"
 gix-config = { version = "0.60", features = ["sha1"] }
-gix-validate = "0.11"
+gix-validate = "0.13"
 bstr = { version = "1", default-features = false, features = ["std"] }
 libc = "0.2"
 # Hardware acceleration with mandatory collision detection, not plain SHA1.
