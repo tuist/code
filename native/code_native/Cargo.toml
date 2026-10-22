@@ -28,7 +28,7 @@ sha1dc = "=0.1.5"
 # Pure-Rust optimized streaming DEFLATE; retain runtime CPU detection.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 gix-object = { version = "0.64", features = ["sha1"] }
-gix-hash = { version = "0.26", features = ["sha1"] }
+gix-hash = { version = "0.28", features = ["sha1"] }
 gix-date = "0.16"
 
 [dev-dependencies]
